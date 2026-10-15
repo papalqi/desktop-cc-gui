@@ -212,6 +212,15 @@ fn can_install(gate: &Gate, active: bool, idle: u64, minute: u16, timestamp: u64
     !gate.installing && !active && gate.requests == 0 && gate.transfers == 0 && idle >= 600_000 && gate.info.deferred_until <= timestamp && !blacked_out(&gate.info, minute)
 }
 
+fn packaged_frontend_available(html: &str, has_asset: impl Fn(&str) -> bool) -> bool {
+    let scripts = regex::Regex::new(r#"(?i)<script\b[^>]*>"#).unwrap();
+    let module = regex::Regex::new(r#"(?i)\btype\s*=\s*["']module["']"#).unwrap();
+    let source = regex::Regex::new(r#"(?i)\bsrc\s*=\s*["']([^"']+\.js)["']"#).unwrap();
+    scripts.find_iter(html).filter(|tag| module.is_match(tag.as_str())).any(|tag| {
+        source.captures(tag.as_str()).is_some_and(|capture| has_asset(capture[1].trim_start_matches("./").trim_start_matches('/')))
+    })
+}
+
 #[tauri::command]
 pub fn relay_update_check(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let connected = crate::relay::web_relay_status(app.clone()).is_some_and(|info| info.connected);
@@ -220,8 +229,8 @@ pub fn relay_update_check(app: tauri::AppHandle) -> Result<serde_json::Value, St
     let workspaces = crate::history::reader::list_workspaces(app.state())?.len();
     let assets = app.asset_resolver().get("index.html".into()).is_some_and(|asset| {
         let html = String::from_utf8_lossy(&asset.bytes);
-        regex::Regex::new(r#"src="([^"]+\.js)""#).unwrap().captures_iter(&html).any(|capture| {
-            app.asset_resolver().get(capture[1].trim_start_matches("./").trim_start_matches('/').to_string()).is_some_and(|js| !js.bytes.is_empty())
+        packaged_frontend_available(&html, |path| {
+            app.asset_resolver().get(path.to_string()).is_some_and(|js| !js.bytes.is_empty())
         })
     });
     let healthy = connected && assets;
@@ -405,6 +414,16 @@ pub fn start(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frontend_health_requires_an_available_module_entry() {
+        let watchdog = r#"<script src="/boot-watchdog.js"></script>"#;
+        assert!(!packaged_frontend_available(watchdog, |_| true));
+        assert!(!packaged_frontend_available(r#"<link rel="modulepreload" href="/assets/main.js">"#, |_| true));
+        let page = format!(r#"{watchdog}<script type="module" crossorigin src="/assets/main.js"></script>"#);
+        assert!(!packaged_frontend_available(&page, |path| path == "boot-watchdog.js"));
+        assert!(packaged_frontend_available(&page, |path| path == "assets/main.js"));
+        assert!(packaged_frontend_available("<script src='./assets/main.js' type='module'></script>", |path| path == "assets/main.js"));
+    }
     #[test]
     fn verifies_the_shared_node_signed_manifest() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/relay-release.json")).unwrap();
