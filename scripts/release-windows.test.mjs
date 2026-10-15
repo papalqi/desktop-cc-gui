@@ -40,5 +40,6 @@ test("release publishing transfers signed installers and publishes the channel a
 
 test("independent updater checks real staged hashes and rolls back failed checks without stopping busy apps", {skip:process.platform !== "win32"}, async () => {
   const output = await runCommand("powershell.exe", ["-NoProfile","-ExecutionPolicy","Bypass","-File",new URL("./install-self-update.test.ps1",import.meta.url).pathname.replace(/^\/(?=[A-Z]:)/i,"")]);
-  assert.equal(output.split("PASS self-update:").length - 1,6,output);
+  assert.deepEqual([...output.matchAll(/^PASS self-update: ([^\r\n]+)/gm)].map((row) => row[1]),
+    ["success","non-executable-task","nested-task","self-check-failure","legacy-rollback","delayed-relay","apply-restored","apply-failure","busy","tampered","handoff-mismatch"],output);
 });

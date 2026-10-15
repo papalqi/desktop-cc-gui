@@ -35,7 +35,7 @@ function Write-Json([string]$Path, $Value) {
 }
 
 function App-Process {
-    $processes = @(Get-CimInstance Win32_Process -Filter "name='ccgui-next.exe'" | Where-Object { $_.ExecutablePath -eq $installed })
+    $processes = @(Get-Process -Name ccgui-next -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $installed } | ForEach-Object { [pscustomobject]@{ProcessId=$_.Id;ExecutablePath=$_.Path} })
     if ($processes.Count -ne 1) { throw 'Expected one installed app process' }
     return $processes[0]
 }
@@ -44,7 +44,9 @@ function Invoke-Local([string]$Command, $Arguments, [int]$TimeoutMs = 5000) {
     $settings = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $appHome 'settings.json') -Raw | ConvertFrom-Json
     $token = [Uri]::EscapeDataString($settings.webAccessToken)
     $process = App-Process
-    $ports = @(Get-NetTCPConnection -State Listen -OwningProcess $process.ProcessId | Select-Object -ExpandProperty LocalPort -Unique)
+    $ports = @(& (Join-Path $env:SystemRoot 'System32/netstat.exe') -ano -p tcp | ForEach-Object {
+        if ($_ -match '^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$' -and [int]$Matches[2] -eq $process.ProcessId) { [int]$Matches[1] }
+    } | Select-Object -Unique)
     $attemptDeadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
     foreach ($port in $ports) {
         $remaining = [int]($attemptDeadline - [DateTime]::UtcNow).TotalMilliseconds
@@ -126,9 +128,12 @@ function Invoke-AutoUpdate {
     $rolledBack = $false
     $rollbackCredential = $null
     try {
-        $tasks = @(Get-ScheduledTask | Where-Object { @($_.Actions).Count -eq 1 -and $_.Actions[0].Execute -is [string] -and $_.Actions[0].Execute.Trim('"') -eq $installed -and $_.State.ToString() -eq 'Running' })
-        if ($tasks.Count -ne 1 -or $tasks[0].TaskPath -ne '\') { throw 'Expected one root scheduled task for this installation' }
-        $taskName = $tasks[0].TaskName
+        $taskService = New-Object -ComObject Schedule.Service
+        $taskService.Connect()
+        $taskFolder = $taskService.GetFolder('\')
+        $tasks = @($taskService.GetRunningTasks(1) | ForEach-Object { $taskFolder.GetTask($_.Path) } | Where-Object { $_.State -eq 4 -and $_.Definition.Actions.Count -eq 1 -and $_.Definition.Actions.Item(1).Type -eq 0 -and $_.Definition.Actions.Item(1).Path.Trim('"') -eq $installed })
+        if ($tasks.Count -ne 1 -or $tasks[0].Path -ne ('\' + $tasks[0].Name)) { throw 'Expected one root scheduled task for this installation' }
+        $taskName = $tasks[0].Name
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [IO.Compression.ZipFile]::OpenRead((Join-Path $stage 'package.zip'))
         try {

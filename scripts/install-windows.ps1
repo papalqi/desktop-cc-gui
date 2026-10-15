@@ -8,9 +8,11 @@ $ProgressPreference = 'SilentlyContinue'
 
 $requestData = Get-Content -Encoding UTF8 -LiteralPath $Request -Raw | ConvertFrom-Json
 if ($requestData.id -notmatch '^\d{8}-\d{6}-[a-f0-9]{8}$') { throw 'Invalid update id' }
-$task = Get-ScheduledTask -TaskName $requestData.task
-if (@($task.Actions).Count -ne 1) { throw 'Expected one scheduled-task action' }
-$installed = $task.Actions[0].Execute.Trim('"')
+$taskService = New-Object -ComObject Schedule.Service
+$taskService.Connect()
+$task = $taskService.GetFolder('\').GetTask($requestData.task)
+if ($task.Definition.Actions.Count -ne 1 -or $task.Definition.Actions.Item(1).Type -ne 0) { throw 'Expected one scheduled-task executable action' }
+$installed = $task.Definition.Actions.Item(1).Path.Trim('"')
 if (-not [IO.Path]::IsPathRooted($installed) -or [IO.Path]::GetFileName($installed) -ne 'ccgui-next.exe') {
     throw 'Scheduled task does not point to an installed CC GUI executable'
 }
@@ -22,7 +24,7 @@ $baselinePath = Join-Path $updateDir 'baseline.json'
 $resourceDirs = @('agent-catalogs', 'skills')
 
 function App-Processes {
-    @(Get-CimInstance Win32_Process -Filter "name='ccgui-next.exe'" | Where-Object { $_.ExecutablePath -eq $installed })
+    @(Get-Process -Name ccgui-next -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $installed } | ForEach-Object { [pscustomobject]@{ProcessId=$_.Id;ExecutablePath=$_.Path} })
 }
 function Wait-App([int]$Count) {
     for ($i=0; $i -lt 40; $i++) {
@@ -33,7 +35,7 @@ function Wait-App([int]$Count) {
     throw "Expected $Count app instances after task transition"
 }
 function Stop-App {
-    Stop-ScheduledTask -TaskName $requestData.task
+    $task.Stop(0)
     $null = Wait-App 0
 }
 function Assert-Idle {
@@ -48,7 +50,9 @@ function Assert-Idle {
     }
     $settings = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $dataDir 'settings.json') -Raw | ConvertFrom-Json
     $token = [Uri]::EscapeDataString($settings.webAccessToken)
-    $ports = @(Get-NetTCPConnection -State Listen -OwningProcess $processes[0].ProcessId | Select-Object -ExpandProperty LocalPort -Unique)
+    $ports = @(& (Join-Path $env:SystemRoot 'System32/netstat.exe') -ano -p tcp | ForEach-Object {
+        if ($_ -match '^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$' -and [int]$Matches[2] -eq $processes[0].ProcessId) { [int]$Matches[1] }
+    } | Select-Object -Unique)
     $active = $null
     $queryFailure = 'No listening bridge port'
     foreach ($port in $ports) {
@@ -82,9 +86,9 @@ function Assert-Idle {
     if ($active -ne 0) { throw "App has $active active turns; app was not stopped" }
 }
 function Start-App {
-    Start-ScheduledTask -TaskName $requestData.task
+    $null = $task.Run($null)
     $processes = @(Wait-App 1)
-    if ((Get-ScheduledTask -TaskName $requestData.task).State.ToString() -ne 'Running') {
+    if ($task.State -ne 4) {
         throw 'App process exists but its scheduled task is not running'
     }
     return $processes[0].ProcessId
@@ -119,7 +123,7 @@ function Restore-App {
 function Invoke-Install {
 if ($Action -eq 'prepare') {
     $processes = @(App-Processes)
-    if ($processes.Count -ne 1 -or $task.State.ToString() -ne 'Running') { throw 'Expected one running scheduled app' }
+    if ($processes.Count -ne 1 -or $task.State -ne 4) { throw 'Expected one running scheduled app' }
     $archive = Join-Path $PSScriptRoot 'package.zip'
     if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $requestData.archiveHash) { throw 'Uploaded archive mismatch' }
     New-Item -ItemType Directory -Path $updateDir | Out-Null

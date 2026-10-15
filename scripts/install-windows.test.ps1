@@ -4,17 +4,9 @@ Import-Module Microsoft.PowerShell.Utility
 $installer = Join-Path $PSScriptRoot 'install-windows.ps1'
 $passed = 0
 
-# Real filesystem copies/extraction; only the scheduled task, process table,
-# and local idle query are simulated. Never operate the host's real app task.
-function Get-ScheduledTask { [pscustomobject]@{ Actions=@([pscustomobject]@{Execute=$installed}); State=$(if ($state.running) {'Running'} else {'Ready'}) } }
-function Get-CimInstance { if ($state.running) { [pscustomobject]@{ ExecutablePath=$installed; ProcessId=$state.pid } } }
-function Stop-ScheduledTask { $state.stops++; $state.running=$false }
-function Start-ScheduledTask {
-    $state.starts++
-    if ($state.failStart -and $state.starts -eq 1) { throw 'Simulated start failure' }
-    $state.running=$true
-    $state.pid++
-}
+# Real filesystem copies/extraction; task/process state and the idle query are simulated.
+. (Join-Path $PSScriptRoot 'test-task-scheduler.ps1')
+function Get-Process { if ($state.running) { [pscustomobject]@{ Path=$installed; Id=$state.pid } } }
 function Copy-Item {
     param($LiteralPath, $Destination, [switch]$Force, [switch]$Recurse)
     if ($state.failCopy -and $Destination -eq $installed) {
@@ -36,6 +28,7 @@ foreach ($scenario in @('success','busy','copy-failure','start-failure','rollbac
     try {
         foreach ($directory in @($app, $stage, $package)) { New-Item -ItemType Directory -Path $directory | Out-Null }
         $installed = Join-Path $app 'ccgui-next.exe'
+        $mockTasks = @(New-TestTask 'CCGUIRelay' '\CCGUIRelay')
         Set-Content -LiteralPath $installed -Value 'old-exe'
         Set-Content -LiteralPath (Join-Path $package 'ccgui-next.exe') -Value 'new-exe'
         foreach ($name in @('agent-catalogs','skills')) {

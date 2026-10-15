@@ -3,13 +3,7 @@ $ProgressPreference = 'SilentlyContinue'
 $helper = Join-Path $PSScriptRoot 'install-self-update.ps1'
 $utf8 = [Text.UTF8Encoding]::new($false)
 function Assert([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
-function Get-ScheduledTask {
-    if ($scenario -eq 'non-executable-task') {
-        [pscustomobject]@{ TaskPath='\'; TaskName='ComHandler'; State='Ready'; Actions=@([pscustomobject]@{ClassId='test'}) }
-        [pscustomobject]@{ TaskPath='\'; TaskName='NoActions'; State='Ready'; Actions=@() }
-    }
-    [pscustomobject]@{ TaskPath='\'; TaskName='CCGUIRelay'; State='Running'; Actions=@([pscustomobject]@{Execute=$installed}) }
-}
+. (Join-Path $PSScriptRoot 'test-task-scheduler.ps1')
 function Invoke-WebRequest { param([switch]$UseBasicParsing,$Uri,$Method,$Headers,$ContentType,$Body,$TimeoutSec)
     if ($Uri.EndsWith('/health')) { return @{Content=(@{ready=$true;version=$testVersion;capabilities=@('self_update')} | ConvertTo-Json -Compress)} }
     if ($Uri.EndsWith('/recovery')) {
@@ -20,7 +14,7 @@ function Invoke-WebRequest { param([switch]$UseBasicParsing,$Uri,$Method,$Header
     $state.reportKey = $Headers.Authorization
 }
 
-foreach ($scenario in @('success','non-executable-task','self-check-failure','legacy-rollback','delayed-relay','apply-restored','apply-failure','busy','tampered','handoff-mismatch')) {
+foreach ($scenario in @('success','non-executable-task','nested-task','self-check-failure','legacy-rollback','delayed-relay','apply-restored','apply-failure','busy','tampered','handoff-mismatch')) {
     $testVersion = $(if ($scenario -in @('legacy-rollback','delayed-relay','apply-restored')) {'1.3.0'} else {'1.2.1'})
     $fixture = [IO.Path]::GetFullPath((Join-Path $env:TEMP ('ccgui-self-update-test-' + [Guid]::NewGuid().ToString('N'))))
     $unicodeName = [string][char]0x4E2D + [char]0x6587
@@ -28,10 +22,13 @@ foreach ($scenario in @('success','non-executable-task','self-check-failure','le
     $appDir = Join-Path $fixture 'app'
     $stage = Join-Path $appHome 'updates\stage-id\staged'
     $package = Join-Path $fixture 'package'
-    $state = @{stops=0; rollbacks=0; completes=0; aborts=0; relayRestarts=0; delays=$(if ($scenario -eq 'delayed-relay') {2} else {0}); recovery=($scenario -in @('legacy-rollback','delayed-relay','apply-restored')); busy=($scenario -eq 'busy'); failApply=($scenario -eq 'apply-failure'); failHealth=($scenario -in @('self-check-failure','legacy-rollback','delayed-relay')); failAfterApply=($scenario -eq 'apply-restored')}
+    $state = @{running=$true; stops=0; rollbacks=0; completes=0; aborts=0; relayRestarts=0; delays=$(if ($scenario -eq 'delayed-relay') {2} else {0}); recovery=($scenario -in @('legacy-rollback','delayed-relay','apply-restored')); busy=($scenario -eq 'busy'); failApply=($scenario -eq 'apply-failure'); failHealth=($scenario -in @('self-check-failure','legacy-rollback','delayed-relay')); failAfterApply=($scenario -eq 'apply-restored')}
     try {
         New-Item -ItemType Directory -Path $stage,$appDir,$package | Out-Null
         $installed = Join-Path $appDir 'ccgui-next.exe'
+        $mockTasks = @(New-TestTask 'CCGUIRelay' '\CCGUIRelay')
+        if ($scenario -eq 'non-executable-task') { $mockTasks += (New-TestTask 'ComHandler' '\ComHandler' 5); $mockTasks += (New-TestTask 'NoActions' '\NoActions' 0 0) }
+        if ($scenario -eq 'nested-task') { $mockTasks = @(New-TestTask 'CCGUIRelay' '\nested\CCGUIRelay') }
         [IO.File]::WriteAllText($installed, 'old-exe', $utf8)
         [IO.File]::WriteAllText((Join-Path $package 'ccgui-next.exe'), 'new-exe', $utf8)
         Compress-Archive -Path (Join-Path $package '*') -DestinationPath (Join-Path $stage 'package.zip')
