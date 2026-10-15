@@ -216,9 +216,10 @@ fn packaged_frontend_available(html: &str, has_asset: impl Fn(&str) -> bool) -> 
     let scripts = regex::Regex::new(r#"(?i)<script\b[^>]*>"#).unwrap();
     let module = regex::Regex::new(r#"(?i)\btype\s*=\s*["']module["']"#).unwrap();
     let source = regex::Regex::new(r#"(?i)\bsrc\s*=\s*["']([^"']+\.js)["']"#).unwrap();
-    scripts.find_iter(html).filter(|tag| module.is_match(tag.as_str())).any(|tag| {
+    let available = scripts.find_iter(html).filter(|tag| module.is_match(tag.as_str())).any(|tag| {
         source.captures(tag.as_str()).is_some_and(|capture| has_asset(capture[1].trim_start_matches("./").trim_start_matches('/')))
-    })
+    });
+    available
 }
 
 #[tauri::command]
