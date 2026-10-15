@@ -93,4 +93,26 @@ describe("PerformanceRecorder", () => {
     recorder.sample(5000, false);
     expect(recorder.snapshot().samples[0]).toMatchObject({ contextAvailable: false });
   });
+
+  it("bounds session transitions and exports only numeric session aliases and allowed metrics", () => {
+    const recorder = new PerformanceRecorder();
+    const first = recorder.sessionToken("codex/private-session");
+    expect(recorder.sessionToken("codex/private-session")).toBe(first);
+    expect(recorder.sessionToken("new:codex:C:/private/workspace")).not.toBe(first);
+    for (let i = 0; i < 205; i++) recorder.transition("history-applied", {
+      session: first, elapsedMs: i, messages: 100, text: "secret conversation", error: "credential",
+    } as never);
+    const snapshot = recorder.snapshot();
+    expect(snapshot.transitions).toHaveLength(200);
+    expect(snapshot.transitions[0].elapsedMs).toBe(5);
+    expect(JSON.stringify(snapshot)).not.toMatch(/private|workspace|secret|credential|conversation/);
+    snapshot.transitions[0].elapsedMs = 999;
+    expect(recorder.snapshot().transitions[0].elapsedMs).toBe(5);
+    vi.mocked(Date.now).mockReturnValue(315001);
+    expect(recorder.snapshot().transitions).toEqual([]);
+    recorder.setEnabled(false);
+    recorder.transition("session-select", { session: first });
+    expect(recorder.sessionToken("private")).toBe(0);
+    expect(recorder.snapshot().transitions).toEqual([]);
+  });
 });

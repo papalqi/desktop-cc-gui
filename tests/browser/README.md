@@ -1,5 +1,23 @@
 # Chat streaming regression
 
+Open `/tests/browser/session-switch.html` and run the regression for the real
+chat store and `MessageTimeline` under React StrictMode. A delayed catalog and
+background history read must retain the latest selection and cached message
+references; twelve subsequent switches must produce no unsolicited activation.
+The report includes the production bounded performance log. Synthetic history
+contains Chinese, emoji and Markdown; no real model, credentials or native IPC
+is used. Timings here describe this browser fixture, not the deployed service.
+
+Open `/tests/browser/multi-machine.html?global=1` and run
+`window.__multiMachineTest()` for the real chat store, view controls and two
+`MessageTimeline` panes under React StrictMode. Two machines share the same
+engine/session ID/path; the delayed background history must preserve the last
+selection, machine-specific content, cached message references and drafts.
+Pinning PC6 must leave PC0 unchanged, and a late all-sessions catalog must not
+replace the remote view. The controls remain usable after the report. This uses
+in-memory IPC and synthetic Unicode/Markdown, without a Hub or native process;
+it does not replace authenticated production browser acceptance.
+
 Open `/tests/browser/concurrent-status.html` for concurrent session indicators:
 the real `AiChatSidebar` and `SessionTab` each render 1, 6 (default), or 12
 synthetic sessions. Switch Processing / Retry / Complete, light / dark, and

@@ -11,6 +11,7 @@ import { ipc, type MessageSearchHit } from "@/lib/ipc";
 import { relativeTime } from "@/features/chat/time";
 import { formatSearchDuration } from "./session-search-format";
 import { isModalDialogOpen, hideModalDialog, showModalDialog } from "@/lib/engine-compat";
+import { sessionKey } from "@/features/chat/store/persistence";
 
 /** Hard cap on listed rows: the palette is a jumper, not a browser. */
 const MAX_RESULTS = 50;
@@ -45,7 +46,7 @@ interface SessionMatch {
 /** Debounced content-lane search: the FTS request and the state it fills.
  *  Title matches are computed inline in the palette; this owns only the
  *  backend lane, so the component body stays render-and-navigate. */
-function useContentSearchLane(open: boolean, trimmedQuery: string, showContent: boolean) {
+function useContentSearchLane(open: boolean, trimmedQuery: string, showContent: boolean, scope: "remote" | "all") {
   const [contentHits, setContentHits] = useState<MessageSearchHit[]>([]);
   const [contentPending, setContentPending] = useState(0);
   // Stats strip state: the last completed query's numbers, whether a query
@@ -54,6 +55,7 @@ function useContentSearchLane(open: boolean, trimmedQuery: string, showContent: 
   const [contentStats, setContentStats] = useState<SearchStats | null>(null);
   const [contentLoading, setContentLoading] = useState(false);
   const [contentFailed, setContentFailed] = useState(false);
+  const [offlineMachines, setOfflineMachines] = useState<string[]>([]);
   // Invalidate in-flight content responses: Tauri invoke cannot be
   // aborted, so a monotonically increasing request id drops late arrivals
   // (agentsview's requestVersion — the AbortController equivalent here).
@@ -69,20 +71,26 @@ function useContentSearchLane(open: boolean, trimmedQuery: string, showContent: 
       setContentStats(null);
       setContentLoading(false);
       setContentFailed(false);
+      setOfflineMachines([]);
       return;
     }
     const seq = ++requestSeq.current;
+    setContentHits(EMPTY_HITS);
+    setContentStats(null);
+    setContentPending(0);
+    setOfflineMachines([]);
     // Debounce window included: from the first keystroke the strip says a
     // search is running, not what the previous query found.
     setContentLoading(true);
     setContentFailed(false);
     const timer = setTimeout(() => {
       ipc
-        .searchMessages(trimmedQuery, CONTENT_LIMIT, 0)
+        .searchMessages(trimmedQuery, CONTENT_LIMIT, 0, scope)
         .then((page) => {
           if (requestSeq.current !== seq) return;
           setContentHits(page.hits);
           setContentPending(page.pending);
+          setOfflineMachines(page.offlineMachines ?? []);
           setContentStats({
             elapsedUs: page.elapsedUs,
             totalMessages: page.totalMessages,
@@ -98,9 +106,9 @@ function useContentSearchLane(open: boolean, trimmedQuery: string, showContent: 
         });
     }, CONTENT_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [open, trimmedQuery, showContent]);
+  }, [open, trimmedQuery, showContent, scope]);
 
-  return { contentHits, contentPending, contentStats, contentLoading, contentFailed };
+  return { contentHits, contentPending, contentStats, contentLoading, contentFailed, offlineMachines };
 }
 
 /** Search box, lane chips and the content-lane stats strip. Kept out of the
@@ -214,10 +222,14 @@ export function SessionSearchPalette({
   repos,
   onClose,
   onThreadSelect,
+  onSessionSelect,
+  scope = "all",
 }: {
   open: boolean;
   /** Every workspace (sections already flattened by the caller). */
   repos: AiChatRepo[];
+  onSessionSelect?: (hit: MessageSearchHit) => void;
+  scope?: "remote" | "all";
   onClose: () => void;
   onThreadSelect?: (id: string) => void;
 }) {
@@ -230,8 +242,8 @@ export function SessionSearchPalette({
   const [showTitle, setShowTitle] = useState(true);
   const [showContent, setShowContent] = useState(true);
   const trimmedQuery = query.trim();
-  const { contentHits, contentPending, contentStats, contentLoading, contentFailed } =
-    useContentSearchLane(open, trimmedQuery, showContent);
+  const { contentHits, contentPending, contentStats, contentLoading, contentFailed, offlineMachines } =
+    useContentSearchLane(open, trimmedQuery, showContent, scope);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -258,7 +270,7 @@ export function SessionSearchPalette({
           label: thread.label,
           engine: thread.engine,
           time: thread.time,
-          workspace: repo.label,
+          workspace: [repo.machine, repo.label].filter(Boolean).join(" · "),
         });
         if (out.length >= MAX_RESULTS) return out;
       }
@@ -279,7 +291,7 @@ export function SessionSearchPalette({
     if (contentHits.length === 0) return contentHits;
     if (!showTitleRows) return contentHits;
     const titled = new Set(titleRows.map((m) => m.id));
-    return contentHits.filter((h) => !titled.has(`${h.engine}/${h.sessionId}`));
+    return contentHits.filter((h) => !titled.has(sessionKey(h.engine, h.sessionId, h.workspacePath, h.machine)));
   }, [showContent, showTitleRows, titleRows, contentHits]);
   const rowCount = titleRows.length + content.length;
 
@@ -331,7 +343,8 @@ export function SessionSearchPalette({
   };
   const jumpContent = (hit: MessageSearchHit) => {
     onClose();
-    onThreadSelect?.(`${hit.engine}/${hit.sessionId}`);
+    if (onSessionSelect) onSessionSelect(hit);
+    else onThreadSelect?.(sessionKey(hit.engine, hit.sessionId, hit.workspacePath, hit.machine));
   };
 
   const jumpRow = (index: number) => {
@@ -400,6 +413,9 @@ export function SessionSearchPalette({
       onCancel={onClose}
     >
       <div className="w-[560px] max-w-full overflow-hidden rounded-2xl border border-border-button-default bg-background-primary-default shadow-dropdown">
+        {scope === "all" && offlineMachines.length > 0 && <p role="status" className="px-3 py-1 text-caption-1-medium text-text-tertiary">
+          {offlineMachines.join(", ")} · {t("chat.machineLocalUnavailable")}
+        </p>}
         <PaletteHeader
           inputRef={inputRef}
           query={query}
@@ -510,7 +526,7 @@ function PaletteResults({
         const index = matches.length + i;
         return (
           <button
-            key={`${hit.engine}/${hit.sessionId}`}
+            key={sessionKey(hit.engine, hit.sessionId, hit.workspacePath, hit.machine)}
             type="button"
             role="option"
             aria-selected={index === active}
@@ -536,7 +552,7 @@ function PaletteResults({
                 </span>
               ) : null}
               <span className="shrink-0 text-caption-1-medium text-text-tertiary">
-                {hit.workspaceName ?? hit.workspacePath}
+                {[hit.machine, hit.workspaceName ?? hit.workspacePath, hit.origin === "local" ? t("chat.localSession") : undefined].filter(Boolean).join(" · ")}
               </span>
             </span>
             <span className="w-full truncate pl-5 text-caption-1-medium text-text-secondary">

@@ -7,8 +7,9 @@ import {
 } from "@/features/plugins/runtime/events";
 import { setPluginSessionEffort, useChatStore } from "./store";
 import { OPEN_TABS_KEY } from "./store/persistence";
-import { EMPTY_SESSION } from "./store/stream";
+import { EMPTY_SESSION, runRouting } from "./store/stream";
 import { handleEngineEvents, type EngineEventDeps } from "./store/engine-events";
+import { SendDeliveryUnknownError } from "@/lib/web-send-recovery";
 import { registerSessionHooks, registerTurnHooks } from "@/features/plugins/runtime/hooks";
 import { getConversationModeState } from "@/features/plugins/conversation/state";
 
@@ -19,10 +20,13 @@ vi.mock("@/lib/ipc", () => ({
     rememberSessionModel: vi.fn(async () => {}),
     rememberSessionEffort: vi.fn(async () => {}),
     listSessions: vi.fn(async () => []),
+    listActiveRuns: vi.fn(async () => []),
     listArchivedSessions: vi.fn(async () => []),
     listPlanReviews: vi.fn(async () => []),
     archiveSession: vi.fn(async () => {}),
     restoreSession: vi.fn(async () => {}),
+    pinSession: vi.fn(async () => {}),
+    renameSession: vi.fn(async () => {}),
     loadSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null, subagentHistory: [] })),
     loadRemoteSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null, subagentHistory: [] })),
     deleteSession: vi.fn(async () => {}),
@@ -47,6 +51,7 @@ function resetStore() {
   vi.mocked(ipc.interruptSession).mockClear();
   vi.mocked(ipc.archiveSession).mockClear();
   vi.mocked(ipc.listArchivedSessions).mockResolvedValue([]);
+  vi.mocked(ipc.listActiveRuns).mockResolvedValue([]);
   useChatStore.setState({
     openTabs: [],
     active: null,
@@ -75,6 +80,36 @@ function engineDeps(): EngineEventDeps {
     upsertSessionMeta: () => {},
   };
 }
+
+describe("running session refresh", () => {
+  beforeEach(resetStore);
+
+  it("restores the run time without requiring the user to open its session", async () => {
+    const startedAt = Date.now() - 90_000;
+    vi.mocked(ipc.listSessions).mockResolvedValueOnce([]);
+    vi.mocked(ipc.listActiveRuns).mockResolvedValueOnce([
+      { runId: "refresh-run", engine: "codex", sessionId: "refresh-session", workspacePath: WS, startedAt },
+    ]);
+    await useChatStore.getState().refreshSessions();
+    expect(useChatStore.getState().active).toBeNull();
+    expect(useChatStore.getState().bySession["codex/refresh-session"]).toMatchObject({
+      streaming: true, turnStartedAt: startedAt,
+    });
+  });
+
+  it("ignores an old machine's pending refresh after switching", async () => {
+    let resolveRuns!: (value: Awaited<ReturnType<typeof ipc.listActiveRuns>>) => void;
+    vi.mocked(ipc.listSessions).mockResolvedValueOnce([]);
+    vi.mocked(ipc.listActiveRuns).mockReturnValueOnce(new Promise((resolve) => { resolveRuns = resolve; }));
+    const pending = useChatStore.getState().refreshSessions();
+    useChatStore.getState().prepareMachineSwitch();
+    resolveRuns([{ runId: "old-machine-run", engine: "codex", sessionId: "old-session", workspacePath: WS, startedAt: Date.now() - 60_000 }]);
+    await pending;
+    expect(useChatStore.getState().sessions).toEqual([]);
+    expect(useChatStore.getState().bySession).toEqual({});
+    expect(useChatStore.getState().streamingByKey).toEqual({});
+  });
+});
 
 describe("per-session composer selection", () => {
   beforeEach(resetStore);
@@ -360,6 +395,31 @@ describe("compactContext and refreshSessionUsage", () => {
     expect(useChatStore.getState().bySession[key].streaming).toBe(false);
   });
 
+  it("a send whose delivery is unknown keeps its route and does not start the queued message", async () => {
+    const queued = { id: "q1", text: "next question", images: [], queuedAt: 1 };
+    const sendWith = async (error: Error, id: string) => {
+      const tab = { engine: "codex", sessionId: id, workspacePath: WS };
+      const key = `codex/${id}`;
+      useChatStore.setState({ active: tab, openTabs: [tab], bySession: { [key]: { ...EMPTY_SESSION, queue: [queued] } } });
+      vi.mocked(ipc.sendMessage).mockClear().mockRejectedValueOnce(error);
+      await useChatStore.getState().send("hello", []);
+      return { key, runId: vi.mocked(ipc.sendMessage).mock.calls[0][0].runId! };
+    };
+
+    const uncertain = await sendWith(new SendDeliveryUnknownError("delivery unknown"), "uncertain");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(ipc.sendMessage).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState().bySession[uncertain.key].streaming).toBe(false);
+    expect(useChatStore.getState().bySession[uncertain.key].queue).toEqual([queued]);
+    expect(useChatStore.getState().bySession[uncertain.key].error).toContain("delivery unknown");
+    expect(runRouting.get(uncertain.runId)).toBe(uncertain.key);
+
+    const failed = await sendWith(new Error("spawn failed"), "rejected");
+    await vi.waitFor(() => expect(ipc.sendMessage).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(ipc.sendMessage).mock.calls[1][0].prompt).toContain("next question");
+    expect(runRouting.has(failed.runId)).toBe(false);
+  });
+
   it("refreshing a closed background session reads its own id, not the active tab", async () => {
     const active = { engine: "claude", sessionId: "foreground", workspacePath: WS };
     const key = "codex/background";
@@ -542,6 +602,46 @@ describe("compactContext and refreshSessionUsage", () => {
     expect(useChatStore.getState().active).toBeNull();
     expect(useChatStore.getState().archivedSessionKeys["codex/archive-1"]).toBe(true);
     expect(useChatStore.getState().bySession["codex/archive-1"]).toBeUndefined();
+  });
+
+  it("archiveSessionsBefore archives only old idle sessions", async () => {
+    const row = (sessionId: string, patch: Partial<SessionMeta> = {}): SessionMeta => ({
+      engine: "codex",
+      sessionId,
+      workspacePath: WS,
+      filePath: `/tmp/${sessionId}.jsonl`,
+      fileSize: 1,
+      fileMtimeMs: 1,
+      title: sessionId,
+      preview: "",
+      createdAt: 1,
+      updatedAt: 1,
+      messageCount: 1,
+      pinned: false,
+      customTitle: null,
+      ...patch,
+    });
+    const old = row("old");
+    const pinned = row("pin", { pinned: true });
+    const recent = row("new", { updatedAt: 10_000 });
+    const running = row("run");
+    useChatStore.setState({
+      sessions: [old, pinned, recent, running],
+      streamingByKey: { "codex/run": true },
+    });
+    vi.mocked(ipc.listSessions).mockResolvedValueOnce([pinned, recent, running]);
+    vi.mocked(ipc.listArchivedSessions).mockResolvedValueOnce([old]);
+
+    const count = await useChatStore.getState().archiveSessionsBefore(5_000);
+
+    expect(count).toBe(1);
+    expect(ipc.archiveSession).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(ipc.archiveSession).mock.calls[0]?.[0].sessionId).toBe("old");
+    expect(useChatStore.getState().sessions.map((item) => item.sessionId)).toEqual([
+      "pin",
+      "new",
+      "run",
+    ]);
   });
 
   it("pinModels(updates, false) 只更新内存 models,不触碰 persisted 默认", async () => {
@@ -773,8 +873,9 @@ describe("model selection is per session", () => {
 describe("refreshSessions and the not-yet-scanned session", () => {
   beforeEach(() => {
     resetStore();
-    useChatStore.setState({ sessions: [], engines: [], workspaces: [] });
+    useChatStore.setState({ sessions: [], engines: [], workspaces: [], actionError: null });
     vi.mocked(ipc.listSessions).mockResolvedValue([]);
+    vi.mocked(ipc.pinSession).mockReset().mockResolvedValue(undefined);
   });
 
   const meta = (sessionId: string, title = "新会话"): SessionMeta => ({
@@ -809,6 +910,83 @@ describe("refreshSessions and the not-yet-scanned session", () => {
     expect(
       useChatStore.getState().sessions.map((s) => s.sessionId),
     ).toContain("s-new");
+  });
+
+  it("pins and unpins a new chat before its history row is available", async () => {
+    useChatStore.setState({
+      sessions: [meta("s-new")],
+      bySession: { "omp/s-new": { ...EMPTY_SESSION, streaming: true } },
+    });
+    vi.mocked(ipc.listActiveRuns).mockResolvedValue([
+      { runId: "pin-run", engine: "omp", sessionId: "s-new", workspacePath: WS },
+    ]);
+
+    await useChatStore.getState().pinSession("omp", "s-new", true);
+
+    expect(ipc.pinSession).toHaveBeenLastCalledWith("omp", "s-new", true, meta("s-new"));
+    expect(useChatStore.getState().sessions).toHaveLength(1);
+    expect(useChatStore.getState().sessions[0].pinned).toBe(true);
+    const pinnedSession = useChatStore.getState().sessions[0];
+
+    await useChatStore.getState().pinSession("omp", "s-new", false);
+
+    expect(ipc.pinSession).toHaveBeenLastCalledWith("omp", "s-new", false, pinnedSession);
+    expect(useChatStore.getState().sessions[0].pinned).toBe(false);
+  });
+
+  it("keeps the executor's newer pin value returned by the refreshed catalog", async () => {
+    const session = meta("s-new");
+    useChatStore.setState({ sessions: [session] });
+    vi.mocked(ipc.listSessions).mockResolvedValueOnce([session]);
+
+    await useChatStore.getState().pinSession("omp", "s-new", true);
+
+    expect(useChatStore.getState().sessions[0].pinned).toBe(false);
+    expect(useChatStore.getState().actionError).toBeNull();
+  });
+
+  it("keeps the pin unchanged and reports a failed save", async () => {
+    const session = meta("s-new");
+    useChatStore.setState({ sessions: [session] });
+    vi.mocked(ipc.pinSession).mockRejectedValueOnce(new Error("pin save failed"));
+
+    await useChatStore.getState().pinSession("omp", "s-new", true);
+
+    expect(useChatStore.getState().sessions[0]).toBe(session);
+    expect(useChatStore.getState().actionError).toBe("pin save failed");
+  });
+
+  it("ignores a pin result after switching to another machine", async () => {
+    useChatStore.setState({ sessions: [meta("s-new")] });
+    let resolvePin!: () => void;
+    vi.mocked(ipc.pinSession).mockReturnValueOnce(new Promise((resolve) => { resolvePin = resolve; }));
+
+    const pending = useChatStore.getState().pinSession("omp", "s-new", true);
+    useChatStore.getState().prepareMachineSwitch();
+    const otherMachineSession = meta("s-new", "Other machine");
+    useChatStore.setState({ sessions: [otherMachineSession] });
+    resolvePin();
+    await pending;
+
+    expect(useChatStore.getState().sessions).toEqual([otherMachineSession]);
+  });
+
+  it.each([false, true])("ignores a late rename result after switching machines (failed=%s)", async (failed) => {
+    let finish!: () => void;
+    vi.mocked(ipc.renameSession).mockReturnValueOnce(new Promise<void>((resolve, reject) => {
+      finish = () => failed ? reject(new Error("old machine error")) : resolve();
+    }));
+    useChatStore.setState({ sessions: [meta("s-new")] });
+    const pending = useChatStore.getState().renameSession("omp", "s-new", "renamed");
+    useChatStore.getState().prepareMachineSwitch();
+    const current = meta("s-new", "Other machine");
+    useChatStore.setState({ sessions: [current], actionError: "newer error" });
+    vi.mocked(ipc.listSessions).mockClear();
+    finish();
+    await pending;
+    expect(ipc.listSessions).not.toHaveBeenCalled();
+    expect(useChatStore.getState().sessions).toEqual([current]);
+    expect(useChatStore.getState().actionError).toBe("newer error");
   });
 
   it("still drops rows with no local state (external delete cleanup)", async () => {

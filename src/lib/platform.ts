@@ -1,7 +1,9 @@
 import { convertFileSrc, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { webPublicPrefix } from "./web-public-prefix";
 import { isWeb, serverVersion, webToken } from "./transport";
+import { webMachine } from "./web-machine";
 
 export { isWeb } from "./transport";
 
@@ -43,9 +45,11 @@ export function getAppVersion(): Promise<string | null> {
  * protocol; web mode uses the bridge's scoped /file route (same $HOME scope,
  * see web.rs).
  */
-export function fileUrl(path: string): string {
+export function fileUrl(path: string, targetMachine?: string): string {
   if (isWeb) {
-    return `/file?path=${encodeURIComponent(path)}&token=${encodeURIComponent(webToken ?? "")}`;
+    const prefix = webPublicPrefix(window.location.pathname);
+    const machine = targetMachine ?? webMachine();
+    return `${prefix}/file?path=${encodeURIComponent(path)}&token=${encodeURIComponent(webToken ?? "")}${machine ? `&machine=${encodeURIComponent(machine)}` : ""}`;
   }
   return convertFileSrc(path);
 }

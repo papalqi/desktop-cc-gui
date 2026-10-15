@@ -218,8 +218,8 @@ type ExpansionProps = { auto: boolean; live: boolean; thinking: boolean };
 
 /** Pure transition table for the expanded-state machine: given the previous
  *  and current prop snapshot plus the user's override flag, decide the next
- *  expanded/overridden pair. Automation opens a row while its thinking is
- *  streaming and folds it the moment that thinking settles — unless
+ *  expanded/overridden pair. An explicit auto-expand request opens a row;
+ *  thinking arrivals keep its current state. Thinking settlement folds it unless
  *  `thinkingAutoCollapse` is off (设置 → 通用 → 行为), in which case the row
  *  stays open so the timeline does not jump shut. A superseded or
  *  turn-settled row folds either way, until the user's own click takes
@@ -232,13 +232,8 @@ function expansionTransition(
   thinkingAutoCollapse: boolean,
 ): { expanded: boolean; overridden: boolean } {
   if (next.auto && !prev.auto) {
-    // Became the latest row: open it and hand control back to automation.
+    // An auto-expand request opens the row and returns control to automation.
     return { expanded: true, overridden: false };
-  }
-  if (next.thinking && !prev.thinking && !overridden) {
-    // Thinking resumed inside this row (extended thinking between tool
-    // calls): show it again unless the user folded the row on purpose.
-    return { expanded: true, overridden };
   }
   if (thinkingAutoCollapse && !next.thinking && prev.thinking && !overridden) {
     // The thinking settled: fold immediately — expanded-on-demand shows

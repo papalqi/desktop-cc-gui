@@ -12,6 +12,7 @@ import type { ComposerPermission } from "@/components/application/ai-chat/permis
 import type { ActiveSession } from "./persistence";
 import type { SessionContributions } from "./session-contributions";
 import type { QueueMoveDirection, SessionState } from "./stream";
+import type { MachineCatalogSnapshot } from "@/features/chat/machine-catalog";
 
 /** Result of a plan-decision submit. `applied`/`conflict` come from the
  *  backend CAS (the returned record already replaced the local card);
@@ -39,10 +40,17 @@ export interface SendOptions {
 export interface ChatStore {
   workspaces: Workspace[];
   sessions: SessionMeta[];
+  sessionScope: "remote" | "all";
+  sessionSort: "workspace" | "recent";
+  setSessionScope: (scope: "remote" | "all") => Promise<void>;
+  setSessionSort: (sort: "workspace" | "recent") => Promise<void>;
   /** Persisted archive identities mirrored from the backend. Engine events
    * consult this map so a late event cannot reinsert an archived row. */
   archivedSessionKeys: Record<string, true>;
   engines: EngineInfo[];
+  enginesByMachine: Record<string, EngineInfo[]>;
+  providersByMachine: Record<string, Record<string, string>>;
+  serviceTiersByMachine: Record<string, { omp: OmpServiceTier; codex: OmpServiceTier }>;
   active: ActiveSession | null;
   /** Open conversation tabs, in display order. Persisted in localStorage. */
   openTabs: ActiveSession[];
@@ -113,14 +121,27 @@ export interface ChatStore {
     sourceSessionId: string | null;
     targetSessionId: string | null;
     workspacePath: string;
+    machine?: string;
   } | null;
 
   init: () => Promise<void>;
+  /** Drop the previous desktop's workspaces and sessions immediately. */
+  prepareMachineSwitch: () => void;
+  /** Paint a desktop's last workspace list before its socket is ready. */
+  applyCachedMachineCatalog: (snapshot: MachineCatalogSnapshot) => void;
+  /** Replace catalogs after the relay points this page at another desktop.
+   *  The document stays; tabs are read from that machine's own storage.
+   *  `isCurrent` lets a newer switch ignore a late reply. `machine` is the
+   *  desktop whose catalog should be written back into the local cache. */
+  replaceMachineCatalog: (isCurrent?: () => boolean, machine?: string) => Promise<void>;
+  /** Archive idle, unpinned sessions last active before `beforeMs`. */
+  archiveSessionsBefore: (beforeMs: number) => Promise<number>;
   refreshSessions: () => Promise<void>;
   /** Re-read engines + sessions after CLI config changes (enable switch,
    * channel edits): refreshes the picker's enabled set and re-filters the
    * history list, migrating the engine pref off a disabled CLI. */
   refreshEngines: () => Promise<void>;
+  refreshMachineRuntime: (machine: string, force?: boolean) => Promise<void>;
   refreshWorkspaces: () => Promise<void>;
   addWorkspace: (path: string, meta?: Record<string, unknown>) => Promise<void>;
   reorderWorkspaces: (ids: string[]) => Promise<void>;
@@ -129,17 +150,20 @@ export interface ChatStore {
     engine: string,
     sessionId: string,
     workspacePath: string,
+    machine?: string,
   ) => Promise<void>;
   closeTab: (
     engine: string,
     sessionId: string | null,
     workspacePath: string,
+    machine?: string,
   ) => void;
   /** Activate an already-open tab without changing the tab list. */
   focusTab: (
     engine: string,
     sessionId: string | null,
     workspacePath: string,
+    machine?: string,
   ) => void;
   /** Move an open tab to a new position (drag-reorder in the tab strip). */
   moveTab: (
@@ -147,8 +171,9 @@ export interface ChatStore {
     sessionId: string | null,
     workspacePath: string,
     toIndex: number,
+    machine?: string,
   ) => void;
-  startNewChat: (workspacePath: string) => void;
+  startNewChat: (workspacePath: string, machine?: string) => void;
   setActiveEngine: (engine: string) => void;
   setPermission: (permission: ComposerPermission) => void;
   setEffort: (engine: string, effort: EffortLevel) => Promise<void>;
@@ -253,16 +278,18 @@ export interface ChatStore {
   /** Stop the running turn (default: the active session). */
   interrupt: (target?: ActiveSession | null) => Promise<void>;
   archiveSession: (session: SessionMeta) => Promise<void>;
-  deleteSession: (engine: string, sessionId: string) => Promise<void>;
+  deleteSession: (engine: string, sessionId: string, machine?: string) => Promise<void>;
   pinSession: (
     engine: string,
     sessionId: string,
     pinned: boolean,
+    machine?: string,
   ) => Promise<void>;
   renameSession: (
     engine: string,
     sessionId: string,
     title: string,
+    machine?: string,
   ) => Promise<void>;
   /** Send /compact to compress conversation context. `trigger` records who
    *  asked: the composer action/command ("manual") or the per-session

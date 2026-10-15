@@ -1,4 +1,5 @@
-import { ipc, type FileIndexEntry } from "@/lib/ipc";
+import { ipc, ipcForMachine, type FileIndexEntry } from "@/lib/ipc";
+import { machineResourceTarget } from "@/lib/web-machine";
 import {
   createRootCacheStore,
   type RootCache,
@@ -59,7 +60,10 @@ function buildEntries(raw: FileIndexEntry[]): MentionEntry[] {
 
 const { useStore: useMentionIndexStore, prune: pruneMentionIndex } =
   createRootCacheStore<MentionEntry>({
-    fetch: (root) => ipc.listFileIndex(root).then(buildEntries),
+    fetch: (root) => {
+      const target = machineResourceTarget(root);
+      return (target.machine ? ipcForMachine(target.machine) : ipc).listFileIndex(target.path).then(buildEntries);
+    },
     ttlMs: INDEX_TTL_MS,
   });
 

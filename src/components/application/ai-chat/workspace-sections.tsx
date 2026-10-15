@@ -198,6 +198,9 @@ export function WorkspaceSection({
   creatingGroup = false,
   onCreateGroup,
   onCreateGroupCancel,
+  heading,
+  staleSessionCount = 0,
+  onArchiveWeek,
 }: {
   repos: AiChatRepo[];
   /** Grouped repo tree; absent/empty = legacy flat list. */
@@ -231,19 +234,24 @@ export function WorkspaceSection({
    *  open, or null when the name was accepted. */
   onCreateGroup?: (name: string) => string | null;
   onCreateGroupCancel?: () => void;
+  /** Overrides the section title. The relay sidebar uses「我的工作区」. */
+  heading?: string;
+  /** Sessions eligible for the week archive. Hidden when zero. */
+  staleSessionCount?: number;
+  onArchiveWeek?: () => void;
 }) {
   const { t } = useTranslation();
   const hasGroups = Boolean(sections?.some((section) => section.id !== null));
 
-  const renderRepoList = (repos: AiChatRepo[], sectionId: string | null) =>
+  const renderRepoList = (repos: AiChatRepo[], sectionId: string | null, readOnly = false) =>
     repos.length > 0 && (
       <WorkspaceSortableList
         items={repos}
         sectionId={sectionId}
-        onDropToSection={onDropWorkspaceToSection}
+        onDropToSection={readOnly ? undefined : onDropWorkspaceToSection}
         onDragActiveChange={onWorkspaceDragActiveChange}
         onReorder={
-          onReorderWorkspaces
+          onReorderWorkspaces && !readOnly
             ? (orderedIds) => {
                 // Rebuild the global order: other sections keep theirs, the
                 // dragged section takes the new one.
@@ -292,8 +300,18 @@ export function WorkspaceSection({
         className="flex w-full items-center justify-between rounded-2lg transition-colors duration-150 data-[drop-hover=true]:bg-background-secondary-hover data-[drop-hover=true]:ring-1 data-[drop-hover=true]:ring-border-button-active"
       >
         <span className="text-body-2-medium text-text-secondary">
-          {t("chat.workspaces")}
+          {heading ?? t("chat.workspaces")}
         </span>
+        <div className="flex items-center gap-1">
+          {staleSessionCount > 0 && onArchiveWeek && (
+            <button
+              type="button"
+              className="cursor-pointer rounded-full px-2 py-1 text-caption-1-medium text-text-tertiary transition-colors duration-150 hover:bg-background-secondary-hover hover:text-text-secondary"
+              onClick={onArchiveWeek}
+            >
+              {t("chat.archiveWeek")}
+            </button>
+          )}
         {!isWeb && (
           <button
             type="button"
@@ -305,6 +323,7 @@ export function WorkspaceSection({
             <FolderPlus className="size-4" aria-hidden />
           </button>
         )}
+        </div>
       </div>
       {!hasGroups && renderRepoList(repos, null)}
       {hasGroups &&
@@ -317,14 +336,16 @@ export function WorkspaceSection({
             // Empty groups stay visible: the sidebar is where groups are
             // created now, so a fresh group must show up before it has
             // members.
-            <div key={section.id} {...{ [WORKSPACE_DROP_TARGET_ATTR]: section.id }} className={dropTargetClasses}>
+            <div key={section.id} {...(section.readOnly ? {} : { [WORKSPACE_DROP_TARGET_ATTR]: section.id })} className={dropTargetClasses}>
               <GroupHeaderRow
                 name={section.name}
                 collapsed={collapsedGroups.has(section.id)}
                 onToggle={() => onToggleGroup?.(section.id!)}
               />
-              {!collapsedGroups.has(section.id) &&
-                renderRepoList(section.repos, section.id)}
+              {!collapsedGroups.has(section.id) && <>
+                {section.notice && <p className="px-2 py-1 text-caption-1-medium text-text-tertiary">{section.notice}</p>}
+                {renderRepoList(section.repos, section.id, section.readOnly)}
+              </>}
             </div>
           ),
         )}

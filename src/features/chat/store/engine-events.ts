@@ -1,4 +1,4 @@
-import { ipc, type Message, type QuestionSpec, type SessionMeta } from "@/lib/ipc";
+import { ipc, ipcForMachine, type ActiveRun, type Message, type QuestionSpec, type SessionMeta } from "@/lib/ipc";
 import type { PlanReview, PlanReviewStatus } from "@/lib/ipc";
 import type { EngineEventPayload } from "@/lib/events";
 import {
@@ -7,8 +7,10 @@ import {
   applyPlanSettled,
 } from "./plan-review";
 import { errorText } from "@/lib/errors";
-import { pendingWorkspaceOfKey, dedupeTabs, persistTabs, sessionKey } from "./persistence";
+import { pendingWorkspaceOfKey, parseSessionKey, parseDraftSessionKey, dedupeTabs, persistTabs, sessionKey } from "./persistence";
+import { sessionIpc } from "./session-ipc";
 import { migrateSessionContributions } from "./session-contributions";
+import { historyTurnStartedAt, runTimestamp } from "./session-utils";
 import { migrateAutoCompactSettings } from "../auto-compact-context";
 import {
   EMPTY_SESSION,
@@ -46,6 +48,7 @@ import {
 } from "./ask-loop";
 import { mergeUsage, parseUsage, reportedContextWindow, type ParsedUsage } from "../usage";
 import { usageTrackingEnabled } from "@/features/settings/usage-tracking";
+import { isWeb } from "@/lib/transport";
 import type {
   RegisteredInternalMessageCapture,
 } from "@/features/plugins/runtime/hooks";
@@ -61,6 +64,7 @@ import { workspaceMetadata } from "./lifecycle";
 import type { AfterTurnEvent, InternalMessageCapture, WorkspaceMetadata } from "@ccgui/plugin-sdk";
 import { migrateSelectedBot } from "@/features/bots/selected-bot";
 interface RunLifecycle {
+  machine?: string;
   turnId: string;
   engine: string;
   sessionId: string | null;
@@ -123,11 +127,13 @@ function recordAcceptedFrame(
   frame: string,
   workspacePath: string,
   attempt: number,
+  machine?: string,
 ): void {
-  void ipc.recordAcceptedInternalFrame(engine, sessionId, frame, workspacePath).catch(() => {
+  const client = machine ? ipcForMachine(machine) : ipc;
+  void client.recordAcceptedInternalFrame(engine, sessionId, frame, workspacePath).catch(() => {
     if (attempt >= FRAME_RECORD_MAX_ATTEMPTS) return;
     setTimeout(
-      () => recordAcceptedFrame(engine, sessionId, frame, workspacePath, attempt + 1),
+      () => recordAcceptedFrame(engine, sessionId, frame, workspacePath, attempt + 1, machine),
       FRAME_RECORD_RETRY_MS,
     );
   });
@@ -138,7 +144,7 @@ function persistAcceptedFrames(lifecycle: RunLifecycle): void {
   const sessionId = lifecycle.sessionId;
   if (!sessionId || !frames || frames.length === 0) return;
   for (const frame of frames.splice(0)) {
-    recordAcceptedFrame(lifecycle.engine, sessionId, frame, lifecycle.workspace.path, 1);
+    recordAcceptedFrame(lifecycle.engine, sessionId, frame, lifecycle.workspace.path, 1, lifecycle.machine);
   }
 }
 
@@ -213,7 +219,7 @@ function bindUnboundRun(event: ChatEngineEvent): boolean {
   if (runLifecycles.has(event.runId) || knownRunIds.has(event.runId)) return false;
   let match: string | undefined;
   for (const [placeholder, lifecycle] of pendingRuns) {
-    if (lifecycle.engine !== event.engine) continue;
+    if (lifecycle.engine !== event.engine || lifecycle.machine !== event.machine) continue;
     if (
       lifecycle.sessionId !== null &&
       // Engine events broadcast to every attached client. A pending send that
@@ -503,9 +509,12 @@ export function optimisticMeta(
   sessionId: string,
   workspacePath: string,
   title: string,
+  machine?: string,
 ): SessionMeta {
   const now = Date.now();
   return {
+    ...(machine ? { machine } : {}),
+    origin: isWeb ? "hub" : "local",
     engine,
     sessionId,
     workspacePath,
@@ -530,11 +539,11 @@ export function upsertSessionMetaInto(
   meta: SessionMeta,
 ) {
   set((s) => {
-    if (s.archivedSessionKeys[sessionKey(meta.engine, meta.sessionId, meta.workspacePath)]) {
+    if (s.archivedSessionKeys[sessionKey(meta.engine, meta.sessionId, meta.workspacePath, meta.machine)]) {
       return {};
     }
     const idx = s.sessions.findIndex(
-      (x) => x.engine === meta.engine && x.sessionId === meta.sessionId,
+      (x) => x.engine === meta.engine && x.sessionId === meta.sessionId && x.machine === meta.machine,
     );
     if (idx < 0) return { sessions: [meta, ...s.sessions] };
     const sessions = s.sessions.slice();
@@ -555,7 +564,7 @@ function stampedModel(
   const session = s.bySession[key];
   if (session?.activeModel) return session.activeModel;
   const tab = s.openTabs.find(
-    (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
+    (t) => sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === key,
   );
   return resolveSessionModel(tab, session, s.models[engine]) || null;
 }
@@ -569,7 +578,7 @@ function stampedEffort(
 ): string | null {
   const s = deps.get();
   const tab = s.openTabs.find(
-    (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
+    (t) => sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === key,
   );
   return resolveSessionEffort(tab, s.bySession[key], s.efforts[engine]) || null;
 }
@@ -760,6 +769,20 @@ function onMessage(
     role: string;
     text: string;
   };
+  if (data.role === "user") {
+    // The sending page already inserted an optimistic user row. Other pages,
+    // including reconnecting observers, learn the prompt from the same log.
+    if (runLifecycles.has(event.runId)) return;
+    deps.set((s) => {
+      const prev = s.bySession[key] ?? EMPTY_SESSION;
+      if (prev.messages.some((m) => m.role === "user" && m.runId === event.runId)) return {};
+      return { bySession: { ...s.bySession, [key]: { ...prev, messages: [...settleLiveRows(prev.messages), {
+        ...data, seq: (prev.messages.at(-1)?.seq ?? 0) + 1,
+        runId: event.runId, ts: new Date(event.ts ?? Date.now()).toISOString(),
+      }] } } };
+    });
+    return;
+  }
   if (data.role !== "assistant") return;
   // Snapshots are a stream boundary: feed them through the same run-scoped
   // capture parser as deltas, then flush any unmatched/incomplete text so it
@@ -782,8 +805,9 @@ function onMessage(
       };
     }
     const seq = settled.length ? settled[settled.length - 1].seq + 1 : 1;
-    const durationMs = prev.turnStartedAt
-      ? Math.max(0, Date.now() - prev.turnStartedAt)
+    const turnStart = runTimestamp(event.startedAt) ?? prev.turnStartedAt;
+    const durationMs = turnStart
+      ? Math.max(0, (runTimestamp(event.ts) ?? Date.now()) - turnStart)
       : null;
     return {
       bySession: {
@@ -848,6 +872,7 @@ function onSession(
   key: string,
   deps: EngineEventDeps,
 ) {
+  const client = event.machine ? ipcForMachine(event.machine) : ipc;
   const nativeId = event.data as string;
   const lifecycle = runLifecycles.get(event.runId);
   if (lifecycle) {
@@ -859,13 +884,14 @@ function onSession(
   // foreground tab's workspace (the session would be orphaned there).
   const state = deps.get();
   const owner = state.openTabs.find(
-    (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
+    (t) => sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === key,
   );
   const pendingCandidates = state.openTabs.filter(
     (t) =>
       t.engine === event.engine &&
+      t.machine === event.machine &&
       t.sessionId === null &&
-      state.bySession[sessionKey(t.engine, null, t.workspacePath)] !==
+      state.bySession[sessionKey(t.engine, null, t.workspacePath, t.machine)] !==
         undefined,
   );
   // With several pending tabs of one engine, guessing would pin the session
@@ -882,14 +908,14 @@ function onSession(
     lifecycle?.workspace.path ||
     tab?.workspacePath ||
     routedWorkspace ||
-    deps.get().active?.workspacePath ||
+    (deps.get().active?.machine === event.machine ? deps.get().active?.workspacePath : "") ||
     "";
-  const newKey = sessionKey(event.engine, nativeId, workspacePath);
+  const newKey = sessionKey(event.engine, nativeId, workspacePath, event.machine);
   // The event can resolve straight to the native key when it beat the send
   // response (the run had no routing entry yet). The turn rows and streaming
   // flag still sit under the pending key then; migrate from there instead of
   // orphaning them on a key nothing renders.
-  const pendingKey = sessionKey(event.engine, null, workspacePath);
+  const pendingKey = sessionKey(event.engine, null, workspacePath, event.machine);
   const fromKey =
     pendingKey !== newKey && deps.get().bySession[pendingKey]
       ? pendingKey
@@ -900,7 +926,7 @@ function onSession(
   if (sentModel) {
     pendingSessionModels.delete(fromKey);
     pendingSessionModels.delete(key);
-    void ipc
+    void client
       .rememberSessionModel?.(event.engine, nativeId, sentModel)
       ?.catch(() => {});
   }
@@ -909,7 +935,7 @@ function onSession(
   if (sentEffort) {
     pendingSessionEfforts.delete(fromKey);
     pendingSessionEfforts.delete(key);
-    void ipc
+    void client
       .rememberSessionEffort?.(event.engine, nativeId, sentEffort)
       ?.catch(() => {});
   }
@@ -918,7 +944,7 @@ function onSession(
   if (sentProvider) {
     pendingSessionProviders.delete(fromKey);
     pendingSessionProviders.delete(key);
-    void ipc
+    void client
       .rememberSessionProvider?.(event.engine, nativeId, sentProvider)
       ?.catch(() => {});
   }
@@ -936,6 +962,7 @@ function onSession(
       event.engine,
       workspacePath,
       nativeId,
+      event.machine,
     );
     return next ? { sessionContributions: next } : {};
   });
@@ -981,6 +1008,7 @@ function onSession(
     const activeNext =
       s.active &&
       s.active.engine === event.engine &&
+      s.active.machine === event.machine &&
       s.active.sessionId === null &&
       s.active.workspacePath === workspacePath
         ? { ...s.active, sessionId: nativeId, effort: undefined, provider: undefined }
@@ -999,6 +1027,7 @@ function onSession(
         if (
           stamped ||
           t.engine !== event.engine ||
+          t.machine !== event.machine ||
           t.sessionId !== null ||
           t.workspacePath !== workspacePath
         ) {
@@ -1011,7 +1040,7 @@ function onSession(
     persistTabs(openTabs, s.active);
     return { openTabs };
   });
-  const createdKey = sessionKey(event.engine, nativeId, workspacePath);
+  const createdKey = sessionKey(event.engine, nativeId, workspacePath, event.machine);
   if (!deps.get().createdSessionKeys[createdKey]) {
     deps.set((s) => ({
       createdSessionKeys: { ...s.createdSessionKeys, [createdKey]: true },
@@ -1022,7 +1051,7 @@ function onSession(
     // Test doubles and early boot states may lack the workspaces list; the
     // helper derives a stable id from the path either way.
     const workspace =
-      lifecycle?.workspace ?? workspaceMetadata(deps.get().workspaces ?? [], workspacePath);
+      lifecycle?.workspace ?? workspaceMetadata(deps.get().workspaces ?? [], workspacePath, event.machine);
     dispatchSessionCreated({
       engine: event.engine,
       sessionId: nativeId,
@@ -1032,11 +1061,11 @@ function onSession(
   }
   // The pinned agent followed the draft key; move it onto the native id so
   // the next send in this tab injects it again.
-  migrateSelectedBot(workspacePath, nativeId);
+  migrateSelectedBot(workspacePath, nativeId, event.machine);
   // The auto-compaction threshold/toggle follows the draft too: a value set on
   // a brand-new chat must survive the adoption of the native session id.
   migrateAutoCompactSettings(
-    sessionKey(event.engine, null, workspacePath),
+    sessionKey(event.engine, null, workspacePath, event.machine),
     newKey,
   );
   // Sidebar row + tab title pick the new session up immediately instead of
@@ -1050,6 +1079,7 @@ function onSession(
       nativeId,
       workspacePath,
       firstUser ? firstLineTitle(firstUser.text) : "",
+      event.machine,
     ),
   );
 }
@@ -1177,9 +1207,9 @@ function writeUsageRow(
 ) {
   const state = deps.get();
   const tab = state.openTabs.find(
-    (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
+    (t) => sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === key,
   );
-  void ipc
+  void sessionIpc(key)
     .usageRecord({
       ts: Date.now(),
       engine: event.engine,
@@ -1231,8 +1261,9 @@ function onError(
           )
         : cur.messages,
     );
-    const durationMs = cur.turnStartedAt
-      ? Math.max(0, Date.now() - cur.turnStartedAt)
+    const turnStart = runTimestamp(event.startedAt) ?? cur.turnStartedAt;
+    const durationMs = turnStart
+      ? Math.max(0, (runTimestamp(event.ts) ?? Date.now()) - turnStart)
       : null;
     if (durationMs != null) {
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -1269,7 +1300,7 @@ function onError(
   untrackRun(event.runId);
   dropRunUsage(event.runId);
   // Failed turns can still create a transcript; index it just as onDone does.
-  ipc.rescanSessions().catch(() => {});
+  sessionIpc(key).rescanSessions().catch(() => {});
   deps.markUnseenIfBackground(key);
   dispatchNormalized(event);
   finishRunLifecycle(event.runId, "failed", typeof event.data === "string" ? event.data : undefined, event.sessionId);
@@ -1406,7 +1437,7 @@ function onPermissionDenied(
   // Preview the directory a grant would cover; failure is non-fatal — the
   // backend re-resolves inside grant_root.
   if (path && rowSeq > 0) {
-    void ipc
+    void sessionIpc(key)
       .grantScope(path)
       .then((dir) =>
         patchGrantBySeq(deps.set, key, rowSeq, (grant) => ({ ...grant, dir })),
@@ -1418,7 +1449,7 @@ function onPermissionDenied(
 /** End a multi-select round through the CLI's free-form row: the only answer
  * that both stops the re-ask loop and reaches the formatted result. */
 function sendAskTerminator(loop: AskLoop, key: string, deps: EngineEventDeps) {
-  void ipc
+  void sessionIpc(key)
     .answerQuestion(loop.runId, loop.requestId, { [loop.base]: ASK_OTHER_OPTION })
     .catch((error) => patchSession(deps.set, key, { error: errorText(error) }));
 }
@@ -1441,7 +1472,7 @@ function onQuestion(
   // labels travel as its text, so it must not surface as another card.
   const editing = method === "editor" || method === "input" ? takeAskEditor(key) : undefined;
   if (editing) {
-    void ipc
+    void sessionIpc(key)
       .answerQuestion(editing.runId, requestId, { [editing.base]: editing.text })
       .catch((error) => patchSession(deps.set, key, { error: errorText(error) }));
     return;
@@ -1754,8 +1785,8 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
         )
       : cur.messages;
     messages = settleLiveRows(messages);
-    const turnStart = cur.turnStartedAt ?? prev.turnStartedAt;
-    const durationMs = turnStart ? Math.max(0, Date.now() - turnStart) : null;
+    const turnStart = runTimestamp(event.startedAt) ?? cur.turnStartedAt ?? prev.turnStartedAt;
+    const durationMs = turnStart ? Math.max(0, (runTimestamp(event.ts) ?? Date.now()) - turnStart) : null;
     const model = stampedModel(deps, event.engine, key);
     const effort = stampedEffort(deps, event.engine, key);
     // Stamp usage, durationMs, effort, and model onto the turn's last assistant message.
@@ -1809,7 +1840,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
   // feature's own switch gates it (localStorage-backed, see usage-tracking.ts).
   recordTurnUsage(deps, event, key, finalUsage);
   // Native file changed; refresh list cache in background.
-  void ipc.rescanSessions().catch(() => {});
+  void sessionIpc(key).rescanSessions().catch(() => {});
   deps.markUnseenIfBackground(key);
   // 一轮对话落定（正常完成或被用户中断）时计数；是否到节奏、用哪个 Bot
   // 复盘由记忆模块判断（features/bots/memory-review.ts）。
@@ -1848,6 +1879,34 @@ function recordTurnUsage(
   writeUsageRow(deps, event, key, parsed, 1);
 }
 
+/** Lift the two flags the composer / sidebar / tab dots read. The caller has
+ *  already routed the run, so Stop and the orphan sweep can find it. */
+function markRunStreaming(
+  key: string,
+  deps: Pick<EngineEventDeps, "set" | "get">,
+  startedAt: number | null,
+  runId: string,
+) {
+  const cur = deps.get().bySession[key];
+  const turnStartedAt = startedAt ?? cur?.turnStartedAt ?? null;
+  // A process snapshot or a live suffix does not contain the opening history.
+  // Locally sent turns already have their optimistic prompt in this page.
+  const needsHistory = cur?.historyLoaded === undefined && !cur?.messages.length && !runLifecycles.has(runId);
+  if (!cur?.streaming || cur.turnStartedAt !== turnStartedAt || needsHistory) {
+    patchSession(deps.set, key, {
+      streaming: true,
+      turnStartedAt,
+      error: null,
+      ...(needsHistory ? { historyLoaded: false } : {}),
+    });
+  }
+  if (!deps.get().streamingByKey[key]) {
+    deps.set((s) => ({
+      streamingByKey: setStreamingFlag(s.streamingByKey, key, true),
+    }));
+  }
+}
+
 /** Mark a session running off an event of a turn this client never sent: the
  *  phone watching the desktop's run, or the desktop watching the phone's.
  *  Routes the run first so Stop and the orphan sweep reach it, then lifts the
@@ -1860,17 +1919,39 @@ function adoptObservedRun(
   if (!runRouting.has(event.runId)) {
     settleOrphanedRuns(deps.set, routeRun(event.runId, key));
   }
-  const cur = deps.get().bySession[key];
-  if (!cur?.streaming) {
-    patchSession(deps.set, key, {
-      streaming: true,
-      turnStartedAt: cur?.turnStartedAt ?? Date.now(),
-    });
-  }
-  if (!deps.get().streamingByKey[key]) {
-    deps.set((s) => ({
-      streamingByKey: setStreamingFlag(s.streamingByKey, key, true),
-    }));
+  markRunStreaming(key, deps, runTimestamp(event.startedAt) ??
+    (event.kind === "launch" ? runTimestamp(event.ts) : null), event.runId);
+}
+
+/** Session key a live desktop run should light. A known session id matches
+ *  the sidebar row (`engine/sessionId`). Before the CLI announces an id, the
+ *  only row is the draft tab for that workspace. */
+function liveRunKey(run: ActiveRun): string | null {
+  if (!run.runId || !run.engine) return null;
+  if (run.sessionId) return sessionKey(run.engine, run.sessionId, run.workspacePath, run.machine);
+  if (!run.workspacePath) return null;
+  return sessionKey(run.engine, null, run.workspacePath, run.machine);
+}
+
+/** Paint turns the desktop still has in its process table. A refresh or a
+ *  machine switch loads a blank page; until the next engine event those
+ *  sessions would look idle. Already-finished runs stay finished. */
+export function adoptLiveRuns(
+  runs: readonly ActiveRun[],
+  deps: Pick<EngineEventDeps, "set" | "get">,
+) {
+  if (!Array.isArray(runs) || runs.length === 0) return;
+  for (const run of runs) {
+    if (settledRuns.get(run.runId)) continue;
+    const key = liveRunKey(run);
+    if (!key) continue;
+    if (deps.get().bySession[key]?.settledRunIds?.includes(run.runId)) continue;
+    if (runRouting.get(run.runId) !== key) {
+      settleOrphanedRuns(deps.set, routeRun(run.runId, key));
+    }
+    const cur = deps.get().bySession[key];
+    markRunStreaming(key, deps, runTimestamp(run.startedAt) ??
+      cur?.turnStartedAt ?? historyTurnStartedAt(cur?.messages ?? []), run.runId);
   }
 }
 
@@ -1904,6 +1985,7 @@ export function handleEngineEvents(
       !isTool ||
       event.runId !== toolBatch.event.runId ||
       event.engine !== toolBatch.event.engine ||
+      event.machine !== toolBatch.event.machine ||
       event.sessionId !== toolBatch.event.sessionId
     )) {
       flushTools();
@@ -1948,6 +2030,7 @@ export function handleEngineEvents(
               lifecycle.engine,
               lifecycle.sessionId,
               lifecycle.workspace.path,
+              lifecycle.machine,
             ),
           ),
         );
@@ -1960,24 +2043,26 @@ export function handleEngineEvents(
     }
     const state = deps.get();
     let key = runRouting.get(event.runId) ?? Object.keys(state.bySession).find(
-      (candidate) => state.bySession[candidate]?.settledRunIds?.includes(event.runId),
+      (candidate) => (parseDraftSessionKey(candidate) ?? parseSessionKey(candidate))?.machine === event.machine && state.bySession[candidate]?.settledRunIds?.includes(event.runId),
     );
+    if (key && (parseDraftSessionKey(key) ?? parseSessionKey(key))?.machine !== event.machine) key = undefined;
     if (key) touchRun(event.runId);
     if (!key && event.sessionId) {
-      key = sessionKey(event.engine, event.sessionId, "");
-      // sessionId-only key lacks workspace; find active match
-      if (!(key in state.bySession)) {
-        const match = Object.keys(state.bySession).find(
-          (k) => k === key || k.endsWith(`/${event.sessionId}`),
-        );
-        if (match) key = match;
-      }
+      key = sessionKey(event.engine, event.sessionId, "", event.machine);
     }
+    if (!key && event.workspacePath) key = sessionKey(event.engine, null, event.workspacePath, event.machine);
     if (!key) {
-      if ([...pendingRuns.values()].some((lifecycle) => lifecycle.engine === event.engine)) {
+      if ([...pendingRuns.values()].some((lifecycle) => lifecycle.engine === event.engine && lifecycle.machine === event.machine)) {
         bufferEarlyEvent(event);
       }
       continue;
+    }
+    if (event.cursor !== undefined) {
+      if (event.cursor <= (deps.get().bySession[key]?.eventCursor ?? -1)) continue;
+      patchSession(deps.set, key, { eventCursor: event.cursor,
+        ...(event.historySource === undefined ? {} : { historySource: event.historySource }),
+        ...(event.historyEpoch === undefined ? {} : { historyEpoch: event.historyEpoch }),
+        ...(deps.get().bySession[key] ? {} : { historyLoaded: false }) });
     }
     if (event.kind === "done" || event.kind === "error") {
       settledRuns.set(event.runId, event.kind);
@@ -1987,7 +2072,7 @@ export function handleEngineEvents(
       // Every turn funnels through here: drop the computer-use global
       // Esc-to-stop so a system-wide hotkey never outlives its run. Arming
       // is per computer-use send (messaging.ts); the call is idempotent.
-      void ipc.computerUseSetActive?.(false)?.catch(() => {});
+      void sessionIpc(key).computerUseSetActive?.(false)?.catch(() => {});
     }
     if (!isPlanEvent &&
       state.bySession[key]?.settledRunIds?.includes(event.runId)) {
@@ -2032,7 +2117,7 @@ export function handleEngineEvents(
         if (isTool && data) {
           if (retryingKeys.has(key)) clearRetry(key, deps);
           toolBatch ??= { event, key, tools: [] };
-          toolBatch.tools.push({ ...data, patch: data.patch === true });
+          toolBatch.tools.push({ ...data, runId: event.runId, patch: data.patch === true });
         } else {
           onMessage(event, key, deps);
         }

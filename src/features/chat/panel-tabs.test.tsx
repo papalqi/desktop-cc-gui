@@ -14,6 +14,9 @@ vi.mock("@/features/files/FilesPanel", () => ({
 vi.mock("@/features/git/ChangesPanel", () => ({
   ChangesPanel: ({ visible = true }: { visible?: boolean }) => visible ? <div>changes-panel-stub</div> : null,
 }));
+vi.mock("@/features/profile/ProfilePanel", () => ({
+  ProfilePanel: ({ visible = true }: { visible?: boolean }) => visible ? <div>profile-frame-stub</div> : <div>profile-idle-stub</div>,
+}));
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -75,6 +78,16 @@ describe("panel tabs registry integration (plan §4.2 #4)", () => {
     render("changes", true);
     expect(container.textContent).not.toContain("changes-panel-stub");
     expect(container.textContent).toContain("files-panel-stub");
+  });
+
+  it("gives the profile tab visibility so its reader frame unmounts off-screen", () => {
+    render("files");
+    expect(container.textContent).toContain("profile-idle-stub");
+    expect(container.textContent).not.toContain("profile-frame-stub");
+    render("profile");
+    expect(container.textContent).toContain("profile-frame-stub");
+    render("profile", true);
+    expect(container.textContent).not.toContain("profile-frame-stub");
   });
 
   it("honors a registry override of the changes component without builtin props", () => {

@@ -4,6 +4,7 @@ import { resolveSelectedRepository } from "@/features/files/repositorySelection"
 import { useGitStore } from "@/features/git/store";
 import { errorText } from "@/lib/errors";
 import type { ActiveSession } from "../store";
+import { machineResourceKey } from "@/lib/web-machine";
 
 function baseName(path: string): string {
   const trimmed = path.replace(/[/\\]+$/, "");
@@ -20,10 +21,13 @@ function baseName(path: string): string {
  * workspace, matching the previous behavior exactly. */
 export function useBranchSwitcher(active: ActiveSession | null) {
   const workspacePath = active?.workspacePath;
+  const machine = active?.machine;
+  const treeMachine = useFilesStore((s) => s.machine);
   const selectedPath = useFilesStore((s) => s.selectedPath);
   const repositories = useFilesStore((s) => s.repositories);
   const branchRepo = useMemo(() => {
     if (!workspacePath) return null;
+    if (treeMachine !== machine) return workspacePath;
     return (
       resolveSelectedRepository({
         selectedPath,
@@ -31,12 +35,13 @@ export function useBranchSwitcher(active: ActiveSession | null) {
         workspacePath,
       }) ?? workspacePath
     );
-  }, [workspacePath, selectedPath, repositories]);
+  }, [workspacePath, machine, treeMachine, selectedPath, repositories]);
+  const repoKey = branchRepo ? machineResourceKey(branchRepo, machine) : null;
   const branch = useGitStore((s) =>
-    branchRepo ? s.statusByWorkspace[branchRepo]?.branch : undefined,
+    repoKey ? s.statusByWorkspace[repoKey]?.branch : undefined,
   );
   const branches = useGitStore((s) =>
-    branchRepo ? s.branchesByWorkspace[branchRepo] : undefined,
+    repoKey ? s.branchesByWorkspace[repoKey] : undefined,
   );
   /** Display name of the followed repo when it's a nested one; the status bar
    * prefixes it to the branch so the chip never mislabels the repo. */
@@ -49,9 +54,9 @@ export function useBranchSwitcher(active: ActiveSession | null) {
   useEffect(() => {
     if (!branchRepo) return;
     const git = useGitStore.getState();
-    void git.loadBranches(branchRepo);
-    void git.refresh(branchRepo).catch(() => undefined);
-  }, [branchRepo]);
+    void git.loadBranches(branchRepo, machine);
+    void git.refresh(branchRepo, false, machine).catch(() => undefined);
+  }, [branchRepo, machine]);
   const [branchError, setBranchError] = useState<string | null>(null);
   /** Dismiss the checkout-error banner (cleared anyway on the next attempt). */
   const dismissBranchError = useCallback(() => setBranchError(null), []);
@@ -61,10 +66,10 @@ export function useBranchSwitcher(active: ActiveSession | null) {
       setBranchError(null);
       void useGitStore
         .getState()
-        .checkout(branchRepo, name)
+        .checkout(branchRepo, name, machine)
         .catch((err: unknown) => setBranchError(errorText(err)));
     },
-    [branchRepo],
+    [branchRepo, machine],
   );
   return { branch, branches, branchRepoName, branchError, handleBranchSelect, dismissBranchError };
 }

@@ -3,7 +3,9 @@ import type { WorktreeCreateProgress } from "@/lib/ipc";
 
 const createMock = vi.fn();
 const removeMock = vi.fn();
+const scopedCreateMock = vi.fn();
 vi.mock("@/lib/ipc", () => ({
+  ipcForMachine: (machine: string) => ({ gitWorktreeCreate: (...args: unknown[]) => scopedCreateMock(machine, ...args) }),
   ipc: {
     gitWorktreeCreate: (...args: unknown[]) => createMock(...args),
     gitWorktreeCreateCancel: vi.fn(async () => undefined),
@@ -27,6 +29,7 @@ vi.mock("@/features/chat/store", () => ({
     getState: () => ({
       workspaces: [
         { id: "ws-parent", path: "/repo/app", name: "app", lastOpenedAt: 1, sortOrder: null, groupId: null },
+        { id: "PC6/ws-parent", machine: "PC6", path: "/repo/app", name: "app", lastOpenedAt: 1, sortOrder: null, groupId: null },
         { id: "ws-wt", path: "/repo/app-worktrees/pr-7-x", name: "pr-7-x", kind: "worktree", parentId: "ws-parent", lastOpenedAt: null, sortOrder: null, groupId: null },
       ],
       refreshWorkspaces: refreshWorkspacesMock,
@@ -73,6 +76,7 @@ describe("plugin worktree bridge", () => {
       prefs: { location: null, openSessionAfter: true },
     });
     createMock.mockReset().mockResolvedValue(undefined);
+    scopedCreateMock.mockReset().mockResolvedValue(undefined);
     listenMock.mockReset().mockResolvedValue(() => {});
     refreshWorkspacesMock.mockReset().mockResolvedValue(undefined);
     dismissCenterSurfacesMock.mockReset();
@@ -105,6 +109,17 @@ describe("plugin worktree bridge", () => {
     await expect(pending).rejects.toThrow(/^pr_not_found: remote ref not found$/);
     // 失败行留在侧栏（宿主既有语义）：用户可重试，插件也在任务条上给同一个原因。
     expect(useWorktreeStore.getState().pending).toHaveLength(1);
+  });
+
+  it("keeps the parent machine for creation and ignores another machine's progress", async () => {
+    const pending = createPluginWorktree("git-tasks", { ...DEF, parentWorkspaceId: "PC6/ws-parent" });
+    const row = useWorktreeStore.getState().pending[0];
+    expect(row.machine).toBe("PC6");
+    expect(scopedCreateMock).toHaveBeenCalledWith("PC6", row.creationId, row.args);
+    useWorktreeStore.getState().applyProgress({ creationId: row.creationId, stage: "done" }, "PC0");
+    expect(useWorktreeStore.getState().pending).toHaveLength(1);
+    useWorktreeStore.getState().applyProgress({ creationId: row.creationId, stage: "done" }, "PC6");
+    await expect(pending).resolves.toEqual({ worktreePath: "/repo/app-worktrees/pr-1842-x" });
   });
 
   it("rejects as canceled when the user cancels the sidebar row", async () => {

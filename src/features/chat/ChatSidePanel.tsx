@@ -2,9 +2,11 @@ import { useTranslation } from "react-i18next";
 import { PluginBoundary } from "@/features/plugins/boundary/PluginBoundary";
 import { pluginIdFromRegistryKey } from "@ccgui/plugin-sdk";
 import { cx } from "@/utils/cx";
-import { ChangesTab } from "./panel-tabs";
+import { ChangesTab, ProfileTab } from "./panel-tabs";
 import { resolveActivePanelTab, useSortedPanelTabs } from "./use-panel-tabs";
 import type { ActiveSession } from "./store";
+import { FilesPanel } from "@/features/files/FilesPanel";
+import { machineResourceKey } from "@/lib/web-machine";
 
 export function ChatSidePanel({
   active,
@@ -76,8 +78,13 @@ export function ChatSidePanel({
       >
         {panelTabs.map((tab) => {
           const TabComponent = tab.component;
+          const tabVisible = !panelCollapsed && activeTab === tab.id;
           const panel = tab.id === "changes" && TabComponent === ChangesTab ? (
-            <ChangesTab workspacePath={active.workspacePath} visible={!panelCollapsed && activeTab === tab.id} />
+            <ChangesTab workspacePath={active.workspacePath} machine={active.machine} visible={tabVisible} />
+          ) : tab.id === "profile" && TabComponent === ProfileTab ? (
+            <ProfileTab workspacePath={active.workspacePath} visible={tabVisible} />
+          ) : tab.id === "files" && TabComponent === FilesPanel ? (
+            <FilesPanel key={machineResourceKey(active.workspacePath, active.machine)} workspacePath={active.workspacePath} machine={active.machine} />
           ) : (
             <TabComponent workspacePath={active.workspacePath} />
           );

@@ -2,9 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useChatStore } from "./store";
 import { SessionTabStrip } from "./components/SessionTabStrip";
+import { BridgeStatusBanner } from "./components/BridgeStatusBanner";
 import { ErrorBanner } from "./components/ErrorBanner";
 import { AppStatusBar } from "@/components/application/app-status-bar/app-status-bar";
 import { isWeb } from "@/lib/platform";
+import { machineResourceKey } from "@/lib/web-machine";
 import { useTitlebarStyle } from "@/features/settings/titlebar";
 import { useBetaFeature } from "@/features/settings/beta-features";
 import PanelLeftOpen from "lucide-react/dist/esm/icons/panel-left-open";
@@ -30,6 +32,7 @@ import { ChatCenterPane } from "./ChatCenterPane";
 import { SplitDragProvider } from "./split/drag";
 import { useComposerBridge } from "./split/composer-bridge";
 import { resolvePanelLayout } from "./panel-layout";
+import { useSessionNotifications } from "./session-notifications";
 // Side-effect import: registers the builtin files/changes tabs into
 // panelTabRegistry (plan §4.2 #4).
 import "./panel-tabs";
@@ -49,6 +52,7 @@ const PANEL_MEDIA = "(max-width: 1279px)";
 
 export default function ChatPage() {
   const { t } = useTranslation();
+  useSessionNotifications();
   const titlebarStyle = useTitlebarStyle();
   // Store actions/slices are stable or low-frequency references. The
   // high-frequency session/draft subscriptions live in ChatConversation
@@ -151,7 +155,7 @@ export default function ChatPage() {
     closeDiff,
   } = useChatTabs({ setDialog });
   const diffStatus = useGitStore((s) =>
-    s.diffView ? s.statusByWorkspace[s.diffView.workspacePath] : undefined,
+    s.diffView ? s.statusByWorkspace[machineResourceKey(s.diffView.workspacePath, s.diffView.machine)] : undefined,
   );
   const {
     active,
@@ -177,6 +181,9 @@ export default function ChatPage() {
     handleCreateGroup,
     handleNewWorktree,
     handleDeleteWorktree,
+    staleSessionCount,
+    liveRunningKeys,
+    handleArchiveWeek,
   } = useChatSidebar({
     sessionById,
     threadStreaming,
@@ -197,12 +204,13 @@ export default function ChatPage() {
     if (activeTabKey) handleTabClose(activeTabKey);
   }, [activeTabKey, handleTabClose]);
 
-  useChatPageLifecycle(init, gitRefresh, active?.workspacePath);
+  useChatPageLifecycle(init, gitRefresh, active?.workspacePath, active?.machine);
   useChatShortcutHandlers(
     active?.workspacePath,
     toggleTerminal,
     handleNewSession,
     closeActiveTab,
+    active?.machine,
   );
 
   return (
@@ -251,6 +259,9 @@ export default function ChatPage() {
         onCreateGroup={handleCreateGroup}
         onNewWorktree={handleNewWorktree}
         onDeleteWorktree={handleDeleteWorktree}
+        staleSessionCount={staleSessionCount}
+        onArchiveWeek={handleArchiveWeek}
+        liveRunningKeys={liveRunningKeys}
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background-primary-default md:rounded-l-[14px] md:border-l md:border-separator-border">
         <SessionTabStrip
@@ -282,6 +293,7 @@ export default function ChatPage() {
             active ? (
               <ChatPanelHeader
                 workspacePath={active.workspacePath}
+                machine={active.machine}
                 panelTab={panelTab}
                 onPanelTabChange={setPanelTab}
                 panelCollapsed={panelCollapsedEffective}
@@ -294,6 +306,7 @@ export default function ChatPage() {
           }
         />
 
+        {isWeb && <BridgeStatusBanner className="mx-4 mt-2" />}
         {actionError && (
           <ErrorBanner
             className="mx-4 mt-2"
@@ -341,7 +354,7 @@ export default function ChatPage() {
             overlay={panelOverlay}
           />
         </div>
-        {active && <TerminalDock workspacePath={active.workspacePath} />}
+        {active && <TerminalDock workspacePath={active.workspacePath} machine={active.machine} />}
         <AppStatusBar />
       </div>
 

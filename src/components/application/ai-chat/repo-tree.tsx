@@ -15,7 +15,8 @@ import Trash2 from "lucide-react/dist/esm/icons/trash-2";
 import X from "lucide-react/dist/esm/icons/x";
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { paginateThreads } from "@/components/application/ai-chat/repo-pagination";
-import { ipc } from "@/lib/ipc";
+import { ipc, ipcForMachine } from "@/lib/ipc";
+import { machineResourceKey } from "@/lib/web-machine";
 import { useWorktreeStore } from "@/features/worktree/store";
 import { WorktreeProgressRow } from "@/features/worktree/WorktreeProgressRow";
 import type { AiChatRepo, AiChatThread, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
@@ -26,15 +27,22 @@ import { cx } from "@/utils/cx";
 /** Streaming/unseen status dot on a thread row; renders nothing when the
  *  thread is neither streaming nor waiting to be seen. */
 function ThreadStatusDot({
+  activity,
   streaming,
   retrying,
   unseen,
 }: {
+  activity?: AiChatThread["activity"];
   streaming: boolean;
   retrying: boolean;
   unseen: boolean;
 }) {
   const { t } = useTranslation();
+  if (activity === "awaiting-approval" || activity === "awaiting-input") {
+    return <span role="status" className="shrink-0 rounded-sm bg-background-tertiary-default px-1 text-caption-2-medium text-text-warning-primary">
+      {t(activity === "awaiting-approval" ? "chat.sessionAwaitingApproval" : "chat.sessionAwaitingInput")}
+    </span>;
+  }
   if (streaming) {
     return (
       <span
@@ -121,14 +129,19 @@ function ThreadHoverActions({
 /** Chat row under an open repo — indented 36px, relative-time chip on the
  *  right, hover action icons (pin / rename / delete; archive lives in the
  *  right-click menu only). */
-function ThreadItem({
+export function ThreadItem({
   id,
   label,
   engine,
+  origin,
+  description,
+  metadataSyncPending,
+  metadataSyncError,
   time,
   pinned = false,
   isSelected = false,
   streaming = false,
+  activity,
   retrying = false,
   unseen = false,
   isDraft = false,
@@ -136,7 +149,9 @@ function ThreadItem({
   onSelect,
   onAction,
   onContextMenu,
+  flat = false,
 }: AiChatThread & {
+  flat?: boolean;
   tabIndex?: number;
   onSelect?: (id: string) => void;
   onAction?: (id: string, action: ThreadAction) => void;
@@ -145,6 +160,7 @@ function ThreadItem({
 }) {
   // 拖到中心区 = 分屏（边=切分到那一侧，中心=替换/互换）：会话在按下时才查，
   // 免得每一行都订阅整个会话列表。
+  const { t } = useTranslation();
   const startDrag = useDragSource(
     useCallback(() => {
       const session = sessionFromThreadId(id);
@@ -157,7 +173,8 @@ function ThreadItem({
         id && onContextMenu ? (event) => onContextMenu(event, id) : undefined
       }
       className={cx(
-        "group flex w-full cursor-pointer items-center gap-2.5 rounded-2lg py-[5px] pr-2 pl-9 transition-colors duration-150 ease",
+        "group flex w-full cursor-pointer items-center gap-2.5 rounded-2lg py-[5px] pr-2 transition-colors duration-150 ease",
+        flat ? "pl-2" : "pl-9",
         isSelected ? "bg-background-secondary-hover" : "hover:bg-background-secondary-hover",
       )}
     >
@@ -178,7 +195,7 @@ function ThreadItem({
             className="size-3 shrink-0 text-foreground-icon-secondary"
           />
         )}
-        <ThreadStatusDot streaming={streaming} retrying={retrying} unseen={unseen} />
+        <ThreadStatusDot streaming={streaming} activity={activity} retrying={retrying} unseen={unseen} />
         {/* Native title tooltip: hover a moment to read the full title when
             the row truncates it (same pattern as the repo row below). */}
         <span
@@ -193,7 +210,12 @@ function ThreadItem({
             />
           )}
           {label}
+          {description && <span className="block truncate text-caption-2-medium text-text-tertiary">{description}</span>}
         </span>
+        {origin === "local" && <span className="shrink-0 text-caption-2-medium text-text-tertiary">{t("chat.localSession")}</span>}
+        {metadataSyncPending && <span role="status" className={cx("shrink-0 text-caption-2-medium", metadataSyncError ? "text-text-error-primary" : "text-text-tertiary")}>
+          {t(metadataSyncError ? "chat.metadataSyncFailed" : "chat.metadataSyncPending")}
+        </span>}
       </button>
       {id && (
         <ThreadHoverActions id={id} pinned={pinned} isDraft={isDraft} onAction={onAction} />
@@ -416,7 +438,7 @@ function WorktreeChildRow({
 }) {
   const { t } = useTranslation();
   const missing = useWorktreeStore((s) =>
-    repo.path ? s.missingPaths[repo.path] === true : false,
+    repo.path ? s.missingPaths[machineResourceKey(repo.path, repo.machine)] === true : false,
   );
   // 收起时把线程运行状态聚合到本行（展开时各线程行自己带状态点）：任一
   // 线程流式中即显示呼吸点；全部流式线程都在退避重试时降为静态点，与会
@@ -533,7 +555,8 @@ function WorktreeGroup({
   useEffect(() => {
     if (collapsed) return;
     if (parent.path) {
-      void ipc
+      const client = parent.machine ? ipcForMachine(parent.machine) : ipc;
+      void client
         .gitWorktreeList(parent.path)
         .then((list) => {
           const locked: Record<string, string> = {};
@@ -542,12 +565,12 @@ function WorktreeGroup({
             if (w.locked) locked[w.path] = w.lockReason ?? "";
             if (w.prunable && !w.isMain) missing[w.path] = true;
           }
-          useWorktreeStore.getState().setGitStates(locked, missing);
+          useWorktreeStore.getState().setGitStates(locked, missing, parent.machine);
         })
         .catch(() => undefined);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 用路径串代替数组引用
-  }, [childPathsKey, collapsed, parent.path]);
+  }, [childPathsKey, collapsed, parent.path, parent.machine]);
 
   if (children.length === 0 && pending.length === 0) return null;
   return (

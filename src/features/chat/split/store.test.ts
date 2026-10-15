@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "../store";
 import { sessionKey, type ActiveSession } from "../store/persistence";
 import {
@@ -6,6 +6,7 @@ import {
   reconcileLayout,
   SPLIT_LAYOUT_KEY,
   useSplitStore,
+  sessionFromThreadId,
 } from "./store";
 import { listPanes, makeBranch, makePane, solePane } from "./tree";
 
@@ -18,6 +19,7 @@ function ids(root = useSplitStore.getState().root) {
 }
 
 let focusTab: ReturnType<typeof vi.fn>;
+afterEach(() => window.history.replaceState(null, "", "/"));
 
 beforeEach(() => {
   localStorage.clear();
@@ -88,6 +90,16 @@ describe("reconcileLayout", () => {
     );
     expect(next).toEqual({ root: null, focusedPaneId: null, lastActiveKey: "claude/a" });
   });
+});
+
+it("keeps same-named sessions from two machines in separate panes and focuses the explicit machine", () => {
+  window.history.replaceState(null, "", "/CCGUI/?global=1&machine=PC0");
+  const pc0 = { ...session("same"), machine:"PC0" }, pc6 = { ...session("same"), machine:"PC6" };
+  useChatStore.setState({ active:pc0, openTabs:[pc0,pc6] });
+  useSplitStore.getState().dropSession("solo", "right", pc6);
+  expect(listPanes(useSplitStore.getState().root).map((pane) => pane.session?.machine)).toEqual(["PC0","PC6"]);
+  expect(focusTab).toHaveBeenCalledWith("claude","same","/repo","PC6");
+  expect(sessionFromThreadId("PC6/claude/same")).toBe(pc6);
 });
 
 describe("split store actions", () => {

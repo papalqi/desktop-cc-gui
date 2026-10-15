@@ -14,6 +14,7 @@ import {
 import { getFileTreeIconSvg } from "./fileIcons";
 import { searchEntries } from "./file-search";
 import { joinPath, useFilesStore } from "./store";
+import { machineResourceKey } from "@/lib/web-machine";
 
 const INPUT_ID = "file-search-input";
 
@@ -27,11 +28,13 @@ const INPUT_ID = "file-search-input";
 export function FileSearchOverlay({ searchRoot }: { searchRoot: string }) {
   const { t } = useTranslation();
   const root = useFilesStore((s) => s.root);
+  const machine = useFilesStore((s) => s.machine);
+  const cacheRoot = machineResourceKey(root, machine);
   const closeSearch = useFilesStore((s) => s.closeSearch);
-  const index = useMentionIndexStore((s) => (root ? s.byRoot[root] : undefined));
+  const index = useMentionIndexStore((s) => (root ? s.byRoot[cacheRoot] : undefined));
   useEffect(() => {
-    if (root) useMentionIndexStore.getState().ensure(root);
-  }, [root]);
+    if (root) useMentionIndexStore.getState().ensure(cacheRoot);
+  }, [root, cacheRoot]);
 
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
@@ -57,10 +60,10 @@ export function FileSearchOverlay({ searchRoot }: { searchRoot: string }) {
       // platform-separator paths the tree/store use.
       const absolute = joinPath(root, entry.rel);
       if (entry.isDir) useFilesStore.getState().selectPath(absolute, true);
-      else void useFilesStore.getState().openFile(absolute);
+      else void useFilesStore.getState().openFile(absolute, machine);
       closeSearch();
     },
-    [root, closeSearch],
+    [root, machine, closeSearch],
   );
 
   // Keys live on the window (same pattern as the command palette): the input

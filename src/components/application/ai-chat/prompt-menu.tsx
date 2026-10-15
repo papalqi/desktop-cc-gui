@@ -1,4 +1,6 @@
 "use client";
+import { machineResourceKey } from "@/lib/web-machine";
+import { useScopedSession } from "@/features/chat/split/session-scope";
 
 import { memo, useEffect, useMemo, type MutableRefObject } from "react";
 import { useTranslation } from "react-i18next";
@@ -96,10 +98,11 @@ export function PromptMenu({
   menuRef?: MutableRefObject<PromptMenuHandle | null>;
 }) {
   const { t } = useTranslation();
-  const catalog = usePromptStore((s) => (root ? s.byRoot[root] : undefined));
+  const cacheRoot = machineResourceKey(root, useScopedSession()?.machine);
+  const catalog = usePromptStore((s) => (root ? s.byRoot[cacheRoot] : undefined));
   useEffect(() => {
-    if (root) usePromptStore.getState().ensure(root);
-  }, [root]);
+    if (root) usePromptStore.getState().ensure(cacheRoot);
+  }, [root, cacheRoot]);
 
   const matched = useMemo(
     () => matchPrompts(catalog?.entries ?? [], query),

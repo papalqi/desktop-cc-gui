@@ -13,6 +13,7 @@ import { clearScopedContributions, sessionLifecycleBase } from "./lifecycle";
 import { getConversationModeState } from "@/features/plugins/conversation/state";
 import type { ChatStore } from "./types";
 import type { StoreGet, StoreSet } from "./context";
+import { setWebMachine, webMultiMachine } from "@/lib/web-machine";
 
 /**
  * Tab-strip actions: new/close/focus/move and the engine picker's pending-tab
@@ -25,7 +26,7 @@ export interface TabDeps {
   get: StoreGet;
   /** 离开一个会话（关标签 / 切走）时的钩子：后台复盘用它补一次收尾
    *  （features/bots/memory-review.ts）。 */
-  sessionEnded?: (engine: string, sessionId: string, workspacePath: string) => void;
+  sessionEnded?: (engine: string, sessionId: string, workspacePath: string, machine?: string) => void;
 }
 
 /** Private tab helpers other action groups use (lifecycle closes tabs on
@@ -40,6 +41,7 @@ export interface TabHelpers {
     engine: string,
     sessionId: string | null,
     workspacePath: string,
+    machine?: string,
   ) => void;
   /** Drop a key from the closed-tab reopen cache (session deleted/archived). */
   forgetClosedTab: (key: string) => void;
@@ -63,9 +65,9 @@ export function createTabActions(
     const previous = get().active;
     if (
       previous?.sessionId &&
-      (!tab || !sameTab(previous, tab.engine, tab.sessionId, tab.workspacePath))
+      (!tab || !sameTab(previous, tab.engine, tab.sessionId, tab.workspacePath, tab.machine))
     ) {
-      deps.sessionEnded?.(previous.engine, previous.sessionId, previous.workspacePath);
+      deps.sessionEnded?.(previous.engine, previous.sessionId, previous.workspacePath, previous.machine);
     }
     if (!tab) {
       set({ active: null });
@@ -73,8 +75,10 @@ export function createTabActions(
       emitSessionActivated(null, null);
       return;
     }
+    if (tab.machine && webMultiMachine()) setWebMachine(tab.machine);
+    if (tab.machine) void get().refreshMachineRuntime(tab.machine);
     if (tab.sessionId)
-      void get().selectSession(tab.engine, tab.sessionId, tab.workspacePath);
+      void get().selectSession(tab.engine, tab.sessionId, tab.workspacePath, tab.machine);
     else {
       // A pending tab sends with its own engine, so the picker must follow it
       // — otherwise the chip shows one CLI while sends go to another.
@@ -99,7 +103,7 @@ export function createTabActions(
       if (!current) return {};
       const active: ActiveSession = { ...current, ...patch };
       const openTabs = s.openTabs.map((t) =>
-        sameTab(t, current.engine, current.sessionId, current.workspacePath)
+        sameTab(t, current.engine, current.sessionId, current.workspacePath, current.machine)
           ? active
           : t,
       );
@@ -122,7 +126,7 @@ export function createTabActions(
     // Keys whose tab is open again are not "closed" anymore.
     const openKeys = new Set(
       get().openTabs.map((t) =>
-        sessionKey(t.engine, t.sessionId, t.workspacePath),
+        sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine),
       ),
     );
     for (let j = closedTabCache.length - 1; j >= 0; j--) {
@@ -154,17 +158,18 @@ export function createTabActions(
     engine: string,
     sessionId: string | null,
     workspacePath: string,
+    machine?: string,
   ) {
-    if (getConversationModeState().isTabCloseBlocked(sessionKey(engine, sessionId, workspacePath), workspacePath)) return;
+    if (getConversationModeState().isTabCloseBlocked(sessionKey(engine, sessionId, workspacePath, machine), workspacePath)) return;
     const s = get();
     const idx = s.openTabs.findIndex((t) =>
-      sameTab(t, engine, sessionId, workspacePath),
+      sameTab(t, engine, sessionId, workspacePath, machine),
     );
     if (idx < 0) return;
     const openTabs = s.openTabs.filter((_, i) => i !== idx);
     set({ openTabs });
-    rememberClosedTab(sessionKey(engine, sessionId, workspacePath));
-    if (s.active && sameTab(s.active, engine, sessionId, workspacePath)) {
+    rememberClosedTab(sessionKey(engine, sessionId, workspacePath, machine));
+    if (s.active && sameTab(s.active, engine, sessionId, workspacePath, machine)) {
       // activateTab 会为这个被关掉的会话触发一次 sessionEnded。
       activateTab(openTabs[Math.min(idx, openTabs.length - 1)] ?? null);
     } else {
@@ -193,7 +198,8 @@ export function createTabActions(
     forgetClosedTab,
     forgetClosedTabs,
 
-    startNewChat: (workspacePath) => {
+    startNewChat: (workspacePath, machine) => {
+      if (machine) void get().refreshMachineRuntime(machine);
       // One pending chat per workspace+engine: re-focus it instead of
       // piling up empty "new" tabs.
       set((s) => {
@@ -201,12 +207,13 @@ export function createTabActions(
           (t) =>
             t.sessionId === null &&
             t.engine === s.activeEngine &&
-            t.workspacePath === workspacePath,
+            t.workspacePath === workspacePath && t.machine === machine,
         );
         const tab: ActiveSession = existing ?? {
           engine: s.activeEngine,
           sessionId: null,
           workspacePath,
+          ...(machine ? { machine } : {}),
         };
         const openTabs = existing ? s.openTabs : [...s.openTabs, tab];
         const source = s.active;
@@ -214,6 +221,7 @@ export function createTabActions(
           source &&
           source.sessionId !== null &&
           source.workspacePath === workspacePath &&
+          source.machine === machine &&
           source.engine !== tab.engine
             ? {
                 sourceEngine: source.engine,
@@ -221,6 +229,7 @@ export function createTabActions(
                 sourceSessionId: source.sessionId,
                 targetSessionId: null,
                 workspacePath,
+                machine,
               }
             : s.pendingRuntimeSwitch;
         persistTabs(openTabs, tab);
@@ -228,25 +237,25 @@ export function createTabActions(
       });
     },
 
-    closeTab: (engine, sessionId, workspacePath) => {
-      if (getConversationModeState().isTabCloseBlocked(sessionKey(engine, sessionId, workspacePath), workspacePath)) return;
+    closeTab: (engine, sessionId, workspacePath, machine) => {
+      if (getConversationModeState().isTabCloseBlocked(sessionKey(engine, sessionId, workspacePath, machine), workspacePath)) return;
       dispatchSessionClosed(
-        sessionLifecycleBase(get, { engine, sessionId, workspacePath }),
+        sessionLifecycleBase(get, { engine, sessionId, workspacePath, machine }),
       );
-      clearScopedContributions(set, engine, sessionId, workspacePath);
-      removeTab(engine, sessionId, workspacePath);
+      clearScopedContributions(set, engine, sessionId, workspacePath, machine);
+      removeTab(engine, sessionId, workspacePath, machine);
     },
-    focusTab: (engine, sessionId, workspacePath) => {
+    focusTab: (engine, sessionId, workspacePath, machine) => {
       // Reuse the stored tab so its per-tab model/effort overrides apply.
       const stored = get().openTabs.find((t) =>
-        sameTab(t, engine, sessionId, workspacePath),
+        sameTab(t, engine, sessionId, workspacePath, machine),
       );
-      activateTab(stored ?? { engine, sessionId, workspacePath });
+      activateTab(stored ?? { engine, sessionId, workspacePath, ...(machine ? { machine } : {}) });
     },
-    moveTab: (engine, sessionId, workspacePath, toIndex) => {
+    moveTab: (engine, sessionId, workspacePath, toIndex, machine) => {
       const s = get();
       const from = s.openTabs.findIndex((t) =>
-        sameTab(t, engine, sessionId, workspacePath),
+        sameTab(t, engine, sessionId, workspacePath, machine),
       );
       if (from < 0) return;
       const openTabs = [...s.openTabs];
@@ -259,7 +268,7 @@ export function createTabActions(
     setActiveEngine: (engine) => {
       const current = get().active;
       if (current && getConversationModeState().isTabCloseBlocked(
-        sessionKey(current.engine, current.sessionId, current.workspacePath), current.workspacePath,
+        sessionKey(current.engine, current.sessionId, current.workspacePath, current.machine), current.workspacePath,
       )) return;
       writeStored(ENGINE_PREF_KEY, engine);
       // Plugins follow the active engine through `session://activated`; the
@@ -274,7 +283,7 @@ export function createTabActions(
         beforeActive.sessionId === null &&
         beforeActive.engine !== engine &&
         !before.bySession[
-          sessionKey(beforeActive.engine, null, beforeActive.workspacePath)
+          sessionKey(beforeActive.engine, null, beforeActive.workspacePath, beforeActive.machine)
         ]?.streaming;
       set((s) => {
         const active = s.active;
@@ -285,11 +294,11 @@ export function createTabActions(
         if (!active || active.sessionId !== null || active.engine === engine) {
           return { activeEngine: engine };
         }
-        const oldKey = sessionKey(active.engine, null, active.workspacePath);
+        const oldKey = sessionKey(active.engine, null, active.workspacePath, active.machine);
         // First turn still in flight (native id not yet assigned): event
         // routing is keyed to the old engine, so leave the tab untouched.
         if (s.bySession[oldKey]?.streaming) return { activeEngine: engine };
-        const newKey = sessionKey(engine, null, active.workspacePath);
+        const newKey = sessionKey(engine, null, active.workspacePath, active.machine);
         const existing = s.openTabs.find(
           (t) =>
             !sameTab(
@@ -297,10 +306,11 @@ export function createTabActions(
               active.engine,
               active.sessionId,
               active.workspacePath,
+              active.machine,
             ) &&
             t.sessionId === null &&
             t.engine === engine &&
-            t.workspacePath === active.workspacePath,
+            t.workspacePath === active.workspacePath && t.machine === active.machine,
         );
         // Carry unsent drafts / session state over to the new key.
         const bySession = { ...s.bySession };
@@ -324,6 +334,7 @@ export function createTabActions(
                 active.engine,
                 active.sessionId,
                 active.workspacePath,
+                active.machine,
               ),
           );
           nextActive = existing;
@@ -338,7 +349,7 @@ export function createTabActions(
             provider: undefined,
           };
           openTabs = s.openTabs.map((t) =>
-            sameTab(t, active.engine, active.sessionId, active.workspacePath)
+            sameTab(t, active.engine, active.sessionId, active.workspacePath, active.machine)
               ? nextActive
               : t,
           );
@@ -356,6 +367,7 @@ export function createTabActions(
             sourceSessionId: active.sessionId,
             targetSessionId: null,
             workspacePath: active.workspacePath,
+            machine: active.machine,
           },
           retryingByKey: moveRetryingFlag(s.retryingByKey, oldKey, newKey),
         };

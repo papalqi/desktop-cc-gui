@@ -33,22 +33,23 @@ function derivedWorkspaceId(workspacePath: string): string {
 export function workspaceMetadata(
   workspaces: Workspace[],
   workspacePath: string,
+  machine?: string,
 ): WorkspaceMetadata {
-  const workspace = workspaces.find((candidate) => candidate.path === workspacePath);
+  const workspace = workspaces.find((candidate) => candidate.path === workspacePath && candidate.machine === machine);
   return workspace
     ? { id: workspace.id, path: workspace.path }
-    : { id: derivedWorkspaceId(workspacePath), path: workspacePath };
+    : { id: `${machine ? encodeURIComponent(machine) + "/" : ""}${derivedWorkspaceId(workspacePath)}`, path: workspacePath };
 }
 
 /** Common envelope of every session lifecycle event (created/restored/closed). */
 export function sessionLifecycleBase(
   get: StoreGet,
-  tab: Pick<ActiveSession, "engine" | "sessionId" | "workspacePath">,
+  tab: Pick<ActiveSession, "engine" | "sessionId" | "workspacePath" | "machine">,
 ) {
   return {
     engine: tab.engine,
     sessionId: tab.sessionId,
-    workspace: workspaceMetadata(get().workspaces, tab.workspacePath),
+    workspace: workspaceMetadata(get().workspaces, tab.workspacePath, tab.machine),
     occurredAt: new Date().toISOString(),
   };
 }
@@ -60,6 +61,7 @@ export function adoptNativeContributions(
   engine: string,
   workspacePath: string,
   sessionId: string,
+  machine?: string,
 ) {
   set((s) => {
     const next = migrateSessionContributions(
@@ -67,6 +69,7 @@ export function adoptNativeContributions(
       engine,
       workspacePath,
       sessionId,
+      machine,
     );
     return next ? { sessionContributions: next } : {};
   });
@@ -78,6 +81,7 @@ export function clearScopedContributions(
   engine: string,
   sessionId: string | null,
   workspacePath: string,
+  machine?: string,
 ) {
   set((s) => {
     const next = forgetSessionContributions(
@@ -85,6 +89,7 @@ export function clearScopedContributions(
       engine,
       sessionId,
       workspacePath,
+      machine,
     );
     return next ? { sessionContributions: next } : {};
   });

@@ -8,11 +8,13 @@ import { pluginPanelTabIcon } from "@/features/plugins/hub/PluginPanelTabIcon";
 import { cx } from "@/utils/cx";
 import { PANEL_TOGGLE_CLASSES } from "./panel-toggle-classes";
 import { resolveActivePanelTab, useSortedPanelTabs } from "./use-panel-tabs";
+import { machineResourceKey } from "@/lib/web-machine";
 
 /** Tab-strip actions slot: the open-in-app cluster plus the side panel's
  * titlebar header (files/changes pills and collapse toggles). */
 export function ChatPanelHeader({
   workspacePath,
+  machine,
   panelTab,
   onPanelTabChange,
   panelCollapsed,
@@ -22,6 +24,7 @@ export function ChatPanelHeader({
   dragging,
 }: {
   workspacePath: string;
+  machine?: string;
   panelTab: string;
   onPanelTabChange: (tab: string) => void;
   panelCollapsed: boolean;
@@ -43,8 +46,8 @@ export function ChatPanelHeader({
   );
   return (
     <div className="flex h-full items-center">
-      <LaunchScriptActions key={workspacePath} workspacePath={workspacePath} />
-      <HeaderOpenActions workspacePath={workspacePath} />
+      <LaunchScriptActions key={machineResourceKey(workspacePath, machine)} workspacePath={workspacePath} machine={machine} />
+      <HeaderOpenActions key={machineResourceKey(workspacePath, machine)} workspacePath={workspacePath} machine={machine} />
       {
         // Deliberately outside the xl-gated chrome below: that wrapper is
         // display:none on narrow windows, and the toggle used to vanish with

@@ -26,6 +26,19 @@ describe("selected-bot store", () => {
     expect(store.getSelectedBot("/ws", null)).toBeNull();
   });
 
+  it("keeps frozen prompts and draft adoption separate for identical threads on different machines", async () => {
+    const store = await freshStore();
+    const bot = { id:"bot",name:"AI",avatar:{ type:"emoji" as const,value:"🤖" } };
+    store.selectSelectedBot("/same",null,bot,"PC0");
+    store.selectSelectedBot("/same",null,{ ...bot,id:"other" },"PC6");
+    store.freezeSelectedBotBlock("/same",null,"PC0 instructions","PC0");
+    store.migrateSelectedBot("/same","same","PC6");
+    expect(store.getSelectedBot("/same",null,"PC0")?.block).toBe("PC0 instructions");
+    expect(store.getSelectedBot("/same","same","PC6")?.id).toBe("other");
+    expect(store.getSelectedBot("/same","same","PC0")).toBeNull();
+    expect(store.getSelectedBot("/same",null,"PC6")).toBeNull();
+  });
+
   it("converts a v1 agent pick into a bot pick and rewrites the key", async () => {
     localStorage.setItem(
       LEGACY_KEY,

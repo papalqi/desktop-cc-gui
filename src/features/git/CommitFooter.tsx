@@ -5,6 +5,7 @@ import { useGitStore } from "./store";
 
 interface CommitFooterProps {
   workspacePath: string;
+  machine?: string;
   stagedCount: number;
   /** A commit is already in flight. */
   busy: boolean;
@@ -20,6 +21,7 @@ interface CommitFooterProps {
 /** Commit message box + commit button pinned to the bottom of the panel. */
 export function CommitFooter({
   workspacePath,
+  machine,
   stagedCount,
   busy,
   commitMsg,
@@ -55,7 +57,7 @@ export function CommitFooter({
           } else {
             const message = commitMsg.trim();
             run("commit", async () => {
-              await useGitStore.getState().commit(workspacePath, message);
+              await useGitStore.getState().commit(workspacePath, message, machine);
               onCommitMsgChange("");
             });
           }

@@ -329,6 +329,7 @@ function isSession(value: unknown): value is ActiveSession {
     typeof session === "object" &&
     typeof session.engine === "string" &&
     typeof session.workspacePath === "string" &&
+    (session.machine === undefined || typeof session.machine === "string") &&
     (session.sessionId === null || typeof session.sessionId === "string")
   );
 }

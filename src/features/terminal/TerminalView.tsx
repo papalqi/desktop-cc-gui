@@ -3,7 +3,7 @@ import type { IDisposable, Terminal } from "@xterm/xterm";
 import type { FitAddon } from "@xterm/addon-fit";
 import { useTranslation } from "react-i18next";
 import { isMacPlatform } from "@/features/shortcuts/shortcuts";
-import { ipc } from "@/lib/ipc";
+import { ipc as defaultIpc, ipcForMachine } from "@/lib/ipc";
 import { loadXterm, type XtermModules } from "./xterm-loader";
 import { terminalFontFamily, terminalTheme } from "./appearance";
 import { FONT_CHANGE_EVENT } from "@/features/settings/font";
@@ -14,6 +14,7 @@ import {
   hasTerminalSession,
   markTerminalClosed,
   markTerminalOpened,
+  registerTerminalOwner,
   setTerminalWriter,
   terminalBacklog,
 } from "./sessions";
@@ -25,7 +26,8 @@ import {
  * Memoized: the dock re-renders per animation frame during height drags, and
  * an xterm re-render per frame would jank the drag.
  */
-export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string; cwd: string }) {
+export const TerminalView = memo(function TerminalView({ id, cwd, machine }: { id: string; cwd: string; machine?: string }) {
+  const ipc = machine ? ipcForMachine(machine) : defaultIpc;
   const { t } = useTranslation();
   const hostRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
@@ -63,6 +65,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
     let resizeObserver: ResizeObserver | null = null;
     let themeObserver: MutationObserver | null = null;
     let disposed = false;
+    registerTerminalOwner(id, machine);
 
     const safeFit = () => {
       try {
@@ -203,7 +206,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
         liveTermRef.current = null;
       }
     };
-  }, [xterm, id, cwd]);
+  }, [xterm, id, cwd, machine, ipc]);
 
   return (
     <div
@@ -219,7 +222,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
     >
       <div ref={hostRef} className="terminal-host absolute inset-0" />
       {menu && (
-        <TerminalContextMenu menu={menu} cwd={cwd} onClose={() => setMenu(null)} />
+        <TerminalContextMenu menu={menu} cwd={cwd} machine={machine} onClose={() => setMenu(null)} />
       )}
       {error && (
         <div className="absolute inset-x-0 top-0 z-10 border-b border-separator-border bg-background-quaternary-error px-3 py-1.5 text-caption-1-medium text-text-error-primary">

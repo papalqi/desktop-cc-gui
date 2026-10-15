@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Key } from "react";
 import { useTranslation } from "react-i18next";
 import ArchiveRestore from "lucide-react/dist/esm/icons/archive-restore";
@@ -12,8 +12,9 @@ import {
 import { ConfirmDialog } from "@/components/dialogs";
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { listenSessionsChanged } from "@/lib/events";
-import { ipc, type SessionMeta } from "@/lib/ipc";
-import { useChatStore } from "@/features/chat/store";
+import { ipc, ipcForMachine, type SessionMeta } from "@/lib/ipc";
+import { sessionKey, useChatStore } from "@/features/chat/store";
+import { machineResourceKey } from "@/lib/web-machine";
 
 const ALL_WORKSPACES = "*";
 
@@ -29,31 +30,43 @@ const pathName = (path: string) =>
 export function ArchivedSessionsSection() {
   const { t, i18n } = useTranslation();
   const workspaces = useChatStore((s) => s.workspaces);
+  const scope = useChatStore((s) => s.sessionScope);
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [workspacePath, setWorkspacePath] = useState(ALL_WORKSPACES);
   const [loading, setLoading] = useState(true);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<SessionMeta | null>(null);
+  const scopeRef = useRef<typeof scope | null>(scope);
+  const readId = useRef(0);
 
   const refresh = useCallback(async () => {
+    if (scopeRef.current !== scope) return;
+    const id = ++readId.current;
+    setLoading(true);
     try {
-      setSessions(await ipc.listArchivedSessions());
+      const rows = await ipc.listArchivedSessions(scope);
+      if (id !== readId.current || scopeRef.current !== scope) return;
+      setSessions(scope === "remote" ? rows.filter((row) => row.origin === "hub") : rows);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (id === readId.current && scopeRef.current === scope) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (id === readId.current && scopeRef.current === scope) setLoading(false);
     }
-  }, []);
+  }, [scope]);
 
   useEffect(() => {
+    scopeRef.current = scope;
+    setSessions([]);
     void refresh();
     const unlisten = listenSessionsChanged(() => void refresh());
     return () => {
+      scopeRef.current = null;
+      readId.current += 1;
       void unlisten.then((off) => off());
     };
-  }, [refresh]);
+  }, [refresh, scope]);
 
   // Building an Intl formatter is slow; do it once per locale, not per row.
   const dateFormatter = useMemo(
@@ -65,29 +78,36 @@ export function ArchivedSessionsSection() {
     [i18n.language],
   );
   const workspaceLabels = useMemo(
-    () => new Map(workspaces.map((workspace) => [workspace.path, workspace.name])),
-    [workspaces],
+    () => {
+      const labels = new Map(sessions.map((session) => [machineResourceKey(session.workspacePath, session.machine),
+        [session.machine, pathName(session.workspacePath)].filter(Boolean).join(" · ")]));
+      for (const workspace of workspaces) labels.set(machineResourceKey(workspace.path, workspace.machine),
+        [workspace.machine, workspace.name].filter(Boolean).join(" · "));
+      return labels;
+    },
+    [workspaces, sessions],
   );
   const workspacePaths = useMemo(
-    () => [...new Set(sessions.map((session) => session.workspacePath))],
+    () => [...new Set(sessions.map((session) => machineResourceKey(session.workspacePath, session.machine)))],
     [sessions],
   );
   const grouped = useMemo(() => {
     const filtered =
       workspacePath === ALL_WORKSPACES
         ? sessions
-        : sessions.filter((session) => session.workspacePath === workspacePath);
+        : sessions.filter((session) => machineResourceKey(session.workspacePath, session.machine) === workspacePath);
     const groups = new Map<string, SessionMeta[]>();
     for (const session of filtered) {
-      const list = groups.get(session.workspacePath) ?? [];
+      const key = machineResourceKey(session.workspacePath, session.machine);
+      const list = groups.get(key) ?? [];
       list.push(session);
-      groups.set(session.workspacePath, list);
+      groups.set(key, list);
     }
     return [...groups.entries()];
   }, [sessions, workspacePath]);
 
   const run = async (session: SessionMeta, action: () => Promise<void>) => {
-    const key = `${session.engine}/${session.sessionId}`;
+    const key = sessionKey(session.engine, session.sessionId, session.workspacePath, session.machine);
     setBusyKey(key);
     setError(null);
     try {
@@ -101,12 +121,13 @@ export function ArchivedSessionsSection() {
   };
 
   const restore = (session: SessionMeta) =>
-    run(session, () => ipc.restoreSession(session.engine, session.sessionId));
+    run(session, () => (session.machine ? ipcForMachine(session.machine) : ipc).restoreSession(session.engine, session.sessionId));
 
   const permanentlyDelete = (session: SessionMeta) =>
     run(session, async () => {
+      const client = session.machine ? ipcForMachine(session.machine) : ipc;
       if (session.remote && session.remotePath) {
-        await ipc.deleteRemoteSession(
+        await client.deleteRemoteSession(
           session.workspacePath,
           session.engine,
           session.sessionId,
@@ -114,10 +135,10 @@ export function ArchivedSessionsSection() {
         );
         // Remote rows have no local sessions-table record, so their archive
         // marker is cleared explicitly after the original remote delete path.
-        await ipc.restoreSession(session.engine, session.sessionId);
+        await client.restoreSession(session.engine, session.sessionId);
       } else {
         // Local deletion also removes the archive marker in the same DB tx.
-        await ipc.deleteSession(session.engine, session.sessionId);
+        await client.deleteSession(session.engine, session.sessionId);
       }
     });
 
@@ -170,8 +191,8 @@ export function ArchivedSessionsSection() {
             </SettingsSectionLabel>
             <SettingsCard>
               {rows.map((session) => {
-                const key = `${session.engine}/${session.sessionId}`;
-                const busy = busyKey === key;
+                const key = sessionKey(session.engine, session.sessionId, session.workspacePath, session.machine);
+                const busy = busyKey !== null;
                 const when = session.updatedAt
                   ? dateFormatter.format(new Date(session.updatedAt))
                   : "";
@@ -194,6 +215,9 @@ export function ArchivedSessionsSection() {
                       </p>
                       <p className="truncate text-body-2-regular text-text-secondary">
                         {session.engine}{when ? ` · ${when}` : ""}
+                        {session.metadataSyncPending && <span role="status" className={session.metadataSyncError ? "text-text-error-primary" : undefined}>
+                          {` · ${t(session.metadataSyncError ? "chat.metadataSyncFailed" : "chat.metadataSyncPending")}`}
+                        </span>}
                       </p>
                     </div>
                     <div className="flex shrink-0 items-center gap-2">

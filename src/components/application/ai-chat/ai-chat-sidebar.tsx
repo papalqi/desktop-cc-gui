@@ -1,6 +1,6 @@
 "use client";
 
-import type { Ref } from "react";
+import type { ReactNode, Ref } from "react";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -20,9 +20,25 @@ import {
   SidebarFooter,
   SidebarPrimaryNav,
 } from "@/components/application/ai-chat/sidebar-chrome";
+import { PinnedMachinesSection } from "@/components/application/ai-chat/pinned-machines-section";
+import { RelayMachinesSection } from "@/components/application/ai-chat/relay-machines-section";
 import { SessionSearchPalette } from "@/components/application/ai-chat/session-search-palette";
 import type { AiChatRepo, AiChatRepoSection, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
+import { currentRelayMachine } from "@/features/chat/machine-catalog";
+import { useMachineRunWatchers } from "@/features/chat/machine-run-watch";
+import {
+  usePrefetchMachineCatalogs,
+  useRelayMachines,
+  useRelaySwitching,
+  useSidebarHold,
+  type RelayMachineList,
+} from "@/features/chat/relay-machines";
 import { cx } from "@/utils/cx";
+import { webMultiMachine } from "@/lib/web-machine";
+import { useChatStore } from "@/features/chat/store";
+import { ThreadItem } from "./repo-tree";
+import { relayMachineNames } from "@/features/chat/relay-machines";
+import { dismissCenterSurfaces } from "@/features/chat/center-surfaces";
 
 export type { AiChatRepo, AiChatRepoSection, AiChatThread, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
 
@@ -62,6 +78,11 @@ export function AiChatSidebar({
   onOpenSettings,
   onClose,
   flat = false,
+  relayMachines,
+  staleSessionCount = 0,
+  onArchiveWeek,
+  liveRunningKeys,
+  sessionViewControls,
 }: {
   repos?: AiChatRepo[];
   /** Grouped repo tree (工作区二级分类); omitted = flat `repos` list. */
@@ -109,8 +130,26 @@ export function AiChatSidebar({
   onOpenSettings?: () => void;
   onClose?: () => void;
   flat?: boolean;
+  /** Relay desktops. Omit to discover them; null keeps the desktop sidebar. */
+  relayMachines?: RelayMachineList | null;
+  /** Unpinned idle sessions older than a week. The archive button hides at 0. */
+  staleSessionCount?: number;
+  onArchiveWeek?: () => void;
+  /** `engine/sessionId` keys running on the connected desktop. */
+  liveRunningKeys?: readonly string[];
+  sessionViewControls?: ReactNode;
 } = {}) {
   const { t } = useTranslation();
+  const scope = useChatStore((state) => state.sessionScope);
+  const sort = useChatStore((state) => state.sessionSort);
+  const discoveredMachines = useRelayMachines();
+  const machines = relayMachines !== undefined ? relayMachines : discoveredMachines;
+  const switchingMachine = useRelaySwitching();
+  const heldSidebar = useSidebarHold();
+  const workspaceThreadId =
+    heldSidebar && currentRelayMachine() !== heldSidebar.machine ? undefined : activeThreadId;
+  usePrefetchMachineCatalogs(machines);
+  useMachineRunWatchers(machines);
   const { searchOpen, openSearch, closeSearch } = useSearchPalette();
   const { collapsedGroups, toggleGroup } = useCollapsedGroups();
   // Worktree 子行也进展开集/搜索面板的数据源：跟着父行扁平化。
@@ -118,7 +157,19 @@ export function AiChatSidebar({
     const topLevel = sections ? sections.flatMap((section) => section.repos) : repos;
     return topLevel.flatMap((repo) => [repo, ...(repo.worktrees ?? [])]);
   }, [sections, repos]);
-  const { isRepoExpanded, toggleRepoExpanded } = useExpandedWorkspaces(allRepos, activeThreadId);
+  const machineSections = useMemo(() => {
+    if (!webMultiMachine()) return sections;
+    const names = machines ? relayMachineNames(machines) : [...new Set(repos.map((repo) => repo.machine).filter((name): name is string => Boolean(name)))];
+    return names.map((name) => ({ id: `machine:${name}`, name, readOnly: true,
+      repos: repos.filter((repo) => repo.machine === name),
+      notice: machines && !machines.names.includes(name)
+        ? t(scope === "all" ? "chat.machineLocalUnavailable" : "chat.machineRemoteOffline") : undefined,
+    }));
+  }, [machines, repos, sections, scope, t]);
+  const recentThreads = useMemo(() => allRepos.flatMap((repo) => repo.threads.map((thread) => ({ ...thread,
+    description: [repo.machine, repo.label].filter(Boolean).join(" · "),
+  }))).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)), [allRepos]);
+  const { isRepoExpanded, toggleRepoExpanded } = useExpandedWorkspaces(allRepos, workspaceThreadId);
   const { workspaceMenu, closeWorkspaceMenu, openWorkspaceMenu, openArchivedMenu } =
     useWorkspaceMenu(onWorkspaceAlias, onSetWorkspaceArchived);
   const { blankMenu, openBlankMenu, closeBlankMenu } = useBlankMenu();
@@ -166,6 +217,7 @@ export function AiChatSidebar({
       {!flat && <SidebarDragStrip onClose={onClose} onOpenSearch={openSearch} />}
       <div className="flex min-h-0 w-full flex-1 flex-col gap-3 p-3">
         {flat && <SidebarBrandRow onOpenSearch={openSearch} />}
+        {sessionViewControls}
 
         <div
           className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto overscroll-contain scrollbar-none"
@@ -178,13 +230,33 @@ export function AiChatSidebar({
             onOpenMission={onOpenMission}
           />
 
-          <WorkspaceSection
+          {machines && <RelayMachinesSection list={machines} />}
+          {machines && (
+            <PinnedMachinesSection
+              list={machines}
+              activeThreadId={activeThreadId}
+              liveRunningKeys={liveRunningKeys}
+            />
+          )}
+          {switchingMachine && !heldSidebar && (
+            <p className="text-caption-1-medium text-text-tertiary">{t("chat.myWorkspacesLoading")}</p>
+          )}
+
+          {sort === "recent" ? <div className="flex flex-col gap-1">
+            {recentThreads.map((thread) => <ThreadItem key={thread.id} {...thread} flat
+              isSelected={thread.id === workspaceThreadId} onSelect={onThreadSelect} onAction={onThreadAction} onContextMenu={openThreadMenu} />)}
+            {machines && scope === "all" && relayMachineNames(machines).filter((name) => !machines.names.includes(name)).map((name) =>
+              <p key={name} className="px-2 text-caption-1-medium text-text-tertiary">{name} · {t("chat.machineLocalUnavailable")}</p>)}
+          </div> : <WorkspaceSection
+            heading={machines ? t("chat.myWorkspaces") : undefined}
+            staleSessionCount={staleSessionCount}
+            onArchiveWeek={onArchiveWeek}
             repos={repos}
-            sections={sections}
+            sections={machineSections}
             collapsedGroups={collapsedGroups}
             isRepoExpanded={isRepoExpanded}
             onToggleRepo={toggleRepoExpanded}
-            activeThreadId={activeThreadId}
+            activeThreadId={workspaceThreadId}
             onThreadSelect={onThreadSelect}
             onThreadAction={onThreadAction}
             onThreadContextMenu={openThreadMenu}
@@ -200,7 +272,7 @@ export function AiChatSidebar({
             creatingGroup={creatingGroup}
             onCreateGroup={onCreateGroup && handleCreateGroupCommit}
             onCreateGroupCancel={() => setCreatingGroup(false)}
-          />
+          />}
           {(archivedRepos.length > 0 || workspaceDragging) && (
             <ArchivedSection
               repos={archivedRepos}
@@ -218,10 +290,17 @@ export function AiChatSidebar({
       <SidebarFooter onOpenSettings={onOpenSettings} />
 
       <SessionSearchPalette
+        key={scope}
+        scope={scope}
         open={searchOpen}
         repos={allRepos}
         onClose={closeSearch}
         onThreadSelect={onThreadSelect}
+        onSessionSelect={(hit) => {
+          dismissCenterSurfaces();
+          void useChatStore.getState().selectSession(hit.engine, hit.sessionId, hit.workspacePath, hit.machine);
+          onClose?.();
+        }}
       />
 
       <SidebarContextMenus

@@ -1,7 +1,10 @@
-import { ipc } from "@/lib/ipc";
+import { ipc, ipcForMachine } from "@/lib/ipc";
+import { sessionIpc } from "./session-ipc";
+import { parseSessionKey } from "./persistence";
 import { errorText } from "@/lib/errors";
 import { newId } from "@/lib/id";
 import i18n from "@/lib/i18n";
+import { SendDeliveryUnknownError } from "@/lib/web-send-recovery";
 import {
   dedupeTabs,
   persistTabs,
@@ -111,7 +114,7 @@ function keyOfTarget(
 ): string {
   const session = target ?? active;
   return session
-    ? sessionKey(session.engine, session.sessionId, session.workspacePath)
+    ? sessionKey(session.engine, session.sessionId, session.workspacePath, session.machine)
     : "";
 }
 
@@ -168,6 +171,12 @@ export function createMessagingActions(
     options?: SendOptions,
   ) {
     if (!prompt.trim() && images.length === 0) return;
+    const client = tab.machine ? ipcForMachine(tab.machine) : ipc;
+    if (tab.machine && !get().enginesByMachine[tab.machine]) {
+      await get().refreshMachineRuntime(tab.machine);
+      if (!get().enginesByMachine[tab.machine]) return;
+    }
+    const engines = tab.machine ? get().enginesByMachine[tab.machine] : get().engines;
     // A pinned bot's assembled prompt rides along as a tail block the
     // transcript keeps (the bubble strips it back out for display). Slash
     // prompts ("/compact") never get it, and a re-sent committed message
@@ -176,14 +185,14 @@ export function createMessagingActions(
     // The block is frozen on first send: the rest of this session reuses that
     // exact text, so editing the bot mid-conversation cannot change a prompt
     // the model has already been primed with (and the prefix cache holds).
-    const selectedBot = getSelectedBot(tab.workspacePath, tab.sessionId);
+    const selectedBot = getSelectedBot(tab.workspacePath, tab.sessionId, tab.machine);
     // 记忆工具每次发送都要重新挂载（每次发送都是一个新进程）；冻结的只是
     // 提示词。能挂的条件：选中了自定义 Bot、它开着记忆、这个引擎支持 MCP。
     const pinnedBot = selectedBot ? botById(selectedBot.id) : null;
     const memoryToolAvailable =
       pinnedBot !== null &&
       pinnedBot.memory.enabled !== false &&
-      engineSupportsMemory(get().engines, tab.engine);
+      engineSupportsMemory(engines, tab.engine);
     // Built-in resolve failures are re-flagged after the optimistic-turn
     // patch below (which resets `error` for the new turn).
     let agentResolveError: string | null = null;
@@ -196,7 +205,7 @@ export function createMessagingActions(
         // drop the stale pin, surface the session error banner, and still
         // send the bare text.
         try {
-          const resolved = await ipc.resolveEnabledBuiltInAgent(selectedBot.id);
+          const resolved = await client.resolveEnabledBuiltInAgent(selectedBot.id);
           const block = buildBotBlock({
             name: resolved.name,
             icon: resolved.icon ?? undefined,
@@ -204,32 +213,32 @@ export function createMessagingActions(
               bot: builtInBotShell(resolved.name, resolved.prompt),
             }).text,
           });
-          freezeSelectedBotBlock(tab.workspacePath, tab.sessionId, block);
+          freezeSelectedBotBlock(tab.workspacePath, tab.sessionId, block, tab.machine);
           prompt += `\n\n${block}`;
         } catch {
-          clearSelectedBot(tab.workspacePath, tab.sessionId);
+          clearSelectedBot(tab.workspacePath, tab.sessionId, tab.machine);
           agentResolveError = i18n.t("chat.agentUnavailable");
         }
       } else {
         const bot = botById(selectedBot.id);
         if (bot) {
-          const block = await buildBotPromptBlock(bot, { memoryToolAvailable });
-          freezeSelectedBotBlock(tab.workspacePath, tab.sessionId, block);
+          const block = await buildBotPromptBlock(bot, { memoryToolAvailable, ...(tab.machine ? { machine:tab.machine } : {}) });
+          freezeSelectedBotBlock(tab.workspacePath, tab.sessionId, block, tab.machine);
           prompt += `\n\n${block}`;
         } else {
           // The bot was deleted between picking and sending. Say so instead
           // of silently sending a bare prompt the user did not ask for.
-          clearSelectedBot(tab.workspacePath, tab.sessionId);
+          clearSelectedBot(tab.workspacePath, tab.sessionId, tab.machine);
           agentResolveError = i18n.t("chat.botUnavailable");
         }
       }
     }
     const engine = tab.engine;
-    const key = sessionKey(engine, tab.sessionId, tab.workspacePath);
+    const key = sessionKey(engine, tab.sessionId, tab.workspacePath, tab.machine);
     // Computer use asks for the driver; engines without an MCP-mount path
     // would run the prompt text-only while the user believes the machine is
     // under agent control. Refuse loudly instead of downgrading silently.
-    if (options?.computerUse && !engineSupportsComputerUse(get().engines, engine)) {
+    if (options?.computerUse && !engineSupportsComputerUse(engines, engine)) {
       patchSession(set, key, { error: i18n.t("chat.cuaUnsupportedEngine") });
       return;
     }
@@ -248,7 +257,7 @@ export function createMessagingActions(
     // `session` event carries the model instead.
     if (model) {
       if (tab.sessionId) {
-        void ipc
+        void client
           .rememberSessionModel(engine, tab.sessionId, model)
           .catch(() => {});
       } else {
@@ -263,7 +272,7 @@ export function createMessagingActions(
     // phone — keeps running the level it ran instead of the engine default.
     if (effort) {
       if (tab.sessionId) {
-        void ipc
+        void client
           .rememberSessionEffort?.(engine, tab.sessionId, effort)
           ?.catch(() => {});
       } else {
@@ -274,11 +283,11 @@ export function createMessagingActions(
       resolveSessionProvider(
         tab,
         get().bySession[key],
-        get().providers[engine],
+        (tab.machine ? get().providersByMachine[tab.machine] : get().providers)?.[engine],
       ) ?? null;
     if (provider) {
       if (tab.sessionId) {
-        void ipc
+        void client
           .rememberSessionProvider?.(engine, tab.sessionId, provider)
           ?.catch(() => {});
       } else {
@@ -286,7 +295,7 @@ export function createMessagingActions(
       }
     }
     // Optimistic user message.
-    const workspace = workspaceMetadata(get().workspaces, tab.workspacePath);
+    const workspace = workspaceMetadata(get().workspaces, tab.workspacePath, tab.machine);
     const hookRunId = newId();
     const previousSend = pendingSends.get(key);
     if (previousSend) previousSend.cancelled = true;
@@ -303,6 +312,7 @@ export function createMessagingActions(
       [
         {
           role: "user",
+          runId: hookRunId,
           text: prompt,
           ts: new Date().toISOString(),
           images: images.length ? [...images] : undefined,
@@ -334,7 +344,7 @@ export function createMessagingActions(
     if (
       pendingSwitch &&
       pendingSwitch.targetEngine === engine &&
-      pendingSwitch.workspacePath === tab.workspacePath
+      pendingSwitch.workspacePath === tab.workspacePath && pendingSwitch.machine === tab.machine
     ) {
       switchEvent = {
         switchId: hookRunId,
@@ -348,7 +358,7 @@ export function createMessagingActions(
       await runBeforeSwitch(switchEvent);
       if (pendingSend.cancelled) return;
     }
-    const scope = sessionContributionScope(engine, tab.sessionId, tab.workspacePath);
+    const scope = sessionContributionScope(engine, tab.sessionId, tab.workspacePath, tab.machine);
     const beforeTurn = await collectBeforeTurnContributions({
       runId: hookRunId,
       turnId: hookRunId,
@@ -371,6 +381,7 @@ export function createMessagingActions(
     // session/delta/done events may outrun the send result, and unregistered
     // events would lose their runtime and afterTurn delivery.
     const settleLaunch = registerPendingRunLifecycle(hookRunId, {
+      machine: tab.machine,
       turnId: hookRunId,
       engine,
       sessionId: tab.sessionId,
@@ -389,7 +400,7 @@ export function createMessagingActions(
       // Arm the global Esc-to-stop for this run: the escape hatch out of a
       // machine-driving turn. Disarmed when the turn settles (onDone / a
       // failed spawn), so the system-wide hotkey never outlives the run.
-      void ipc.computerUseSetActive?.(true)?.catch(() => {});
+      void client.computerUseSetActive?.(true)?.catch(() => {});
     }
     try {
       // Read-only launch observation, after the lifecycle registration so a
@@ -404,7 +415,7 @@ export function createMessagingActions(
         workspace,
         occurredAt: new Date().toISOString(),
       });
-      const result = await ipc.sendMessage({
+      const result = await client.sendMessage({
         runId: requestedRunId,
         engine,
         workspacePath: tab.workspacePath,
@@ -416,7 +427,7 @@ export function createMessagingActions(
         model,
         effort,
         permission: effectivePermission(
-          get().engines,
+          engines,
           engine,
           get().permission,
         ),
@@ -459,25 +470,26 @@ export function createMessagingActions(
       if (result.sessionId && !tab.sessionId
           && (!settled || (knownKey && get().bySession[knownKey]?.interrupted) || stillPending)) {
         // Preassigned native id (grok): adopt immediately.
-        migrateSelectedBot(tab.workspacePath, result.sessionId);
+        migrateSelectedBot(tab.workspacePath, result.sessionId, tab.machine);
         const newKey = sessionKey(
           engine,
           result.sessionId,
           tab.workspacePath,
+          tab.machine,
         );
-        adoptNativeContributions(set, engine, tab.workspacePath, result.sessionId);
+        adoptNativeContributions(set, engine, tab.workspacePath, result.sessionId, tab.machine);
         if (model) {
-          void ipc
+          void client
             .rememberSessionModel?.(engine, result.sessionId, model)
             ?.catch(() => {});
         }
         if (effort) {
-          void ipc
+          void client
             .rememberSessionEffort?.(engine, result.sessionId, effort)
             ?.catch(() => {});
         }
         if (provider) {
-          void ipc
+          void client
             .rememberSessionProvider?.(engine, result.sessionId, provider)
             ?.catch(() => {});
         }
@@ -497,7 +509,7 @@ export function createMessagingActions(
                 stamped ||
                 t.engine !== engine ||
                 t.sessionId !== null ||
-                t.workspacePath !== tab.workspacePath
+                t.workspacePath !== tab.workspacePath || t.machine !== tab.machine
               ) {
                 return t;
               }
@@ -511,7 +523,7 @@ export function createMessagingActions(
             s.active &&
             s.active.engine === engine &&
             s.active.sessionId === null &&
-            s.active.workspacePath === tab.workspacePath
+            s.active.workspacePath === tab.workspacePath && s.active.machine === tab.machine
               ? { ...s.active, sessionId: result.sessionId, effort: undefined }
               : s.active;
           return {
@@ -531,10 +543,11 @@ export function createMessagingActions(
             result.sessionId,
             tab.workspacePath,
             firstLineTitle(prompt),
+            tab.machine,
           ),
         );
         const createdTab = { ...tab, sessionId: result.sessionId };
-        const createdKey = sessionKey(engine, result.sessionId, tab.workspacePath);
+        const createdKey = sessionKey(engine, result.sessionId, tab.workspacePath, tab.machine);
         if (!get().createdSessionKeys[createdKey]) {
           set((s) => ({
             createdSessionKeys: { ...s.createdSessionKeys, [createdKey]: true },
@@ -563,7 +576,7 @@ export function createMessagingActions(
       // Session adoption may have moved the state, so read the live key.
       const liveKey = runRouting.get(result.runId) ?? knownKey ?? (
         result.sessionId && !tab.sessionId
-          ? sessionKey(engine, result.sessionId, tab.workspacePath)
+          ? sessionKey(engine, result.sessionId, tab.workspacePath, tab.machine)
           : key);
       if (pendingSend.cancelled || get().bySession[liveKey]?.interrupted) {
         finishRunLifecycle(result.runId, "cancelled");
@@ -573,17 +586,22 @@ export function createMessagingActions(
         dropRunUsage(result.runId);
         // A replacement may already own the same native session. Only the
         // immutable run id belongs to this late acknowledgement.
-        await ipc.interruptSession(result.runId).catch(() => false);
+        await client.interruptSession(result.runId).catch(() => false);
       }
     } catch (error) {
+      // The prompt may still be running: its late events must land in this
+      // tab, and the queue must not start a second turn beside it.
+      const deliveryUnknown = error instanceof SendDeliveryUnknownError;
       finishRunLifecycle(hookRunId, "failed", String(error));
       settleLaunch();
       const failedKey = runRouting.get(requestedRunId) ?? key;
-      runRouting.delete(requestedRunId);
-      untrackRun(requestedRunId);
-      dropRunUsage(requestedRunId);
+      if (!deliveryUnknown) {
+        runRouting.delete(requestedRunId);
+        untrackRun(requestedRunId);
+        dropRunUsage(requestedRunId);
+      }
       if (options?.computerUse) {
-        void ipc.computerUseSetActive?.(false)?.catch(() => {});
+        void client.computerUseSetActive?.(false)?.catch(() => {});
       }
       set((s) => ({
         streamingByKey: setStreamingFlag(s.streamingByKey, failedKey, false),
@@ -598,7 +616,7 @@ export function createMessagingActions(
       // coming. Each drain consumes one item, so a run of failures empties
       // the queue instead of looping.
       void get().refreshSessionUsage(failedKey);
-      if (!get().bySession[failedKey]?.interrupted) drainQueue(failedKey);
+      if (!deliveryUnknown && !get().bySession[failedKey]?.interrupted) drainQueue(failedKey);
     } finally {
       if (pendingSends.get(key) === pendingSend) pendingSends.delete(key);
     }
@@ -609,7 +627,7 @@ export function createMessagingActions(
   function markUnseenIfBackground(key: string) {
     const active = get().active;
     const activeKey = active
-      ? sessionKey(active.engine, active.sessionId, active.workspacePath)
+      ? sessionKey(active.engine, active.sessionId, active.workspacePath, active.machine)
       : null;
     if (key === activeKey) return;
     set((s) => (s.unseen[key] ? {} : { unseen: { ...s.unseen, [key]: true } }));
@@ -621,7 +639,7 @@ export function createMessagingActions(
     const session = s.bySession[key];
     if (!session || session.streaming || session.queue.length === 0) return;
     const tab = s.openTabs.find(
-      (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
+      (t) => sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === key,
     );
     if (!tab) return;
     const [head, ...rest] = session.queue;
@@ -639,6 +657,7 @@ export function createMessagingActions(
   /** 按会话 key 中断：公共 `interrupt(target)` 与队列「立即发送」共用。
    *  key 而不是会话对象，是因为后台会话的排队项只有 key。 */
   async function interruptByKey(key: string) {
+    const client = sessionIpc(key);
     // An in-flight send is awaiting plugin beforeTurn hooks: mark it cancelled
     // so its late launch does not start a run the user already stopped.
     const pendingSend = pendingSends.get(key);
@@ -676,16 +695,15 @@ export function createMessagingActions(
     });
     // Registry is keyed by native session id once known; before that the
     // run id routes. Try both.
-    const sessionId = key.includes("/") ? key.slice(key.indexOf("/") + 1) : "";
-    if (sessionId && !key.startsWith("new:"))
-      await ipc.interruptSession(sessionId).catch(() => false);
+    const sessionId = parseSessionKey(key)?.sessionId;
+    if (sessionId) await client.interruptSession(sessionId).catch(() => false);
     const deadRunIds: string[] = [];
     for (const [runId, routed] of runRouting) {
       if (routed === key) deadRunIds.push(runId);
     }
     // Independent kills, one IPC call per routed run — fired together.
     await Promise.all(
-      deadRunIds.map((runId) => ipc.interruptSession(runId).catch(() => false)),
+      deadRunIds.map((runId) => client.interruptSession(runId).catch(() => false)),
     );
     // The runs are dead: drop their routing and usage entries so the maps
     // cannot grow forever. (A late done event would also remove them.)
@@ -727,7 +745,7 @@ export function createMessagingActions(
       const path = message.path;
       if (!path) return;
       try {
-        await ipc.grantRoot(path);
+        await sessionIpc(key).grantRoot(path);
         patchGrantBySeq(set, key, seq, (grant) => ({
           ...grant,
           status: "granted",
@@ -766,7 +784,7 @@ export function createMessagingActions(
         status: "submitting",
       }));
       try {
-        const outcome = await ipc.respondPlanReview(
+        const outcome = await sessionIpc(key).respondPlanReview(
           planId,
           expectedRevision,
           decision,
@@ -813,7 +831,7 @@ export function createMessagingActions(
       // a label only toggles the CLI's own set and re-asks the same question.
       const loop = answers ? beginAskSubmit(key, seq, answerText(answers)) : undefined;
       try {
-        await ipc.answerQuestion(
+        await sessionIpc(key).answerQuestion(
           question.runId,
           question.requestId,
           loop ? { [loop.base]: ASK_OTHER_OPTION } : answers,
@@ -841,7 +859,7 @@ export function createMessagingActions(
       if (!lastUser) return;
       const tab =
         s.openTabs.find(
-          (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
+          (t) => sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === key,
         ) ?? s.active;
       if (tab)
         await sendPrompt(tab, lastUser.text, lastUser.images ?? [], {
@@ -856,6 +874,7 @@ export function createMessagingActions(
         session.engine,
         session.sessionId,
         session.workspacePath,
+        session.machine,
       );
       set((s) => {
         const prev = s.bySession[key] ?? EMPTY_SESSION;
@@ -976,14 +995,14 @@ export function createMessagingActions(
       const targetKey =
         key ??
         (active
-          ? sessionKey(active.engine, active.sessionId, active.workspacePath)
+          ? sessionKey(active.engine, active.sessionId, active.workspacePath, active.machine)
           : "");
       if (!targetKey) return;
       if (streamingByKey[targetKey]) return;
       const targetTab =
         openTabs.find(
           (t) =>
-            sessionKey(t.engine, t.sessionId, t.workspacePath) === targetKey,
+            sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === targetKey,
         ) ?? active;
       if (!targetTab) return;
 
@@ -1015,6 +1034,7 @@ export function createMessagingActions(
                     targetTab.engine,
                     targetTab.sessionId,
                     targetTab.workspacePath,
+                    targetTab.machine,
                   )
                 ]),
           );
@@ -1053,13 +1073,14 @@ export function createMessagingActions(
       const latestTab =
         get().openTabs.find(
           (t) =>
-            sessionKey(t.engine, t.sessionId, t.workspacePath) === targetKey,
+            sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === targetKey,
         ) ?? get().active;
       const finalKey = latestTab
         ? sessionKey(
             latestTab.engine,
             latestTab.sessionId,
             latestTab.workspacePath,
+            latestTab.machine,
           )
         : targetKey;
       await get().refreshSessionUsage(finalKey);
@@ -1076,17 +1097,17 @@ export function createMessagingActions(
       const targetKey =
         key ??
         (active
-          ? sessionKey(active.engine, active.sessionId, active.workspacePath)
+          ? sessionKey(active.engine, active.sessionId, active.workspacePath, active.machine)
           : "");
       if (!targetKey) return;
       // A background/closed tab must never fall back to the active session.
       const targetTab = openTabs.find(
-        (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === targetKey,
+        (t) => sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === targetKey,
       );
-      const slashIdx = targetKey.indexOf("/");
-      const engine = targetTab?.engine ?? targetKey.slice(0, slashIdx);
-      const sessionId = targetTab?.sessionId ?? targetKey.slice(slashIdx + 1);
-      if (targetKey.startsWith("new:") || slashIdx < 1 || !engine || !sessionId) return;
+      const identity = parseSessionKey(targetKey);
+      const engine = targetTab?.engine ?? identity?.engine;
+      const sessionId = targetTab?.sessionId ?? identity?.sessionId;
+      if (!identity || !engine || !sessionId) return;
       const before = get().bySession[targetKey];
       if (!before) return;
       const beforeTotal = parseUsage(before.usage)?.total ?? null;
@@ -1112,6 +1133,9 @@ export function createMessagingActions(
             sessionId,
             targetTab?.workspacePath ?? "",
             100,
+            undefined,
+            undefined,
+            targetTab?.machine ?? identity.machine,
           );
           const latestUsage =
             [...page.messages].reverse().find((m) => m.usage)?.usage ?? null;

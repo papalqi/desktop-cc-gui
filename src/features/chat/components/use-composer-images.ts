@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ipc } from "@/lib/ipc";
+import { ipc as defaultIpc, ipcForMachine } from "@/lib/ipc";
 import { fileName } from "@/features/files/store";
 import { dataUrlBytes, imageDimensions } from "@/utils/image-meta";
 
@@ -41,7 +41,8 @@ export interface ComposerImages {
   dismissImageError: () => void;
 }
 
-export function useComposerImages(): ComposerImages {
+export function useComposerImages(machine?: string): ComposerImages {
+  const ipc = machine ? ipcForMachine(machine) : defaultIpc;
   const { t } = useTranslation();
   const [images, setImages] = useState<string[]>([]);
   const [previews, setPreviews] = useState<Record<string, AttachmentPreview>>({});
@@ -86,7 +87,7 @@ export function useComposerImages(): ComposerImages {
         }));
       })
       .catch(() => {});
-  }, []);
+  }, [ipc]);
   const pasteImages = useCallback(
     (files: File[]) => {
       setImageError(null);
@@ -112,7 +113,7 @@ export function useComposerImages(): ComposerImages {
         reader.readAsDataURL(file);
       }
     },
-    [t, loadPreview],
+    [t, loadPreview, ipc],
   );
 
   /** Import user-picked image files: copy them into the app sandbox (picked
@@ -142,7 +143,7 @@ export function useComposerImages(): ComposerImages {
           setImageError(t("chat.imageImportFailed", { message: String(err) }));
         });
     },
-    [t, loadPreview],
+    [t, loadPreview, ipc],
   );
   return {
     images,

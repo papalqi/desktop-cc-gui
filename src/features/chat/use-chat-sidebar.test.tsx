@@ -10,7 +10,7 @@ import { useGitStore } from "@/features/git/store";
 import { resetMissionStore, useMissionStore } from "@/features/mission/store";
 import { usePluginHubStore } from "@/features/plugins/hub/store";
 import { usePluginTabsStore } from "@/features/plugins/runtime/center-tabs";
-import { useChatStore } from "./store";
+import { useChatStore, sessionKey } from "./store";
 import { useChatSidebar } from "./use-chat-sidebar";
 
 vi.mock("@/lib/ipc", async (importOriginal) => ({
@@ -29,6 +29,7 @@ vi.mock("@/lib/events", () => ({
 }));
 vi.mock("@/lib/platform", () => ({
   pickDirectory: vi.fn(async () => null),
+  isWeb: false,
 }));
 // 聚焦助手自带 rAF 重试窗口，单测里只关心语义。
 vi.mock("./focus-composer", () => ({ focusComposerWhenVisible: vi.fn() }));
@@ -65,10 +66,11 @@ let captured: AiChatRepo[];
 let sidebar: ReturnType<typeof useChatSidebar>;
 
 function Harness() {
+  const sessions = useChatStore((s) => s.sessions);
   const streaming = useChatStore((s) => s.streamingByKey["codex/s-1"] === true);
   const retrying = useChatStore((s) => s.retryingByKey["codex/s-1"] === true);
   sidebar = useChatSidebar({
-    sessionById: new Map(),
+    sessionById: new Map(sessions.map((s) => [sessionKey(s.engine, s.sessionId, s.workspacePath, s.machine), s])),
     threadStreaming: [streaming],
     threadRetrying: [retrying],
     collapseSidebarOnMobile: () => {},
@@ -84,6 +86,7 @@ describe("useChatSidebar repo mapping", () => {
     useChatStore.setState({
       workspaces: [WS],
       sessions: [SESSION],
+      sessionScope: "all",
       openTabs: [],
       threadLimit: 7,
       workspaceGroups: [],
@@ -106,12 +109,27 @@ describe("useChatSidebar repo mapping", () => {
       root.unmount();
     });
     container.remove();
+    window.history.replaceState(null, "", "/");
   });
 
   it("threadLimit 透传到 repo(分页折叠依赖它,删了设置就失效)", () => {
     expect(captured).toHaveLength(1);
     expect(captured[0]?.threadLimit).toBe(7);
     expect(captured[0]?.threads.map((t) => t.id)).toEqual(["codex/s-1"]);
+  });
+
+  it("keeps identical workspace paths and session IDs on their own machine rows", async () => {
+    window.history.replaceState(null, "", "/CCGUI/?global=1&machine=PC0");
+    await act(async () => useChatStore.setState({
+      workspaces: [{ ...WS, id:"PC0/w1", machine:"PC0" }, { ...WS, id:"PC6/w1", machine:"PC6" }],
+      sessions: [{ ...SESSION, machine:"PC0" }, { ...SESSION, machine:"PC6" }],
+      openTabs: [{ engine:"codex",sessionId:null,workspacePath:WS.path,machine:"PC6" }],
+    }));
+    expect(captured.map((repo) => repo.threads.map((thread) => thread.id))).toEqual([
+      ["PC0/codex/s-1"], ["PC6/new:codex:/ws/a", "PC6/codex/s-1"],
+    ]);
+    await act(async () => sidebar.handleNewSessionInWorkspace("PC6/w1"));
+    expect(useChatStore.getState().active).toMatchObject({ machine:"PC6", workspacePath:WS.path, sessionId:null });
   });
 
   it("pending 新对话出现在对应工作区线程列表顶部", async () => {

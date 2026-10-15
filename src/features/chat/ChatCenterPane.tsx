@@ -181,7 +181,7 @@ export function ChatCenterPane({
   /** 版本更新说明中心页签（更新检查发现新版本时自动打开）：是否打开 / 是否在视。 */
   notesOpen: boolean;
   notesActive: boolean;
-  diffView: { workspacePath: string; target: DiffTarget } | null;
+  diffView: { workspacePath: string; target: DiffTarget; machine?: string } | null;
   diffStatus: GitStatus | undefined;
   closeDiff: () => void;
 }) {
@@ -287,6 +287,7 @@ export function ChatCenterPane({
         <div className="relative flex min-w-0 flex-1 basis-0 flex-col overflow-hidden bg-background-primary-default">
           <DiffView
             workspacePath={diffView.workspacePath}
+            machine={diffView.machine}
             target={diffView.target}
             status={diffStatus}
             onBack={closeDiff}

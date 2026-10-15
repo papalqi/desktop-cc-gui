@@ -157,11 +157,11 @@ function AddProgramDialog({
   );
 }
 
-export function HeaderOpenActions({ workspacePath }: { workspacePath: string }) {
+export function HeaderOpenActions({ workspacePath, machine }: { workspacePath: string; machine?: string }) {
   const { t } = useTranslation();
   // Editors open the file shown in the active editor tab; Finder always
   // reveals the workspace folder.
-  const activeFilePath = useFilesStore((s) => s.activeFilePath);
+  const activeFile = useFilesStore((s) => s.activeFilePath ? s.fileStates[s.activeFilePath] : undefined);
   const terminalOpen = useTerminalStore((s) => s.open);
   const toggleTerminal = useTerminalStore((s) => s.toggle);
   const pinnedIds = useSyncExternalStore(subscribePinnedIds, readPinnedIds);
@@ -179,13 +179,14 @@ export function HeaderOpenActions({ workspacePath }: { workspacePath: string }) 
 
   const openTarget = useCallback(
     async (target: OpenAppTarget | CustomApp) => {
-      const path = resolveOpenAppPath(target, { workspacePath, activeFilePath });
+      const path = resolveOpenAppPath(target, { workspacePath, activeFilePath: activeFile?.path });
+      const targetMachine = "kind" in target && target.kind === "finder" ? machine : activeFile?.machine ?? machine;
       setOpenError(null);
       try {
         if ("path" in target) {
-          await openCustomProgram(path, target);
+          await openCustomProgram(path, target, targetMachine);
         } else {
-          await openPathInTarget(path, target);
+          await openPathInTarget(path, target, targetMachine);
         }
       } catch (error) {
         setOpenError(
@@ -193,7 +194,7 @@ export function HeaderOpenActions({ workspacePath }: { workspacePath: string }) 
         );
       }
     },
-    [workspacePath, activeFilePath, t],
+    [workspacePath, machine, activeFile, t],
   );
 
   const handleSelectTarget = useCallback(
@@ -365,7 +366,7 @@ export function HeaderOpenActions({ workspacePath }: { workspacePath: string }) 
           title={terminalLabel}
           aria-label={terminalLabel}
           aria-pressed={terminalOpen}
-          onClick={() => toggleTerminal(workspacePath)}
+          onClick={() => toggleTerminal(workspacePath, machine)}
           className={cx(
             ICON_BUTTON_CLASSES,
             terminalOpen && "bg-background-secondary-hover text-foreground-icon-primary",
@@ -397,7 +398,7 @@ export function HeaderOpenActions({ workspacePath }: { workspacePath: string }) 
                 <button
                   type="button"
                   onClick={() => {
-                    toggleTerminal(workspacePath);
+                    toggleTerminal(workspacePath, machine);
                     closeMenu();
                   }}
                   className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 rounded-2lg p-2 text-left outline-none transition-colors hover:bg-background-primary-hover focus-visible:bg-background-primary-hover"

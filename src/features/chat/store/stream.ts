@@ -24,6 +24,10 @@ export type QueueMoveDirection = "up" | "down";
 
 export interface SessionState {
   messages: Message[];
+  eventCursor?: number;
+  historyEpoch?: number;
+  historySource?: "hub" | "executor";
+  historyLoaded?: boolean;
   /** Older delegation metadata kept outside the paginated message window. */
   subagentHistory: Message[];
   nextBefore: number | null;
@@ -369,6 +373,8 @@ export function appendToolMessage<T extends BySessionSlice>(
 
 export interface ToolMessageInput {
   text: string;
+  toolCallId?: string | null;
+  runId?: string | null;
   path?: string | null;
   todos?: TodosPayload | null;
   args?: unknown;
@@ -446,6 +452,8 @@ export function appendToolMessages<T extends BySessionSlice>(
       if (!patch) {
         const message: Message = {
           role: "tool",
+          toolCallId: tool.toolCallId,
+          runId: tool.runId,
           text,
           path: path ?? null,
           ts: new Date().toISOString(),
@@ -460,7 +468,14 @@ export function appendToolMessages<T extends BySessionSlice>(
         continue;
       }
       let target = -1;
-      if (result !== undefined) {
+      if (tool.toolCallId) {
+        target = messages.findLastIndex((m) => m.role === "tool" && m.toolCallId === tool.toolCallId &&
+          (!tool.runId || !m.runId || m.runId === tool.runId));
+        // Histories from older hosts did not expose native call ids. Keep
+        // their name-based fallback, without overwriting a different known id.
+        if (target < 0) target = messages.findLastIndex((m) => m.role === "tool" && !m.toolCallId &&
+          (result !== undefined ? (!text || m.text.includes(text)) : (m.text === text && m.args == null)));
+      } else if (result !== undefined) {
         const cached = resultTargets.get(text);
         target = cached?.index ?? -1;
         for (let offset = toolIndices.length - 1; offset >= (cached?.scanned ?? 0); offset--) {

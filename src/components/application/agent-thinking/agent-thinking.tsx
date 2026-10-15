@@ -288,6 +288,7 @@ function ElapsedTimer({
 
   useEffect(() => {
     if (startedAt) {
+      setElapsed(Math.max(0, (Date.now() - startedAt) / 1000));
       const id = window.setInterval(
         () => setElapsed(Math.max(0, (Date.now() - startedAt) / 1000)),
         100,
@@ -295,6 +296,7 @@ function ElapsedTimer({
       return () => window.clearInterval(id);
     }
     const started = performance.now();
+    setElapsed(0);
     const id = window.setInterval(
       () => setElapsed((performance.now() - started) / 1000),
       100,
@@ -326,7 +328,7 @@ function VariantIndicator({ variant, animated }: { variant: AgentThinkingVariant
 function MetaItem({ children }: { children: ReactNode }) {
   return (
     <>
-      <span aria-hidden className="text-text-tertiary">·</span>
+      <span aria-hidden className="text-text-tertiary first:hidden">·</span>
       {children}
     </>
   );

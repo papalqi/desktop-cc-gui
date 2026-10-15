@@ -6,13 +6,15 @@ import { Chip } from "@/components/base/chips/chip";
 import { Input } from "@/components/base/input/input";
 import { Switch } from "@/components/base/switch/switch";
 import {
-  ipc,
+  ipc as defaultIpc,
+  ipcForMachine,
   type PrPreview,
   type Workspace,
   type WorktreeCreateArgs,
 } from "@/lib/ipc";
 import { useGitStore } from "@/features/git/store";
 import { useWorktreeStore } from "./store";
+import { machineResourceKey } from "@/lib/web-machine";
 import {
   defaultBaseRef,
   defaultWorktreePath,
@@ -39,6 +41,7 @@ function usePrPreview({
   location,
   locationTouched,
   parentPath,
+  machine,
 }: {
   tab: SourceTab;
   prNumber: number | null;
@@ -46,7 +49,9 @@ function usePrPreview({
   location: string;
   locationTouched: boolean;
   parentPath: string;
+  machine?: string;
 }) {
+  const ipc = machine ? ipcForMachine(machine) : defaultIpc;
   const [preview, setPreview] = useState<PrPreview | null>(null);
   const [resolving, setResolving] = useState(false);
   const [resolveError, setResolveError] = useState<"notGitHub" | "invalidPrInput" | null>(null);
@@ -101,7 +106,7 @@ function usePrPreview({
     }, 400);
     return () => clearTimeout(timer);
     // 依赖 preview?.title：标题晚到时重跑并复查冲突；key guard 防死循环。
-  }, [prInput, prNumber, preview?.title, location, locationTouched, parentPath, tab, branchSuffix]);
+  }, [prInput, prNumber, preview?.title, location, locationTouched, parentPath, tab, branchSuffix, ipc]);
 
   const suggestedBranch = prNumber
     ? suggestPrBranch(prNumber, preview?.title, branchSuffix)
@@ -184,10 +189,12 @@ function buildCreateArgs({
 /** Worktree-create form state, derived values, and submit. Kept JSX-free so
  *  the dialog below only composes its tabs and field groups. */
 function useWorktreeCreateForm(parent: Workspace, onClose: () => void) {
+  const ipc = parent.machine ? ipcForMachine(parent.machine) : defaultIpc;
   const prefs = useWorktreeStore((s) => s.prefs);
-  const branches = useGitStore((s) => s.branchesByWorkspace[parent.path]);
+  const resourceKey = machineResourceKey(parent.path, parent.machine);
+  const branches = useGitStore((s) => s.branchesByWorkspace[resourceKey]);
   /** 当前检出分支，跟实时 status（同 useBranchSwitcher）；detached HEAD 是 "HEAD"。 */
-  const currentBranch = useGitStore((s) => s.statusByWorkspace[parent.path]?.branch);
+  const currentBranch = useGitStore((s) => s.statusByWorkspace[resourceKey]?.branch);
 
   const [tab, setTab] = useState<SourceTab>("new");
   const [occupied, setOccupied] = useState<Set<string>>(new Set());
@@ -204,8 +211,8 @@ function useWorktreeCreateForm(parent: Workspace, onClose: () => void) {
   const [existing, setExisting] = useState<string | null>(null);
 
   // Shared
-  const [location, setLocation] = useState(prefs.location ?? "");
-  const [locationTouched, setLocationTouched] = useState(prefs.location != null);
+  const [location, setLocation] = useState(parent.machine ? "" : prefs.location ?? "");
+  const [locationTouched, setLocationTouched] = useState(!parent.machine && prefs.location != null);
   const [openSessionAfter, setOpenSessionAfter] = useState(prefs.openSessionAfter);
   const [submitting, setSubmitting] = useState(false);
 
@@ -217,14 +224,15 @@ function useWorktreeCreateForm(parent: Workspace, onClose: () => void) {
     location,
     locationTouched,
     parentPath: parent.path,
+    machine: parent.machine,
   });
 
   // Branch list + occupancy (existing-branch flow blocks checked-out names).
   useEffect(() => {
     const git = useGitStore.getState();
-    void git.loadBranches(parent.path);
+    void git.loadBranches(parent.path, parent.machine);
     // 默认 base 取自当前分支，status 也要拉（30s TTL / 在途去重在 git store）。
-    void git.refresh(parent.path).catch(() => undefined);
+    void git.refresh(parent.path, false, parent.machine).catch(() => undefined);
     void ipc
       .gitWorktreeList(parent.path)
       .then((list) => {
@@ -233,7 +241,7 @@ function useWorktreeCreateForm(parent: Workspace, onClose: () => void) {
         );
       })
       .catch(() => undefined);
-  }, [parent.path]);
+  }, [parent.path, parent.machine, ipc]);
 
   // Default base: 当前分支（main/master 除外，规则与理由见 defaultBaseRef）。
   // 派生而非写进 state：status 比分支列表晚到时默认值能自己跟上，用户手选过则不再改。
@@ -284,7 +292,7 @@ function useWorktreeCreateForm(parent: Workspace, onClose: () => void) {
     setSubmitting(true);
     const store = useWorktreeStore.getState();
     store.setPrefs({
-      location: locationTouched ? location.trim() : null,
+      ...(parent.machine ? {} : { location: locationTouched ? location.trim() : null }),
       openSessionAfter,
     });
     store.start(
@@ -298,7 +306,7 @@ function useWorktreeCreateForm(parent: Workspace, onClose: () => void) {
         preview,
         prInput,
       }),
-      { parentPath: parent.path, openSessionAfter },
+      { parentPath: parent.path, openSessionAfter, ...(parent.machine ? { machine: parent.machine } : {}) },
     );
     onClose();
   };

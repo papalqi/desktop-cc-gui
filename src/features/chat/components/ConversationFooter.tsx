@@ -132,7 +132,7 @@ function ActiveRunStatus({ active }: { active: ActiveSession | null }) {
   return (
     <div className="mx-auto w-full max-w-3xl">
       <RunStatusStrip
-        sessionKey={active ? sessionKey(active.engine, active.sessionId, active.workspacePath) : ""}
+        sessionKey={active ? sessionKey(active.engine, active.sessionId, active.workspacePath, active.machine) : ""}
         engine={active?.engine ?? ""}
         workspacePath={active?.workspacePath ?? ""}
       />
@@ -218,7 +218,7 @@ function FooterStatusBar({
   branches: BranchInfo[] | undefined;
   branchRepoName: string | undefined;
   onBranchSelect: (name: string) => void;
-  startNewChat: (workspacePath: string) => void;
+  startNewChat: (workspacePath: string, machine?: string) => void;
 }) {
   const { t } = useTranslation();
   // Same denominator as the breakdown card (contextMax), so the ring pill
@@ -243,7 +243,7 @@ function FooterStatusBar({
 
   // 压缩/刷新按本格子的会话 key 发出：分屏时不能再落到全局 active 上。
   const sessionKeyValue = active
-    ? sessionKey(active.engine, active.sessionId, active.workspacePath)
+    ? sessionKey(active.engine, active.sessionId, active.workspacePath, active.machine)
     : "";
   const autoCompact = useAutoCompactSettings(sessionKeyValue);
   const autoCompactLatch = useRef<{
@@ -263,7 +263,7 @@ function FooterStatusBar({
       // No active fallback: a closed tab means there is nothing to resume
       // into, and the fallback would send the nudge to a different session.
       const tab = state.openTabs.find(
-        (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
+        (t) => sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === key,
       );
       const shouldResume = shouldResumeAfterAutoCompact({
         trigger: "threshold",
@@ -373,15 +373,15 @@ function FooterStatusBar({
   const visibleWorkspaces = useMemo(
     () => {
       const archivedIds = new Set(archivedWorkspaces);
-      return workspaces.filter((w) => !archivedIds.has(w.id));
+      return workspaces.filter((w) => !archivedIds.has(w.id) && w.machine === active?.machine);
     },
-    [workspaces, archivedWorkspaces],
+    [workspaces, archivedWorkspaces, active?.machine],
   );
   const statusFolders = useMemo(() => visibleWorkspaces.map((w) => baseName(w.path)), [visibleWorkspaces]);
   const handleFolderSelect = useCallback(
     (name: string) => {
       const target = visibleWorkspaces.find((w) => baseName(w.path) === name);
-      if (target) startNewChat(target.path);
+      if (target) startNewChat(target.path, target.machine);
     },
     [visibleWorkspaces, startNewChat],
   );
@@ -503,7 +503,7 @@ export function ConversationFooter({
   branches: BranchInfo[] | undefined;
   onBranchSelect: (name: string) => void;
   branchRepoName: string | undefined;
-  startNewChat: (workspacePath: string) => void;
+  startNewChat: (workspacePath: string, machine?: string) => void;
 }) {
   /** Composer attachment chip lightbox: preview URL + display name. */
   const [zoomImage, setZoomImage] = useState<ZoomImage>(null);

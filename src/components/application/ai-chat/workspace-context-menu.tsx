@@ -12,7 +12,8 @@ import Puzzle from "lucide-react/dist/esm/icons/puzzle";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { useChatStore } from "@/features/chat/store";
 import { useWorktreeStore } from "@/features/worktree/store";
-import { ipc, worktreeMetaOf, type Workspace } from "@/lib/ipc";
+import { ipc, ipcForMachine, worktreeMetaOf, type Workspace } from "@/lib/ipc";
+import { machineResourceKey } from "@/lib/web-machine";
 import {
   compareByOrder,
   pluginIdFromRegistryKey,
@@ -93,7 +94,7 @@ function buildWorkspaceMenuEntries({
       id: "reveal-worktree",
       label: revealLabel(t),
       icon: <FolderOpen className="size-4" aria-hidden />,
-      onSelect: () => void ipc.revealInFileManager(workspace.path).catch(() => undefined),
+      onSelect: () => void (workspace.machine ? ipcForMachine(workspace.machine) : ipc).revealInFileManager(workspace.path).catch(() => undefined),
     });
     if (onDeleteWorktree) {
       entries.push("separator");
@@ -221,7 +222,7 @@ export function WorkspaceContextMenu({
   const isWorktree = workspace != null && (worktreeMetaOf(workspace) != null || workspace.parentId != null);
   // git 层面 locked 的 worktree 禁删（原因进 title，不谎报可点）。
   const lockReason = useWorktreeStore((s) =>
-    workspace ? s.lockedPaths[workspace.path] : undefined,
+    workspace ? s.lockedPaths[machineResourceKey(workspace.path, workspace.machine)] : undefined,
   );
   // Read in render so a language flip or an owner's state change re-labels an
   // open menu.

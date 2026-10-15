@@ -140,6 +140,25 @@ it("lists sessions newest-first on open and jumps on click", async () => {
   expect(onClose).toHaveBeenCalled();
 });
 
+it("searches the selected scope and opens the owning machine for identical hits", async () => {
+  vi.useFakeTimers();
+  const onThreadSelect = vi.fn();
+  try {
+    vi.mocked(ipc.searchMessages).mockResolvedValue(page({ hits: [
+      contentHit({ machine: "PC0", sessionId: "same", title: "first" }),
+      contentHit({ machine: "PC6", sessionId: "same", title: "second" }),
+    ] }));
+    await act(async () => root.render(<SessionSearchPalette open repos={[]} scope="remote" onClose={vi.fn()} onThreadSelect={onThreadSelect} />));
+    await type("中文查询");
+    await act(async () => { vi.advanceTimersByTime(350); });
+    expect(ipc.searchMessages).toHaveBeenCalledWith("中文查询", 20, 0, "remote");
+    expect(options()).toHaveLength(2);
+    expect(options()[1].textContent).toContain("PC6");
+    await act(async () => options()[1].click());
+    expect(onThreadSelect).toHaveBeenCalledWith("PC6/claude/same");
+  } finally { vi.useRealTimers(); }
+});
+
 it("filters by session title, not by unrelated content", async () => {
   await render(true);
   await type("流水线");
@@ -181,7 +200,7 @@ it("shows debounced message-content hits with highlighted snippets", async () =>
     await act(async () => {
       vi.advanceTimersByTime(350);
     });
-    expect(ipc.searchMessages).toHaveBeenCalledWith("已生成", 20, 0);
+    expect(ipc.searchMessages).toHaveBeenCalledWith("已生成", 20, 0, "all");
 
     const rows = options();
     expect(rows).toHaveLength(1);

@@ -8,7 +8,8 @@ import { Button } from "@/components/base/buttons/button";
 import { Checkbox } from "@/components/base/checkbox/checkbox";
 import { sessionKey, useChatStore } from "@/features/chat/store";
 import { useTerminalStore } from "@/features/terminal/store";
-import { ipc, worktreeMetaOf, type Workspace } from "@/lib/ipc";
+import { ipc as defaultIpc, ipcForMachine, worktreeMetaOf, type Workspace } from "@/lib/ipc";
+import { machineResourceKey } from "@/lib/web-machine";
 import { useWorktreeStore } from "./store";
 
 /** 预检结果：null = 还在加载。 */
@@ -29,7 +30,9 @@ function useDeletePreflight(
   repoPath: string | undefined,
   branch: string | null,
   baseRef: string,
+  machine?: string,
 ): Preflight | null {
+  const ipc = machine ? ipcForMachine(machine) : defaultIpc;
   const [preflight, setPreflight] = useState<Preflight | null>(null);
 
   useEffect(() => {
@@ -58,7 +61,7 @@ function useDeletePreflight(
     return () => {
       cancelled = true;
     };
-  }, [workspacePath, repoPath, branch, baseRef]);
+  }, [workspacePath, repoPath, branch, baseRef, ipc]);
 
   return preflight;
 }
@@ -253,14 +256,15 @@ export function DeleteWorktreeDialog({
     s.openTabs.some(
       (tab) =>
         tab.workspacePath === workspace.path &&
-        s.streamingByKey[sessionKey(tab.engine, tab.sessionId, tab.workspacePath)],
+        tab.machine === workspace.machine &&
+        s.streamingByKey[sessionKey(tab.engine, tab.sessionId, tab.workspacePath, tab.machine)],
     ),
   );
   const hasTerminals = useTerminalStore(
-    (s) => (s.tabsByWorkspace[workspace.path] ?? []).length > 0,
+    (s) => (s.tabsByWorkspace[machineResourceKey(workspace.path, workspace.machine)] ?? []).length > 0,
   );
 
-  const preflight = useDeletePreflight(workspace.path, repoPath, branch, baseRef);
+  const preflight = useDeletePreflight(workspace.path, repoPath, branch, baseRef, workspace.machine);
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -293,6 +297,7 @@ export function DeleteWorktreeDialog({
       repoPath,
       branch,
       deleteBranch,
+      ...(workspace.machine ? { machine: workspace.machine } : {}),
     });
     onClose();
   };

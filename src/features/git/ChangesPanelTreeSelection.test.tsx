@@ -229,9 +229,9 @@ describe("ChangesPanel tree view and checkbox selection", () => {
     });
 
     // It should have auto-staged the selected unstaged file
-    expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", ["src/features/git/ChangesPanel.tsx"]);
+    expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", ["src/features/git/ChangesPanel.tsx"], undefined);
     // And called commit with message
-    expect(useGitStore.getState().commit).toHaveBeenCalledWith("/repo", "feat: new tree view");
+    expect(useGitStore.getState().commit).toHaveBeenCalledWith("/repo", "feat: new tree view", undefined);
   });
 
   function typeCommitMessage(text: string) {
@@ -291,11 +291,11 @@ describe("ChangesPanel tree view and checkbox selection", () => {
       confirmBtn.click();
     });
 
-    expect(useGitStore.getState().unstage).toHaveBeenCalledWith("/repo", ["staged-root.ts"]);
+    expect(useGitStore.getState().unstage).toHaveBeenCalledWith("/repo", ["staged-root.ts"], undefined);
     expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", [
       "src/features/git/ChangesPanel.tsx",
-    ]);
-    expect(useGitStore.getState().commit).toHaveBeenCalledWith("/repo", "feat: only the checked file");
+    ], undefined);
+    expect(useGitStore.getState().commit).toHaveBeenCalledWith("/repo", "feat: only the checked file", undefined);
   });
 
   it("canceling the dialog leaves the index and worktree untouched", () => {
@@ -352,8 +352,8 @@ describe("ChangesPanel tree view and checkbox selection", () => {
 
     await act(async () => {});
 
-    expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", ["partial.ts"]);
+    expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", ["partial.ts"], undefined);
     expect(useGitStore.getState().unstage).not.toHaveBeenCalled();
-    expect(useGitStore.getState().commit).toHaveBeenCalledWith("/repo", "feat: whole file");
+    expect(useGitStore.getState().commit).toHaveBeenCalledWith("/repo", "feat: whole file", undefined);
   });
 });

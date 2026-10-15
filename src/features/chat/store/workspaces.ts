@@ -1,9 +1,10 @@
 import { ipc, type WorkspaceGroup } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
 import { newId } from "@/lib/id";
+import { machineResourceKey } from "@/lib/web-machine";
 import { pruneMentionIndex } from "@/components/application/ai-chat/mention-files";
 import { pruneSlashCommands } from "@/components/application/ai-chat/slash-commands";
-import { persistTabs, sessionKey, type ActiveSession } from "./persistence";
+import { parseDraftSessionKey, persistTabs, sessionKey, type ActiveSession } from "./persistence";
 import { persistSettings } from "./settings-persist";
 import type { ChatStore } from "./types";
 import type { StoreGet, StoreSet } from "./context";
@@ -74,21 +75,23 @@ export function createWorkspaceActions(
 
     removeWorkspace: async (id) => {
       try {
-        const removedPath = get().workspaces.find((w) => w.id === id)?.path;
+        const removed = get().workspaces.find((w) => w.id === id);
+        const removedPath = removed?.path;
         await ipc.removeWorkspace(id);
         await get().refreshWorkspaces();
         set({ actionError: null });
         if (!removedPath) return;
         // The composer's per-root picker caches die with the workspace.
-        pruneMentionIndex(removedPath);
-        pruneSlashCommands(removedPath);
+        const resourceKey = machineResourceKey(removedPath, removed?.machine);
+        pruneMentionIndex(resourceKey);
+        pruneSlashCommands(resourceKey);
         // Evict cached session state belonging to the removed workspace:
         // real session keys come from the list cache, pending-chat keys
         // carry the path in the key itself.
         const dead = new Set<string>();
         for (const sess of get().sessions) {
-          if (sess.workspacePath === removedPath) {
-            dead.add(sessionKey(sess.engine, sess.sessionId, ""));
+          if (sess.workspacePath === removedPath && sess.machine === removed?.machine) {
+            dead.add(sessionKey(sess.engine, sess.sessionId, "", sess.machine));
           }
         }
         const current = get();
@@ -97,7 +100,8 @@ export function createWorkspaceActions(
           ...Object.keys(current.drafts),
           ...Object.keys(current.unseen),
         ]) {
-          if (key.startsWith("new:") && key.endsWith(`:${removedPath}`)) {
+          const draft = parseDraftSessionKey(key);
+          if (draft?.workspacePath === removedPath && draft.machine === removed?.machine) {
             dead.add(key);
           }
         }
@@ -116,11 +120,11 @@ export function createWorkspaceActions(
           });
         }
         const openTabs = get().openTabs.filter(
-          (t) => t.workspacePath !== removedPath,
+          (t) => t.workspacePath !== removedPath || t.machine !== removed?.machine,
         );
         set({ openTabs });
         const active = get().active;
-        if (active && active.workspacePath === removedPath) {
+        if (active && active.workspacePath === removedPath && active.machine === removed?.machine) {
           activateTab(openTabs[0] ?? null);
         } else {
           persistTabs(openTabs, active);

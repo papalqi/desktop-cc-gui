@@ -129,14 +129,14 @@ describe("ChangesPanel virtual rows", () => {
       row.querySelector<HTMLButtonElement>("button")!.click();
       row.querySelector<HTMLButtonElement>('[aria-label="git.stage"]')!.click();
     });
-    expect(useGitStore.getState().openDiff).toHaveBeenCalledWith("/repo", { file: "file-0.ts", staged: false });
-    expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", ["file-0.ts"]);
+    expect(useGitStore.getState().openDiff).toHaveBeenCalledWith("/repo", { file: "file-0.ts", staged: false }, undefined);
+    expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", ["file-0.ts"], undefined);
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="git.unstage"]')!.click());
-    expect(useGitStore.getState().unstage).toHaveBeenCalledWith("/repo", ["staged.ts"]);
+    expect(useGitStore.getState().unstage).toHaveBeenCalledWith("/repo", ["staged.ts"], undefined);
     act(() => row.querySelector<HTMLButtonElement>('[aria-label="git.discard"]')!.click());
     expect(useGitStore.getState().discard).not.toHaveBeenCalled();
     await act(async () => Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "confirm")!.click());
-    expect(useGitStore.getState().discard).toHaveBeenCalledWith("/repo", ["file-0.ts"]);
+    expect(useGitStore.getState().discard).toHaveBeenCalledWith("/repo", ["file-0.ts"], undefined);
     await act(async () => Array.from(section.querySelectorAll("button")).find((button) => button.textContent === "git.stageAll")!.click());
     expect(vi.mocked(useGitStore.getState().stage).mock.lastCall?.[1]).toHaveLength(2000);
   });
@@ -184,8 +184,8 @@ describe("ChangesPanel virtual rows", () => {
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(container.querySelectorAll("li")).toHaveLength(0);
     renderSidebar("changes", false, "/other");
-    expect(refresh).toHaveBeenLastCalledWith("/other");
-    expect(loadBranches).toHaveBeenLastCalledWith("/other");
+    expect(refresh).toHaveBeenLastCalledWith("/other", false, undefined);
+    expect(loadBranches).toHaveBeenLastCalledWith("/other", undefined);
   });
 
   it("uses the scrolled row's path for actions and keeps whole-group discard complete", async () => {
@@ -197,7 +197,7 @@ describe("ChangesPanel virtual rows", () => {
     });
     const row = Array.from(section.querySelectorAll("li")).find((element) => element.textContent?.includes("file-1999.ts"))!;
     await act(async () => row.querySelector<HTMLButtonElement>('[aria-label="git.stage"]')!.click());
-    expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", ["file-1999.ts"]);
+    expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", ["file-1999.ts"], undefined);
     act(() => Array.from(section.querySelectorAll("button")).find((button) => button.textContent === "git.discardAll")!.click());
     expect(useGitStore.getState().discard).not.toHaveBeenCalled();
     await act(async () => Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "confirm")!.click());

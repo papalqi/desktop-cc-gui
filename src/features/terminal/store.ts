@@ -1,8 +1,9 @@
 import { create } from "zustand";
-import { ipc } from "@/lib/ipc";
+import { ipc, ipcForMachine } from "@/lib/ipc";
+import { machineResourceKey } from "@/lib/web-machine";
 import { readStoredNumber, writeStored } from "@/lib/storage";
 import { newId } from "@/lib/id";
-import { clearTerminalSessionState } from "./sessions";
+import { clearTerminalSessionState, registerTerminalOwner } from "./sessions";
 
 const HEIGHT_KEY = "ccgui-next.terminalHeight";
 export const TERMINAL_MIN_HEIGHT = 120;
@@ -12,6 +13,7 @@ export const TERMINAL_DEFAULT_HEIGHT = 240;
 export interface TerminalTab {
   /** Globally unique; doubles as the backend PTY session key. */
   id: string;
+  machine?: string;
 }
 
 interface TerminalState {
@@ -20,19 +22,19 @@ interface TerminalState {
   /** Tabs per workspace; each workspace's shells run in its own cwd. */
   tabsByWorkspace: Record<string, TerminalTab[]>;
   activeByWorkspace: Record<string, string>;
-  toggle: (workspacePath: string) => void;
+  toggle: (workspacePath: string, machine?: string) => void;
   closePanel: () => void;
-  newTab: (workspacePath: string) => void;
-  selectTab: (workspacePath: string, id: string) => void;
-  closeTab: (workspacePath: string, id: string) => void;
-  removeWorkspace: (workspacePath: string) => void;
+  newTab: (workspacePath: string, machine?: string) => void;
+  selectTab: (workspacePath: string, id: string, machine?: string) => void;
+  closeTab: (workspacePath: string, id: string, machine?: string) => void;
+  removeWorkspace: (workspacePath: string, machine?: string) => void;
   setHeight: (height: number) => void;
 }
 
 /** Kill the backend session and drop its frontend buffer. */
-function destroySession(id: string): void {
+function destroySession(id: string, machine?: string): void {
   clearTerminalSessionState(id);
-  void ipc.terminalClose(id).catch(() => {});
+  void (machine ? ipcForMachine(machine) : ipc).terminalClose(id).catch(() => {});
 }
 
 function clampHeight(height: number): number {
@@ -48,15 +50,15 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   tabsByWorkspace: {},
   activeByWorkspace: {},
 
-  toggle: (workspacePath) => {
+  toggle: (workspacePath, machine) => {
     const { open } = get();
     if (open) {
       set({ open: false });
       return;
     }
     // Opening with no tabs in this workspace creates the first shell.
-    if (!(get().tabsByWorkspace[workspacePath]?.length)) {
-      get().newTab(workspacePath);
+    if (!(get().tabsByWorkspace[machineResourceKey(workspacePath, machine)]?.length)) {
+      get().newTab(workspacePath, machine);
     }
     set({ open: true });
   },
@@ -65,48 +67,54 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     set({ open: false });
   },
 
-  newTab: (workspacePath) => {
+  newTab: (workspacePath, machine) => {
+    const key = machineResourceKey(workspacePath, machine);
     const id = newId();
+    registerTerminalOwner(id, machine);
     set((s) => ({
       tabsByWorkspace: {
         ...s.tabsByWorkspace,
-        [workspacePath]: [...(s.tabsByWorkspace[workspacePath] ?? []), { id }],
+        [key]: [...(s.tabsByWorkspace[key] ?? []), { id, ...(machine ? { machine } : {}) }],
       },
-      activeByWorkspace: { ...s.activeByWorkspace, [workspacePath]: id },
+      activeByWorkspace: { ...s.activeByWorkspace, [key]: id },
     }));
   },
 
-  selectTab: (workspacePath, id) =>
+  selectTab: (workspacePath, id, machine) =>
     set((s) => ({
-      activeByWorkspace: { ...s.activeByWorkspace, [workspacePath]: id },
+      activeByWorkspace: { ...s.activeByWorkspace, [machineResourceKey(workspacePath, machine)]: id },
     })),
 
-  closeTab: (workspacePath, id) => {
-    destroySession(id);
+  closeTab: (workspacePath, id, machine) => {
+    const key = machineResourceKey(workspacePath, machine);
+    const tab = get().tabsByWorkspace[key]?.find((tab) => tab.id === id);
+    if (!tab) return;
+    destroySession(id, tab.machine);
     set((s) => {
-      const tabs = (s.tabsByWorkspace[workspacePath] ?? []).filter((tab) => tab.id !== id);
+      const tabs = (s.tabsByWorkspace[key] ?? []).filter((tab) => tab.id !== id);
       const nextActive =
-        s.activeByWorkspace[workspacePath] === id
+        s.activeByWorkspace[key] === id
           ? (tabs[tabs.length - 1]?.id ?? "")
-          : s.activeByWorkspace[workspacePath];
+          : s.activeByWorkspace[key];
       return {
-        tabsByWorkspace: { ...s.tabsByWorkspace, [workspacePath]: tabs },
-        activeByWorkspace: { ...s.activeByWorkspace, [workspacePath]: nextActive },
+        tabsByWorkspace: { ...s.tabsByWorkspace, [key]: tabs },
+        activeByWorkspace: { ...s.activeByWorkspace, [key]: nextActive },
         // Closing the last tab closes the panel; sessions stay per workspace.
         open: tabs.length > 0 ? s.open : false,
       };
     });
   },
 
-  removeWorkspace: (workspacePath) => {
-    for (const tab of get().tabsByWorkspace[workspacePath] ?? []) {
-      destroySession(tab.id);
+  removeWorkspace: (workspacePath, machine) => {
+    const key = machineResourceKey(workspacePath, machine);
+    for (const tab of get().tabsByWorkspace[key] ?? []) {
+      destroySession(tab.id, tab.machine);
     }
     set((s) => {
       const tabsByWorkspace = { ...s.tabsByWorkspace };
       const activeByWorkspace = { ...s.activeByWorkspace };
-      delete tabsByWorkspace[workspacePath];
-      delete activeByWorkspace[workspacePath];
+      delete tabsByWorkspace[key];
+      delete activeByWorkspace[key];
       return { tabsByWorkspace, activeByWorkspace };
     });
   },

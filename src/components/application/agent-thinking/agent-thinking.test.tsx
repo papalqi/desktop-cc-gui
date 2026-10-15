@@ -20,6 +20,7 @@ describe("AgentThinking", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    vi.useRealTimers();
   });
 
   it("renders label and timer correctly", () => {
@@ -49,6 +50,24 @@ describe("AgentThinking", () => {
 
     expect(container.textContent).toContain("响应中");
     expect(container.textContent).toMatch(/耗时 \d+\.\d+s/);
+  });
+
+  it("keeps elapsed time across leaving the view and immediately reflects a different turn", () => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    vi.setSystemTime(now);
+    act(() => root.render(<AgentThinking label="响应中" startedAt={now - 5000} />));
+    expect(container.textContent).toContain("5.0s");
+    act(() => root.render(null));
+    vi.setSystemTime(now + 60_000);
+    act(() => root.render(<AgentThinking label="响应中" startedAt={now - 5000} />));
+    expect(container.textContent).toContain("1m5s");
+    act(() => root.render(<AgentThinking label="响应中" startedAt={now + 50_000} />));
+    expect(container.textContent).toContain("10.0s");
+    // A throttled/background tab catches up from the clock, not tick count.
+    vi.setSystemTime(now + 120_000);
+    act(() => vi.advanceTimersByTime(100));
+    expect(container.textContent).toContain("1m10s");
   });
 
   it("renders model and effort with separator", () => {

@@ -22,9 +22,11 @@ import {
 import { type BranchInfo } from "@/lib/ipc";
 import { cx } from "@/utils/cx";
 import { useGitStore } from "./store";
+import { machineResourceKey } from "@/lib/web-machine";
 
 interface ChangesPanelHeaderProps {
   workspacePath: string;
+  machine?: string;
   /** Set when the panel follows the file tree's selection into a repository
    *  other than the workspace root: rendered as a badge so the user can see
    *  which repo stage/commit/pull/push will act on. */
@@ -47,6 +49,7 @@ interface ChangesPanelHeaderProps {
 /** Title row with refresh/pull/push, the branch picker, and the new-branch form. */
 export function ChangesPanelHeader({
   workspacePath,
+  machine,
   followedRepoPath,
   notRepo,
   branch,
@@ -60,6 +63,7 @@ export function ChangesPanelHeader({
   viewMode,
   onToggleViewMode,
 }: ChangesPanelHeaderProps) {
+  const workspaceKey = machineResourceKey(workspacePath, machine);
   const { t } = useTranslation();
   const [branchOpen, setBranchOpen] = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
@@ -76,12 +80,12 @@ export function ChangesPanelHeader({
     run("refresh", () =>
       // refresh() reports failure through store state instead of throwing.
       refreshAction.start(
-        () => useGitStore.getState().refresh(workspacePath, true),
+        () => useGitStore.getState().refresh(workspacePath, true, machine),
         () => {
           const state = useGitStore.getState();
           return (
-            state.errorByWorkspace[workspacePath] != null ||
-            state.notRepoByWorkspace[workspacePath] === true
+            state.errorByWorkspace[workspaceKey] != null ||
+            state.notRepoByWorkspace[workspaceKey] === true
           );
         },
       ),
@@ -116,12 +120,12 @@ export function ChangesPanelHeader({
           onRefresh={handleRefresh}
           onPull={() =>
             run("pull", () =>
-              pullAction.start(() => useGitStore.getState().pull(workspacePath)),
+              pullAction.start(() => useGitStore.getState().pull(workspacePath, machine)),
             )
           }
           onPush={() =>
             run("push", () =>
-              pushAction.start(() => useGitStore.getState().push(workspacePath)),
+              pushAction.start(() => useGitStore.getState().push(workspacePath, machine)),
             )
           }
         />
@@ -129,6 +133,7 @@ export function ChangesPanelHeader({
       {!notRepo && (
         <BranchPicker
           workspacePath={workspacePath}
+          machine={machine}
           branch={branch}
           branches={branches}
           run={run}
@@ -149,7 +154,7 @@ export function ChangesPanelHeader({
           onNameChange={setNewBranchName}
           onSubmit={(name) =>
             run("createBranch", async () => {
-              await useGitStore.getState().createBranch(workspacePath, name);
+              await useGitStore.getState().createBranch(workspacePath, name, machine);
               setCreatingBranch(false);
               setNewBranchName("");
             })
@@ -238,6 +243,7 @@ function HeaderActions({
 /** Branch trigger + searchable popover + the "new branch" entry. */
 function BranchPicker({
   workspacePath,
+  machine,
   branch,
   branches,
   run,
@@ -248,6 +254,7 @@ function BranchPicker({
   onCreateBranch,
 }: {
   workspacePath: string;
+  machine?: string;
   branch: string | undefined;
   branches: BranchInfo[] | undefined;
   run: (key: string, action: () => Promise<unknown>) => void;
@@ -286,7 +293,7 @@ function BranchPicker({
           onOpenChange(next);
           // The cached list goes stale when branches change outside the
           // app (CLI checkout/switch); reload on every open.
-          if (next) void useGitStore.getState().loadBranches(workspacePath);
+          if (next) void useGitStore.getState().loadBranches(workspacePath, machine);
         }}
       >
         <DropdownTrigger
@@ -342,7 +349,7 @@ function BranchPicker({
                 // behind external checkouts and would no-op the click.
                 if (b.name !== branch) {
                   run("checkout", () =>
-                    useGitStore.getState().checkout(workspacePath, b.name),
+                    useGitStore.getState().checkout(workspacePath, b.name, machine),
                   );
                 }
               }}

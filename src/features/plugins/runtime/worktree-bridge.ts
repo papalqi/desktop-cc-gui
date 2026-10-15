@@ -141,10 +141,10 @@ export function createPluginWorktree(
       new Error(`invalid_args: ${pluginId} worktrees.create: empty parentWorkspaceId`),
     );
   }
-  const parentKnown = useChatStore
+  const parent = useChatStore
     .getState()
-    .workspaces.some((workspace) => workspace.id === parentWorkspaceId);
-  if (!parentKnown) {
+    .workspaces.find((workspace) => workspace.id === parentWorkspaceId);
+  if (!parent) {
     return Promise.reject(
       new Error(`invalid_args: ${pluginId} worktrees.create: unknown parent workspace ${parentWorkspaceId}`),
     );
@@ -166,6 +166,6 @@ export function createPluginWorktree(
   // 轮次），宿主不在这里抢开一个空会话。
   const creationId = useWorktreeStore
     .getState()
-    .start(args, { parentPath: repoPath, openSessionAfter: false });
+    .start(args, { parentPath: repoPath, openSessionAfter: false, ...(parent.machine ? { machine: parent.machine } : {}) });
   return awaitCreation(creationId, worktreePath);
 }

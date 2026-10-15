@@ -3,7 +3,7 @@ import { useVirtualizer, type ReactVirtualizer } from "@tanstack/react-virtual";
 import { useTranslation } from "react-i18next";
 import ArrowLeft from "lucide-react/dist/esm/icons/arrow-left";
 import { IconButton } from "@/components/base/buttons/icon-button";
-import { ipc, type GitFileEntry, type GitStatus } from "@/lib/ipc";
+import { ipc, ipcForMachine, type GitFileEntry, type GitStatus } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
 import { cx } from "@/utils/cx";
 import type { DiffTarget } from "./store";
@@ -15,11 +15,13 @@ const DIFF_VIRTUALIZE_LINES = 500;
 
 export function DiffView({
   workspacePath,
+  machine,
   target,
   status,
   onBack,
 }: {
   workspacePath: string;
+  machine?: string;
   target: DiffTarget;
   status: GitStatus | undefined;
   onBack: () => void;
@@ -39,7 +41,8 @@ export function DiffView({
   useEffect(() => {
     let cancelled = false;
     setError(null);
-    ipc
+    setDiffText(null);
+    (machine ? ipcForMachine(machine) : ipc)
       .gitDiff(workspacePath, target.file, target.staged)
       .then((text) => {
         if (!cancelled) setDiffText(text);
@@ -50,7 +53,7 @@ export function DiffView({
     return () => {
       cancelled = true;
     };
-  }, [workspacePath, target.file, target.staged, entrySig]);
+  }, [workspacePath, machine, target.file, target.staged, entrySig]);
 
   const { lines, truncated } = useMemo<{ lines: AnnotatedLine[] | null; truncated: boolean }>(() => {
     if (diffText === null) return { lines: null, truncated: false };

@@ -36,7 +36,7 @@ export function summarizePerformanceReport(report: PerformanceReport): string {
   }
   const renderer = report.renderer;
   const intervals = [...renderer.samples, renderer.pending];
-  const durations = Object.fromEntries(["engineBatch", "liveRenderCommit", "eventLoopLag", "longTask"].map((key) => {
+  const durations = Object.fromEntries(["engineBatch", "liveRenderCommit", "eventLoopLag", "longTask", "sessionHistory", "sessionCatalog", "historyRoundTrip", "historyParse"].map((key) => {
     const entries = intervals.map((sample) => sample.durations[key as keyof typeof sample.durations]).filter((entry) => entry !== undefined);
     return [key, { count: entries.reduce((sum, entry) => sum + entry.count, 0), maxMs: peak(entries.map((entry) => entry.maxMs)), totalMs: entries.reduce((sum, entry) => sum + entry.totalMs, 0) }];
   }));
@@ -63,6 +63,7 @@ export function summarizePerformanceReport(report: PerformanceReport): string {
       sampleCount: renderer.samples.length, from: renderer.samples[0]?.at ?? null, to: renderer.samples.at(-1)?.at ?? null,
       counters: Object.fromEntries(["engineEvents", "toolEvents", "textEvents"].map((key) => [key, intervals.reduce((sum, sample) => sum + (sample.counters[key as keyof typeof sample.counters] ?? 0), 0)])),
       durations,
+      transitions: renderer.transitions.slice(-12),
       stallWindow: nearby(renderer.samples, (sample) => sample.durations.eventLoopLag?.maxMs).map((sample) => ({
         at: sample.at, hidden: sample.hidden, lagMs: sample.durations.eventLoopLag?.maxMs ?? null,
         batchMaxMs: sample.durations.engineBatch?.maxMs ?? null,
@@ -81,6 +82,7 @@ export function summarizePerformanceReport(report: PerformanceReport): string {
   if (new TextEncoder().encode(text).length > SUMMARY_MAX_BYTES) {
     summary.native.peakWindow = [];
     summary.renderer.stallWindow = [];
+    summary.renderer.transitions = [];
     text = JSON.stringify(summary);
   }
   return text;

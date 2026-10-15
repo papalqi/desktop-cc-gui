@@ -1,13 +1,42 @@
 // Transport picks Tauri IPC natively and the web-access WS bridge in browsers.
-import { invoke, listen } from "./transport";
+import { invoke as transportInvoke, isWeb, listen, webBridgeGeneration } from "./transport";
 import type { NativePerformanceDiagnostics } from "./performance-types";
 import { withGrantRetry } from "./grant";
+import { sendWithDeliveryRecovery } from "./web-send-recovery";
+import { webMachine, webMultiMachine } from "./web-machine";
+const invoke: typeof transportInvoke = (cmd, args) => transportInvoke(cmd, args);
 
 // ==================== Shared types (mirror Rust serde camelCase) ====================
 
-export interface SessionMeta {
+/** A turn the desktop still has in its process table. */
+export interface ActiveRun {
+  machine?: string;
+  runId: string;
   engine: string;
+  sessionId: string | null;
+  workspacePath: string;
+  /** Host reservation time (Unix ms). Older desktops omit it. */
+  startedAt?: number;
+}
+
+export interface RelayUpdateInfo {
+  version: string | null;
+  phase: string;
+  error: string | null;
+  failedVersion: string | null;
+  deferredUntil: number;
+  blackoutStart: number | null;
+  blackoutEnd: number | null;
+}
+
+export interface SessionMeta {
+  machine?: string;
+  machineOffline?: boolean;
+  engine: string;
+  metadataSyncPending?: boolean;
+  metadataSyncError?: string | null;
   sessionId: string;
+  origin?: "local" | "hub";
   workspacePath: string;
   filePath: string;
   fileSize: number;
@@ -64,6 +93,8 @@ export interface QuestionSpec {
 
 export interface Message {
   seq: number;
+  runId?: string | null;
+  toolCallId?: string | null;
   role: string; // "user" | "assistant" | "tool" | "thinking"
   text: string;
   /** Target file of a tool call (read/edit/write/...); renders as a file chip. */
@@ -119,12 +150,35 @@ export interface Message {
 
 export interface SessionPage {
   messages: Message[];
+  origin?: "local" | "hub";
+  source?: "hub" | "executor";
   nextBefore: number | null;
   /** Delegation metadata before this page, restored from the session file. */
   subagentHistory: Message[];
+  /** Committed event watermark of this history snapshot. */
+  eventCursor?: number;
+  /** Hub snapshot revision; native hosts may omit it. */
+  historyEpoch?: number;
+  activeRuns?: ActiveRun[];
+  settledRunIds?: string[];
+  incompleteTurn?: boolean;
+}
+
+export interface SessionEventPage {
+  events: import("./events").EngineEventPayload[];
+  nextCursor: number;
+  head: number;
+  hasMore: boolean;
+  historyEpoch?: number;
+  reset?: boolean;
+  source?: "hub" | "executor";
 }
 
 export interface Workspace {
+  machine?: string;
+  machineOffline?: boolean;
+  /** Executor-local id before the global browser adds the machine namespace. */
+  executorId?: string;
   id: string;
   path: string;
   name: string;
@@ -432,6 +486,8 @@ export interface CliConfig {
 }
 
 export interface AppSettings {
+  sessionScope?: "remote" | "all";
+  sessionSort?: "workspace" | "recent";
   theme: string;
   /** Windows 标题栏样式："native" | "mac"（仿 mac 自绘标题栏）。仅 Windows 生效，
    *  改动需重启应用；macOS 恒为系统原生红绿灯。 */
@@ -576,6 +632,8 @@ export interface SnippetPart {
 
 /** One message-content search hit: the best-matching message of a session. */
 export interface MessageSearchHit {
+  machine?: string;
+  origin?: "hub" | "local";
   engine: string;
   sessionId: string;
   workspacePath: string;
@@ -588,6 +646,7 @@ export interface MessageSearchHit {
 }
 
 export interface MessageSearchPage {
+  offlineMachines?: string[];
   hits: MessageSearchHit[];
   hasMore: boolean;
   /** Sessions still awaiting (re)indexing at query time; >0 means the
@@ -1094,6 +1153,11 @@ export interface CliUpdatePlan {
 // Shared in-flight/cached app-settings promise: startup, the settings page
 // and the chat store all read the same settings, so fetch once.
 let settingsPromise: Promise<AppSettings> | null = null;
+let settingsGeneration = 0;
+// Object spread preserves this marker; JSON sent to the backend omits it.
+const settingsConnection = Symbol("settings connection");
+const settingsMachine = Symbol("settings machine");
+type ConnectionSettings = AppSettings & { [settingsConnection]?: number; [settingsMachine]?: string | null };
 // Backend writes that bypass update_app_settings (pet scale / position /
 // visibility) broadcast this event; drop the shared cache in every window so
 // a later read-modify-write save cannot resurrect the pre-write values.
@@ -1102,11 +1166,25 @@ void listen("settings://changed", () => {
 });
 
 function fetchAppSettings(): Promise<AppSettings> {
-  return (settingsPromise ??= invoke<AppSettings>("get_app_settings").catch((e) => {
-    // Allow retry after a failed fetch instead of caching the rejection.
-    settingsPromise = null;
-    throw e;
-  }));
+  const generation = isWeb ? webBridgeGeneration() : 0;
+  if (settingsGeneration !== generation) settingsPromise = null;
+  settingsGeneration = generation;
+  if (!settingsPromise) {
+    const machine = webMachine();
+    const pending = (webMultiMachine() ? invoke<AppSettings>("get_app_settings", { settingsMachine: machine }) : invoke<AppSettings>("get_app_settings"))
+      .then((settings) => {
+        if (!isWeb) return settings;
+        if (generation !== webBridgeGeneration()) throw new Error("web bridge disconnected");
+        return { ...settings, [settingsConnection]: generation, ...(webMultiMachine() ? { [settingsMachine]: machine } : {}) };
+      })
+      .catch((e) => {
+        // A late failure from the old connection must not evict the new cache.
+        if (settingsPromise === pending) settingsPromise = null;
+        throw e;
+      });
+    settingsPromise = pending;
+  }
+  return settingsPromise;
 }
 
 // ---- pi-family (pi/omp) provider auth & custom providers (供应商认证) ----
@@ -1303,7 +1381,35 @@ export interface PetPackage extends PetSummary {
   frameCounts?: number[];
 }
 
-export const ipc = {
+function createIpc(machine?: string) {
+const invoke: typeof transportInvoke = (cmd, args) => machine
+  ? transportInvoke(cmd, args, machine)
+  : transportInvoke(cmd, args);
+const sessionRows = <T extends { machine?: string }>(rows: T[]): T[] => rows.map((row) => {
+  if (isWeb && !webMultiMachine() && row.machine) { const { machine: _machine, ...local } = row; return local as T; }
+  return webMultiMachine() && machine ? { ...row, machine } : row;
+});
+const workspaceTarget = (id: string) => {
+  const slash = id.indexOf("/");
+  return webMultiMachine() && slash > 0
+    ? { machine: decodeURIComponent(id.slice(0, slash)), id: decodeURIComponent(id.slice(slash + 1)) }
+    : { machine, id };
+};
+const workspaceInvoke = <T>(cmd: string, id: string, args: Record<string, unknown> = {}) => {
+  const target = workspaceTarget(id);
+  return target.machine ? transportInvoke<T>(cmd, { ...args, id: target.id }, target.machine) : invoke<T>(cmd, { ...args, id });
+};
+const workspaceRow = (row: Workspace): Workspace => {
+  const target = row.machine ?? machine;
+  if (!webMultiMachine() || !target || row.executorId) return row;
+  const prefix = encodeURIComponent(target) + "/";
+  return { ...row, machine: target, executorId: row.id, id: prefix + encodeURIComponent(row.id),
+    ...(row.parentId ? { parentId: prefix + encodeURIComponent(row.parentId) } : {}) };
+};
+const registerWorkspace = (cmd: string, args: Record<string, unknown>, target = machine ?? (webMultiMachine() ? webMachine() ?? undefined : undefined)) =>
+  (target ? transportInvoke<Workspace>(cmd, args, target) : invoke<Workspace>(cmd, args))
+    .then((row) => workspaceRow(target ? { ...row, machine: target } : row));
+return {
   // config
   getCliConfig: () => invoke<CliConfig>("get_cli_config"),
   upsertProvider: (engine: string, id: string, json: unknown) =>
@@ -1350,16 +1456,20 @@ export const ipc = {
   fetchProviderModels: (baseUrl: string, apiKey: string) =>
     invoke<ProviderModelList>("fetch_provider_models", { baseUrl, apiKey }),
   // settings
-  getAppSettings: fetchAppSettings,
+  getAppSettings: machine ? () => invoke<AppSettings>("get_app_settings") : fetchAppSettings,
   /** De-cached read: settings the backend changed on its own (the pairing key
    *  rotates after a pairing and on a timer) never pass through a write here,
    *  so the cached copy would keep showing the retired code. */
   refreshAppSettings: () => {
     settingsPromise = null;
-    return fetchAppSettings();
+    return machine ? invoke<AppSettings>("get_app_settings") : fetchAppSettings();
   },
   updateAppSettings: async (settings: AppSettings) => {
-    await invoke<void>("update_app_settings", { settings });
+    const generation = (settings as ConnectionSettings)[settingsConnection];
+    if (isWeb && generation !== undefined && generation !== webBridgeGeneration()) {
+      throw new Error("web bridge disconnected");
+    }
+    await invoke<void>("update_app_settings", { settings, ...(!machine && webMultiMachine() ? { settingsMachine: (settings as ConnectionSettings)[settingsMachine] ?? null } : {}) });
     // Drop the cache instead of caching `settings`: the backend adjusts what
     // it stores (it mints the pairing key, drops rejected bin paths), and a
     // write must never seed the shared copy with something the backend did
@@ -1430,9 +1540,14 @@ export const ipc = {
     /** 记忆：把 memory MCP 工具挂给本次会话并绑定到这个 Bot（仅当这个 Bot
      *  开启了记忆、引擎支持挂载时传）。 */
     memoryBot?: string | null;
-  }) => invoke<SendResult>("send_message", args),
+  }) => isWeb
+    ? sendWithDeliveryRecovery(args, () => invoke<SendResult>("send_message", args), undefined, machine)
+    : invoke<SendResult>("send_message", args),
   interruptSession: (sessionId: string) =>
     invoke<boolean>("interrupt_session", { sessionId }),
+  relayUpdateStatus: () => invoke<RelayUpdateInfo>("relay_update_status"),
+  relayUpdateDefer: () => invoke<RelayUpdateInfo>("relay_update_defer"),
+  relayUpdateBlackout: (start: number | null, end: number | null) => invoke<RelayUpdateInfo>("relay_update_blackout", { start, end }),
   // 电脑操控 (computer use)
   /** macOS TCC probe. `osPermissionsRequired` is false on Windows/Linux,
    *  where the driver needs no OS grant. */
@@ -1490,8 +1605,20 @@ export const ipc = {
       invoke<EngineCatalog>("list_engine_models", { engine, workspace: workspace ?? null }),
     ),
   // history
-  listSessions: () => invoke<SessionMeta[]>("list_sessions"),
-  listArchivedSessions: () => invoke<SessionMeta[]>("list_archived_sessions"),
+  listSessions: (scope?: "remote" | "all") => invoke<SessionMeta[]>("list_sessions", scope ? { scope } : undefined).then(sessionRows),
+  /** Turns still running on this desktop, so a reloaded page can paint them. */
+  listActiveRuns: () => invoke<ActiveRun[]>("list_active_runs").then(sessionRows),
+  runStatus: (runIds: string[]) => invoke<Array<{
+    runId: string; known: boolean;
+    state: "reserved" | "spawned" | "done" | "error" | "cancelled" | "spawn_failed" | null;
+    sessionId: string | null; startedAt: number | null; error: string | null; origin: "local" | "hub" | null;
+  }>>("run_status", { runIds }),
+  setSessionOrigin: (engine: string, sessionId: string, origin: "local" | "hub") =>
+    invoke<void>("set_session_origin", { engine, sessionId, origin }),
+  loadSessionEvents: (engine: string, sessionId: string, afterCursor: number, untilCursor?: number, historyEpoch?: number, historySource?: "hub" | "executor") =>
+    invoke<SessionEventPage>("load_session_events", { engine, sessionId, afterCursor, untilCursor,
+      ...(historyEpoch === undefined ? {} : { historyEpoch }), ...(historySource === undefined ? {} : { historySource }) }),
+  listArchivedSessions: (scope?: "remote" | "all") => invoke<SessionMeta[]>("list_archived_sessions", scope ? { scope } : undefined).then(sessionRows),
   archiveSession: (session: SessionMeta) =>
     invoke<void>("archive_session", { session }),
   restoreSession: (engine: string, sessionId: string) =>
@@ -1508,8 +1635,10 @@ export const ipc = {
     query: string,
     limit?: number,
     offset?: number,
+    scope?: "remote" | "all",
   ) =>
-    invoke<MessageSearchPage>("search_messages", { query, limit, offset }),
+    invoke<MessageSearchPage>("search_messages", { query, limit, offset, ...(scope ? { scope } : {}) })
+      .then((page) => ({ ...page, hits: sessionRows(page.hits) })),
   /** Remote (WSL distro) transcript: host fetches the jsonl over the ssh
    *  channel, caches it locally, and parses with the same engine reader. */
   loadRemoteSessionPage: (
@@ -1542,10 +1671,10 @@ export const ipc = {
     remotePath: string,
   ) =>
     invoke<void>("delete_remote_session", { workspacePath, engine, sessionId, remotePath }),
-  pinSession: (engine: string, sessionId: string, pinned: boolean) =>
-    invoke<void>("pin_session", { engine, sessionId, pinned }),
-  renameSession: (engine: string, sessionId: string, title: string) =>
-    invoke<void>("rename_session", { engine, sessionId, title }),
+  pinSession: (engine: string, sessionId: string, pinned: boolean, session?: SessionMeta) =>
+    invoke<void>("pin_session", { engine, sessionId, pinned, ...(isWeb && session ? { session } : {}) }),
+  renameSession: (engine: string, sessionId: string, title: string, session?: SessionMeta) =>
+    invoke<void>("rename_session", { engine, sessionId, title, ...(isWeb && session ? { session } : {}) }),
   /** Remember the model id this session ran ("provider/model", as the picker
    * spells it) — the engine's own transcript keeps only the bare name, so
    * this is what survives a restart or another client. */
@@ -1560,28 +1689,35 @@ export const ipc = {
   rememberSessionProvider: (engine: string, sessionId: string, providerId: string) =>
     invoke<void>("remember_session_provider", { engine, sessionId, providerId }),
   rescanSessions: () => invoke<void>("rescan_sessions"),
-  listWorkspaces: () => invoke<Workspace[]>("list_workspaces"),
+  listWorkspaces: () => invoke<Workspace[]>("list_workspaces").then((rows) => rows.map(workspaceRow)),
   addWorkspace: (path: string, meta?: Record<string, unknown>) =>
-    invoke<Workspace>("add_workspace", { path, meta: meta ?? null }),
+    registerWorkspace("add_workspace", { path, meta: meta ?? null }),
   /** Register a git worktree as a child workspace of `parentId`. The Rust
    *  side validates the parent row exists. */
-  addWorktreeWorkspace: (path: string, parentId: string, meta?: Record<string, unknown>) =>
-    invoke<Workspace>("add_workspace", {
-      path,
-      meta: meta ?? null,
-      kind: "worktree",
-      parentId,
-    }),
+  addWorktreeWorkspace: (path: string, parentId: string, meta?: Record<string, unknown>) => {
+    const target = workspaceTarget(parentId);
+    const args = { path, meta: meta ?? null, kind: "worktree", parentId: target.id };
+    return registerWorkspace("add_workspace", args, target.machine);
+  },
   /** Plugin-scoped workspace registration: the Rust side re-checks the
    *  plugin's manifest grants (host:workspace; meta.wsl additionally needs
    *  host:workspace:remote) — the server-side counterpart of the JS gate in
    *  plugins/runtime/context.ts. pluginId is injected by the host bridge. */
   pluginAddWorkspace: (pluginId: string, path: string, meta?: Record<string, unknown>) =>
-    invoke<Workspace>("plugin_add_workspace", { pluginId, path, meta: meta ?? null }),
-  reorderWorkspaces: (ids: string[]) => invoke<void>("reorder_workspaces", { ids }),
-  removeWorkspace: (id: string) => invoke<void>("remove_workspace", { id }),
+    registerWorkspace("plugin_add_workspace", { pluginId, path, meta: meta ?? null }),
+  reorderWorkspaces: async (ids: string[]) => {
+    const groups = new Map<string | undefined, string[]>();
+    for (const id of ids) {
+      const target = workspaceTarget(id);
+      groups.set(target.machine, [...groups.get(target.machine) ?? [], target.id]);
+    }
+    await Promise.all([...groups].map(([target, list]) => target
+      ? transportInvoke<void>("reorder_workspaces", { ids: list }, target)
+      : invoke<void>("reorder_workspaces", { ids: list })));
+  },
+  removeWorkspace: (id: string) => workspaceInvoke<void>("remove_workspace", id),
   setWorkspaceGroup: (id: string, groupId: string | null) =>
-    invoke<void>("set_workspace_group", { id, groupId }),
+    workspaceInvoke<void>("set_workspace_group", id, { groupId }),
   // terminal
   /** Idempotent: re-opening a live session id is a no-op on the backend. */
   terminalOpen: (args: { id: string; cwd: string; cols: number; rows: number }) =>
@@ -1766,8 +1902,11 @@ export const ipc = {
    *  "worktree://create-progress" events keyed by creationId. The invoke
    *  promise resolves when the pipeline settles (failure also arrives as a
    *  failed-stage event). */
-  gitWorktreeCreate: (creationId: string, args: WorktreeCreateArgs) =>
-    invoke<void>("git_worktree_create", { creationId, args }),
+  gitWorktreeCreate: (creationId: string, args: WorktreeCreateArgs) => {
+    const target = workspaceTarget(args.parentWorkspaceId);
+    const payload = { creationId, args: { ...args, parentWorkspaceId: target.id } };
+    return target.machine ? transportInvoke<void>("git_worktree_create", payload, target.machine) : invoke<void>("git_worktree_create", payload);
+  },
   gitWorktreeCreateCancel: (creationId: string) =>
     invoke<boolean>("git_worktree_create_cancel", { creationId }),
   gitWorktreeRemove: (
@@ -1948,3 +2087,15 @@ export const ipc = {
   cliUpdate: (engine: string, runId: string) =>
     invoke<{ ok: boolean; version: string | null }>("cli_update", { engine, runId }),
 };
+}
+
+export const ipc = createIpc();
+const machineClients = new Map<string, typeof ipc>();
+
+/** A client's target never changes while its asynchronous operation is running. */
+export function ipcForMachine(machine?: string): typeof ipc {
+  if (!machine) return ipc;
+  let client = machineClients.get(machine);
+  if (!client) { client = createIpc(machine); machineClients.set(machine, client); }
+  return client;
+}

@@ -37,7 +37,7 @@ export default defineConfig(() => ({
       allow: [".."],
     },
     watch: {
-      ignored: ["**/src-tauri/**"],
+      ignored: ["**/src-tauri/**", "**/target-install/**"],
     },
   },
 }));

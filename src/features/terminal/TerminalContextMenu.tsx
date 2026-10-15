@@ -6,7 +6,7 @@ import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { copyText } from "@/lib/clipboard";
 import { isPathUnder, pathExistsOnDisk } from "@/features/chat/file-link-resolution";
 import { resolveFilePath } from "@/lib/fileLinks";
-import { ipc } from "@/lib/ipc";
+import { ipc, ipcForMachine } from "@/lib/ipc";
 
 export interface TerminalMenuState {
   x: number;
@@ -30,10 +30,12 @@ export interface TerminalMenuState {
 export function TerminalContextMenu({
   menu,
   cwd,
+  machine,
   onClose,
 }: {
   menu: TerminalMenuState;
   cwd: string;
+  machine?: string;
   onClose: () => void;
 }) {
   const { t } = useTranslation();
@@ -60,7 +62,7 @@ export function TerminalContextMenu({
         // the explicit click is consent enough, so enable on the raw path.
         setExists(true);
       } else {
-        void pathExistsOnDisk(resolved)
+        void pathExistsOnDisk(resolved, machine)
           .then((ok) => {
             if (!cancelled) setExists(ok);
           })
@@ -72,7 +74,7 @@ export function TerminalContextMenu({
     return () => {
       cancelled = true;
     };
-  }, [resolved, cwd]);
+  }, [resolved, cwd, machine]);
 
   const entries: ContextMenuEntry[] = [
     {
@@ -93,7 +95,7 @@ export function TerminalContextMenu({
       // enable immediately (see the effect above).
       disabled: exists === null,
       onSelect: () => {
-        void ipc.revealInFileManager(resolved).catch(() => {});
+        void (machine ? ipcForMachine(machine) : ipc).revealInFileManager(resolved).catch(() => {});
       },
     });
   }

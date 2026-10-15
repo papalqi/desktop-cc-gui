@@ -49,9 +49,9 @@ function normalizeError(error: unknown): SkillsHubError {
 
 /** Query one mode of the hub; `params` stay loose because the backend is the
  *  source of truth for each mode's shape. */
-async function query<T>(mode: string, params: Record<string, unknown> = {}): Promise<T> {
+async function query<T>(mode: string, params: Record<string, unknown> = {}, machine?: string): Promise<T> {
   try {
-    return await invoke<T>("skills_hub_query", { mode, params });
+    return await (machine ? invoke<T>("skills_hub_query", { mode, params }, machine) : invoke<T>("skills_hub_query", { mode, params }));
   } catch (error) {
     throw normalizeError(error);
   }
@@ -92,25 +92,23 @@ function forceParam(force?: boolean): Record<string, unknown> {
  * Only the first call's promise is shared (a failure clears it, so the next
  * call retries); `invalidateInstalledSkillsCache` runs after any mutation.
  */
-let installedCache: Promise<SkillsInstalledResult> | null = null;
+const installedCache = new Map<string, { promise: Promise<SkillsInstalledResult>; at: number }>();
 const INSTALLED_TTL_MS = 30_000;
-let installedAt = 0;
 
 export function invalidateInstalledSkillsCache(): void {
-  installedCache = null;
-  installedAt = 0;
+  installedCache.clear();
 }
 
-export function cachedInstalledSkills(): Promise<SkillsInstalledResult> {
-  const fresh = installedCache && Date.now() - installedAt < INSTALLED_TTL_MS;
-  if (fresh && installedCache) return installedCache;
-  const promise = skillsHubApi.installed().catch((error: unknown) => {
+export function cachedInstalledSkills(machine?: string): Promise<SkillsInstalledResult> {
+  const key = machine ?? "";
+  const cached = installedCache.get(key);
+  if (cached && Date.now() - cached.at < INSTALLED_TTL_MS) return cached.promise;
+  const promise = (machine ? query<SkillsInstalledResult>("installed", {}, machine) : skillsHubApi.installed()).catch((error: unknown) => {
     // A failed scan must not be cached: the next send retries.
-    if (installedCache === promise) invalidateInstalledSkillsCache();
+    if (installedCache.get(key)?.promise === promise) installedCache.delete(key);
     throw error;
   });
-  installedCache = promise;
-  installedAt = Date.now();
+  installedCache.set(key, { promise,at:Date.now() });
   return promise;
 }
 

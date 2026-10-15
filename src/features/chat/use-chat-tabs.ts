@@ -57,10 +57,11 @@ export function useChatTabs({
     })),
   );
   // Open file tabs render alongside the session tabs in the center area.
-  const { openFiles, activeFilePath, dirtyPaths, activateFile, clearActiveFile, closeFile, moveOpenFile } =
+  const { openFiles, fileStates, activeFilePath, dirtyPaths, activateFile, clearActiveFile, closeFile, moveOpenFile } =
     useFilesStore(
       useShallow((s) => ({
         openFiles: s.openFiles,
+        fileStates: s.fileStates,
         activeFilePath: s.activeFilePath,
         dirtyPaths: s.dirtyPaths,
         activateFile: s.activateFile,
@@ -127,7 +128,7 @@ export function useChatTabs({
   const tabStreaming = useMemo(
     () =>
       openTabs.map(
-        (tab) => streamingByKey[sessionKey(tab.engine, tab.sessionId, tab.workspacePath)] === true,
+        (tab) => streamingByKey[sessionKey(tab.engine, tab.sessionId, tab.workspacePath, tab.machine)] === true,
       ),
     [openTabs, streamingByKey],
   );
@@ -136,7 +137,7 @@ export function useChatTabs({
   const tabRetrying = useMemo(
     () =>
       openTabs.map(
-        (tab) => retryingByKey[sessionKey(tab.engine, tab.sessionId, tab.workspacePath)] === true,
+        (tab) => retryingByKey[sessionKey(tab.engine, tab.sessionId, tab.workspacePath, tab.machine)] === true,
       ),
     [openTabs, retryingByKey],
   );
@@ -145,7 +146,7 @@ export function useChatTabs({
     () =>
       sessions.map(
         (sess) =>
-          streamingByKey[sessionKey(sess.engine, sess.sessionId, sess.workspacePath)] === true,
+          streamingByKey[sessionKey(sess.engine, sess.sessionId, sess.workspacePath, sess.machine)] === true,
       ),
     [sessions, streamingByKey],
   );
@@ -153,31 +154,31 @@ export function useChatTabs({
     () =>
       sessions.map(
         (sess) =>
-          retryingByKey[sessionKey(sess.engine, sess.sessionId, sess.workspacePath)] === true,
+          retryingByKey[sessionKey(sess.engine, sess.sessionId, sess.workspacePath, sess.machine)] === true,
       ),
     [sessions, retryingByKey],
   );
 
   const sessionById = useMemo(() => {
     const map = new Map<string, SessionMeta>();
-    for (const s of sessions) map.set(`${s.engine}/${s.sessionId}`, s);
+    for (const s of sessions) map.set(sessionKey(s.engine, s.sessionId, s.workspacePath, s.machine), s);
     return map;
   }, [sessions]);
   const sessionTabItems = useMemo(
     () =>
       openTabs.map((tab, index) => {
         const meta = tab.sessionId
-          ? sessionById.get(`${tab.engine}/${tab.sessionId}`)
+          ? sessionById.get(sessionKey(tab.engine, tab.sessionId, tab.workspacePath, tab.machine))
           : undefined;
         return {
-          key: sessionKey(tab.engine, tab.sessionId, tab.workspacePath),
+          key: sessionKey(tab.engine, tab.sessionId, tab.workspacePath, tab.machine),
           // 会话身份随页签带下去：向下拖出页签条即分屏（split/drag.tsx）。
           session: tab,
           engine: tab.engine,
-          label: meta?.customTitle || meta?.title || t("chat.newChat"),
+          label: `${tab.machine ? tab.machine + " · " : ""}${meta?.customTitle || meta?.title || t("chat.newChat")}`,
           streaming: tabStreaming[index] ?? false,
           retrying: tabRetrying[index] ?? false,
-          unseen: unseen[`${tab.engine}/${tab.sessionId}`] ?? false,
+          unseen: unseen[sessionKey(tab.engine, tab.sessionId, tab.workspacePath, tab.machine)] ?? false,
           tab,
         };
       }),
@@ -188,13 +189,13 @@ export function useChatTabs({
     () =>
       openFiles.map((path) => ({
         key: FILE_TAB_PREFIX + path,
-        label: fileName(path),
-        title: path,
+        label: `${fileStates[path]?.machine ? fileStates[path].machine + " · " : ""}${fileName(fileStates[path]?.path ?? path)}`,
+        title: fileStates[path]?.path ?? path,
         icon: FileText,
         streaming: false,
         dirty: !!dirtyPaths[path],
       })),
-    [openFiles, dirtyPaths],
+    [openFiles, fileStates, dirtyPaths],
   );
   // Plugin tabs trail the browser tabs in the same strip.
   const pluginTabItems = useMemo(
@@ -435,7 +436,7 @@ function activeCenterTabKey({
   if (missionActive) return MISSION_WORKBENCH_TAB_KEY;
   if (notesActive) return RELEASE_NOTES_TAB_KEY;
   if (activeFilePath) return FILE_TAB_PREFIX + activeFilePath;
-  return active ? sessionKey(active.engine, active.sessionId, active.workspacePath) : null;
+  return active ? sessionKey(active.engine, active.sessionId, active.workspacePath, active.machine) : null;
 }
 
 /** Index a dragged tab lands at: after-target drops shift one past the
@@ -450,9 +451,9 @@ interface ChatTabHandlerDeps {
   sessionTabItems: SessionTabItem[];
   activeTabKey: string | null;
   // Session tabs (chat store).
-  focusTab: (engine: string, sessionId: string | null, workspacePath: string) => void;
-  closeTab: (engine: string, sessionId: string | null, workspacePath: string) => void;
-  moveTab: (engine: string, sessionId: string | null, workspacePath: string, toIndex: number) => void;
+  focusTab: (engine: string, sessionId: string | null, workspacePath: string, machine?: string) => void;
+  closeTab: (engine: string, sessionId: string | null, workspacePath: string, machine?: string) => void;
+  moveTab: (engine: string, sessionId: string | null, workspacePath: string, toIndex: number, machine?: string) => void;
   // File tabs (files store).
   openFiles: string[];
   dirtyPaths: Record<string, true>;
@@ -565,7 +566,7 @@ function useChatTabHandlers({
       }
       clearActiveFile();
       const item = sessionTabItems.find((i) => i.key === tabKey);
-      if (item) focusTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath);
+      if (item) focusTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath, item.tab.machine);
     },
     [sessionTabItems, focusTab, activateFile, clearActiveFile, closeDiff, activateBrowserTab, deactivateBrowserTab, activatePluginTab, deactivatePluginTab],
   );
@@ -603,7 +604,7 @@ function useChatTabHandlers({
         return;
       }
       const item = sessionTabItems.find((i) => i.key === tabKey);
-      if (item) closeTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath);
+      if (item) closeTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath, item.tab.machine);
     },
     [sessionTabItems, closeTab, closeFile, dirtyPaths, closeDiff, setDialog, closeBrowserTab, closePluginTab],
   );
@@ -645,7 +646,7 @@ function useChatTabHandlers({
       const target = sessionTabItems.findIndex((i) => i.key === targetKey);
       const dragged = sessionTabItems[from]?.tab;
       if (!dragged || target < 0) return;
-      moveTab(dragged.engine, dragged.sessionId, dragged.workspacePath, dropTargetIndex(from, target, before));
+      moveTab(dragged.engine, dragged.sessionId, dragged.workspacePath, dropTargetIndex(from, target, before), dragged.machine);
     },
     [openFiles, moveOpenFile, sessionTabItems, moveTab, browserTabs, moveBrowserTab, pluginTabs, movePluginTab],
   );
@@ -660,7 +661,7 @@ function useChatTabHandlers({
     usePluginHubStore.getState().close();
     useReleaseNotesTabStore.getState().close();
     for (const item of sessionTabItems) {
-      closeTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath);
+      closeTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath, item.tab.machine);
     }
     for (const tab of browserTabs) closeBrowserTab(tab.id);
     for (const id of pluginTabs) closePluginTab(id);
@@ -684,7 +685,7 @@ function useChatTabHandlers({
     if (activeTabKey !== RELEASE_NOTES_TAB_KEY) useReleaseNotesTabStore.getState().close();
     for (const item of sessionTabItems) {
       if (item.key === activeTabKey || item.streaming) continue;
-      closeTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath);
+      closeTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath, item.tab.machine);
     }
     for (const tab of browserTabs) {
       if (tab.id === activeBrowserId) continue;

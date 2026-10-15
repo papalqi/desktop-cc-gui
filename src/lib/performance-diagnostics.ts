@@ -1,9 +1,14 @@
 const COUNTERS = ["engineEvents", "toolEvents", "textEvents"] as const;
-const DURATIONS = ["engineBatch", "liveRenderCommit", "eventLoopLag", "longTask"] as const;
+const DURATIONS = ["engineBatch", "liveRenderCommit", "eventLoopLag", "longTask", "sessionHistory", "sessionCatalog", "historyRoundTrip", "historyParse"] as const;
+const TRANSITIONS = ["session-select", "active-change", "refresh-start", "refresh-applied", "catalog-start", "catalog-applied", "history-start", "history-applied", "history-failed", "history-discarded", "history-response", "timeline-commit", "timeline-paint"] as const;
+const TRANSITION_FIELDS = ["session", "previous", "request", "elapsedMs", "parseMs", "messages", "rows", "bytes", "textUnits", "active", "hidden"] as const;
+const TRANSITION_CAPACITY = 200;
 const RETENTION_MS = 300_000;
 
 type Counter = typeof COUNTERS[number];
 type Duration = typeof DURATIONS[number];
+type Transition = typeof TRANSITIONS[number];
+type TransitionFields = Partial<Record<typeof TRANSITION_FIELDS[number], number>>;
 type DurationSummary = { count: number; totalMs: number; maxMs: number };
 type Totals = {
   counters: Partial<Record<Counter, number>>;
@@ -37,6 +42,9 @@ export class PerformanceRecorder {
   private samples: RendererSample[] = [];
   private totals: Totals = { counters: {}, durations: {} };
   private previousBeat: { at: number; hidden: boolean } | null = null;
+  private transitions: Array<TransitionFields & { at: number; phase: Transition }> = [];
+  private sessionTokens = new Map<string, number>();
+  private nextSessionToken = 1;
   readonly startedAt = Date.now();
 
   constructor(private capacity = 60, private heartbeatMs = 1000) {}
@@ -49,6 +57,8 @@ export class PerformanceRecorder {
     if (!enabled) {
       this.samples = [];
       this.totals = { counters: {}, durations: {} };
+      this.transitions = [];
+      this.sessionTokens.clear();
     }
   }
 
@@ -64,6 +74,30 @@ export class PerformanceRecorder {
     summary.totalMs += milliseconds;
     summary.maxMs = Math.max(summary.maxMs, milliseconds);
     this.totals.durations[key] = summary;
+  }
+
+  /** Window-local numeric identities keep session ids and draft paths out of exports. */
+  sessionToken(key: string | null | undefined): number {
+    if (!this.enabled || !key) return 0;
+    const existing = this.sessionTokens.get(key);
+    if (existing !== undefined) return existing;
+    const token = this.nextSessionToken++;
+    if (this.sessionTokens.size >= TRANSITION_CAPACITY) this.sessionTokens.delete(this.sessionTokens.keys().next().value!);
+    this.sessionTokens.set(key, token);
+    return token;
+  }
+
+  transition(phase: Transition, fields: TransitionFields = {}) {
+    if (!this.enabled || !TRANSITIONS.includes(phase)) return;
+    const at = Date.now();
+    const entry: TransitionFields & { at: number; phase: Transition } = { at, phase, hidden: Number(typeof document !== "undefined" && document.hidden) };
+    for (const key of TRANSITION_FIELDS) {
+      const value = fields[key];
+      if (value !== undefined && finite(value)) entry[key] = value;
+    }
+    this.transitions = this.transitions.filter((item) => at - item.at < RETENTION_MS);
+    this.transitions.push(entry);
+    if (this.transitions.length > TRANSITION_CAPACITY) this.transitions.shift();
   }
 
   heartbeat(at: number, hidden: boolean) {
@@ -102,6 +136,8 @@ export class PerformanceRecorder {
       sampleIntervalMs: 5000,
       capacity: this.capacity,
       retentionMs: RETENTION_MS,
+      transitionCapacity: TRANSITION_CAPACITY,
+      transitions: this.transitions.filter((entry) => Date.now() - entry.at < RETENTION_MS).map((entry) => ({ ...entry })),
       samples: this.samples.filter((sample) => Date.now() - sample.at < RETENTION_MS)
         .map((sample) => ({ ...sample, context: { ...sample.context }, ...copyTotals(sample) })),
       pending: copyTotals(this.totals),
@@ -110,3 +146,10 @@ export class PerformanceRecorder {
 }
 
 export const performanceRecorder = new PerformanceRecorder();
+
+declare global {
+  interface Window { __ccguiPerformanceSnapshot?: () => ReturnType<PerformanceRecorder["snapshot"]>; }
+}
+if (typeof window !== "undefined" && !("__TAURI_INTERNALS__" in window)) {
+  window.__ccguiPerformanceSnapshot = () => performanceRecorder.snapshot();
+}

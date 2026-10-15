@@ -10,8 +10,9 @@ import { useChatStore } from "./store";
  * tracking the active workspace. */
 export function useChatPageLifecycle(
   init: () => Promise<void>,
-  gitRefresh: (workspacePath: string) => Promise<void>,
+  gitRefresh: (workspacePath: string, force?: boolean, machine?: string) => Promise<void>,
   activeWorkspacePath: string | undefined,
+  machine?: string,
 ) {
   useEffect(() => {
     void init();
@@ -32,8 +33,8 @@ export function useChatPageLifecycle(
 
   // Git status follows the active workspace (30s TTL inside the store).
   useEffect(() => {
-    if (activeWorkspacePath) void gitRefresh(activeWorkspacePath);
-  }, [activeWorkspacePath, gitRefresh]);
+    if (activeWorkspacePath) void gitRefresh(activeWorkspacePath, false, machine);
+  }, [activeWorkspacePath, machine, gitRefresh]);
 }
 
 /** Terminal toggle + new-session + interrupt + close-tab keys live in the
@@ -41,16 +42,17 @@ export function useChatPageLifecycle(
  * Settings → Shortcuts). */
 export function useChatShortcutHandlers(
   activeWorkspacePath: string | undefined,
-  toggleTerminal: (workspacePath: string) => void,
+  toggleTerminal: (workspacePath: string, machine?: string) => void,
   handleNewSession: () => void,
   closeActiveTab: () => void,
+  machine?: string,
 ) {
   useEffect(
     () =>
       registerShortcutHandler("toggleTerminal", () => {
-        if (activeWorkspacePath) toggleTerminal(activeWorkspacePath);
+        if (activeWorkspacePath) toggleTerminal(activeWorkspacePath, machine);
       }),
-    [activeWorkspacePath, toggleTerminal],
+    [activeWorkspacePath, machine, toggleTerminal],
   );
   useEffect(
     () => registerShortcutHandler("newSession", handleNewSession),

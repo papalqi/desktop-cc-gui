@@ -124,7 +124,7 @@ describe("ChangesPanelHeader refresh feedback", () => {
     )!;
     await act(async () => trigger.click());
     // The cached list is reloaded on every open (external checkouts).
-    expect(mocks.loadBranches).toHaveBeenCalledWith(WS);
+    expect(mocks.loadBranches).toHaveBeenCalledWith(WS, undefined);
 
     // The popover portals to <body>, not the component container.
     const row = [...document.body.querySelectorAll("button")].find((b) =>
@@ -136,7 +136,7 @@ describe("ChangesPanelHeader refresh feedback", () => {
     expect(row.textContent).toContain("远程分支");
 
     await act(async () => row.click());
-    expect(mocks.checkout).toHaveBeenCalledWith(WS, "origin/v1.0.9");
+    expect(mocks.checkout).toHaveBeenCalledWith(WS, "origin/v1.0.9", undefined);
   });
 
   it("spins, flashes a check on success, then returns to the arrow", async () => {

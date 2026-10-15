@@ -7,6 +7,7 @@ import { usePluginTabsStore } from "@/features/plugins/runtime/center-tabs";
 import { useReleaseNotesTabStore } from "@/features/update/notes-tab";
 import {
   ipc,
+  ipcForMachine,
   type DirEntry,
   type FileContent,
   type FileTreeColor,
@@ -15,9 +16,12 @@ import {
 import { errorText } from "@/lib/errors";
 import { writeStored } from "@/lib/storage";
 import { installFilesBridge, readRemoteAware } from "./remote-files";
+import { machineResourceKey } from "@/lib/web-machine";
 
 export const FILES_ROOT_KEY = "ccgui-next.filesRoot";
 let treeGeneration = 0;
+let nextFileRead = 0;
+const fileReads = new Map<string, number>();
 
 /** Join a directory path and a child name. Backend paths are POSIX-style on
  * macOS/Linux; Rust's fs APIs also accept "/" separators on Windows. */
@@ -43,6 +47,7 @@ export interface TreeClipboard {
 
 export interface OpenFileState {
   path: string;
+  machine?: string;
   /** null while the first read is in flight. */
   content: FileContent | null;
   loading: boolean;
@@ -54,6 +59,7 @@ export interface OpenFileState {
 interface FilesStore {
   /** Folder the tree is rooted at; "" = unset. Persisted to localStorage. */
   root: string;
+  machine?: string;
   /** dirPath -> loaded children (dirs first; backend sorts). Missing = not fetched. */
   children: Record<string, DirEntry[]>;
   loadingDirs: Record<string, true>;
@@ -69,7 +75,7 @@ interface FilesStore {
   selectedIsDir: boolean;
   /** Open file tabs, in tab order. */
   openFiles: string[];
-  /** Per-tab load state keyed by absolute path. */
+  /** Per-tab load state keyed by machine and absolute path. */
   fileStates: Record<string, OpenFileState>;
   /** File tab shown in the center area; null = a chat tab is active. */
   activeFilePath: string | null;
@@ -80,7 +86,7 @@ interface FilesStore {
   /** Folder the workspace file search is scoped to (absolute); null = closed. */
   searchRoot: string | null;
 
-  setRoot: (path: string) => void;
+  setRoot: (path: string, machine?: string) => void;
   ensureDir: (path: string) => Promise<void>;
   toggleDir: (path: string) => Promise<void>;
   /** Re-fetch a directory only if it has been loaded before. */
@@ -92,7 +98,7 @@ interface FilesStore {
   loadGitStatus: (levels: Record<string, DirEntry[]>) => Promise<void>;
   selectPath: (path: string | null, isDir?: boolean) => void;
   /** Open a file as a center tab (or focus its existing tab). */
-  openFile: (path: string) => Promise<void>;
+  openFile: (path: string, machine?: string) => Promise<void>;
   /** Switch the center area to an already-open file tab. */
   activateFile: (path: string) => void;
   /** Return the center area to the chat (a chat tab was selected). */
@@ -150,9 +156,9 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
   clipboard: null,
   searchRoot: null,
 
-  setRoot: (path) => {
+  setRoot: (path, machine) => {
     const root = path.trim();
-    if (root === get().root) return;
+    if (root === get().root && machine === get().machine) return;
     treeGeneration += 1;
     if (root) {
       writeStored(FILES_ROOT_KEY, root);
@@ -163,6 +169,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     // paths and stay editable regardless of which tree is shown.
     set({
       root,
+      machine,
       refreshing: false,
       children: {},
       loadingDirs: {},
@@ -172,6 +179,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       fileColors: {},
       selectedPath: null,
       selectedIsDir: false,
+      clipboard: null,
       // A workspace switch invalidates the search scope (it belonged to the
       // previous tree).
       searchRoot: null,
@@ -185,7 +193,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     const generation = treeGeneration;
     set((s) => ({ loadingDirs: { ...s.loadingDirs, [path]: true } }));
     try {
-      const entries = await ipc.listDir(path);
+      const entries = await (s.machine ? ipcForMachine(s.machine) : ipc).listDir(path);
       if (generation !== treeGeneration) return;
       set((s) => {
         const loadingDirs = { ...s.loadingDirs };
@@ -221,7 +229,8 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     }));
     if (requests.length === 0) return;
     try {
-      const result = await ipc.gitTreeStatus(requests);
+      const machine = get().machine;
+      const result = await (machine ? ipcForMachine(machine) : ipc).gitTreeStatus(requests);
       if (generation !== treeGeneration) return;
       set((state) => {
         const repositories = { ...state.repositories };
@@ -255,7 +264,8 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     if (!get().children[path]) return;
     const generation = treeGeneration;
     try {
-      const entries = await ipc.listDir(path);
+      const machine = get().machine;
+      const entries = await (machine ? ipcForMachine(machine) : ipc).listDir(path);
       if (generation !== treeGeneration) return;
       set((s) => ({ children: { ...s.children, [path]: entries } }));
       await get().loadGitStatus({ [path]: entries });
@@ -267,6 +277,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     const s = get();
     if (!s.root || s.refreshing) return;
     const generation = treeGeneration;
+    const client = s.machine ? ipcForMachine(s.machine) : ipc;
     set({ refreshing: true });
     try {
       const dirs = new Set([s.root, ...Object.keys(s.children), ...Object.keys(s.expanded)]);
@@ -274,7 +285,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       await Promise.all(
         [...dirs].map(async (dir) => {
           try {
-            const entries = await ipc.listDir(dir);
+            const entries = await client.listDir(dir);
             if (generation !== treeGeneration) return;
             levels[dir] = entries;
             set((state) => {
@@ -296,23 +307,24 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
 
   selectPath: (path, isDir = false) => set({ selectedPath: path, selectedIsDir: isDir }),
 
-  openFile: async (path) => {
+  openFile: async (path, machine = get().machine) => {
     dismissNonFileSurfaces();
-    if (get().fileStates[path]) {
-      set({ activeFilePath: path, selectedPath: path, selectedIsDir: false });
+    const key = machineResourceKey(path, machine);
+    if (get().fileStates[key]) {
+      set({ activeFilePath: key, selectedPath: path, selectedIsDir: false });
       return;
     }
     set((s) => ({
-      openFiles: [...s.openFiles, path],
+      openFiles: [...s.openFiles, key],
       fileStates: {
         ...s.fileStates,
-        [path]: { path, content: null, loading: true, error: null, loadNonce: 0 },
+        [key]: { path, ...(machine ? { machine } : {}), content: null, loading: true, error: null, loadNonce: 0 },
       },
-      activeFilePath: path,
+      activeFilePath: key,
       selectedPath: path,
       selectedIsDir: false,
     }));
-    await get().reloadFile(path);
+    await get().reloadFile(key);
   },
 
   activateFile: (path) => {
@@ -325,6 +337,11 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
   clearActiveFile: () => set({ activeFilePath: null }),
 
   reloadFile: async (path) => {
+    const entry = get().fileStates[path];
+    if (!entry) return;
+    const client = entry.machine ? ipcForMachine(entry.machine) : ipc;
+    const readId = ++nextFileRead;
+    fileReads.set(path, readId);
     set((s) => {
       const st = s.fileStates[path];
       if (!st) return s;
@@ -333,7 +350,8 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       };
     });
     try {
-      const content = await readRemoteAware(path, (p) => ipc.readFile(p));
+      const content = await readRemoteAware(entry.path, (p) => client.readFile(p));
+      if (fileReads.get(path) !== readId) return;
       set((s) => {
         const st = s.fileStates[path];
         if (!st) return s; // tab closed mid-load
@@ -345,6 +363,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
         };
       });
     } catch (e) {
+      if (fileReads.get(path) !== readId) return;
       const message = errorText(e);
       set((s) => {
         const st = s.fileStates[path];
@@ -356,7 +375,8 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     }
   },
 
-  closeFile: (path) =>
+  closeFile: (path) => {
+    fileReads.delete(path);
     set((s) => {
       if (!s.fileStates[path]) return s;
       const openFiles = s.openFiles.filter((p) => p !== path);
@@ -371,7 +391,8 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
         activeFilePath = openFiles[Math.min(idx, openFiles.length - 1)] ?? null;
       }
       return { openFiles, fileStates, dirtyPaths, activeFilePath };
-    }),
+    });
+  },
   moveOpenFile: (path, toIndex) =>
     set((s) => {
       const from = s.openFiles.indexOf(path);
@@ -382,15 +403,25 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       return { openFiles };
     }),
 
-  remapOpenFiles: (from, to) =>
+  remapOpenFiles: (from, to) => {
+    const reloads: string[] = [];
     set((s) => {
-      const mapPath = (p: string) =>
-        p === from ? to : p.startsWith(from + "/") ? to + p.slice(from.length) : p;
+      const mapPath = (key: string) => {
+        const entry = s.fileStates[key];
+        if (!entry || entry.machine !== s.machine) return key;
+        const path = entry.path;
+        const next = path === from ? to : path.startsWith(from + "/") ? to + path.slice(from.length) : path;
+        return machineResourceKey(next, entry.machine);
+      };
       if (!s.openFiles.some((p) => mapPath(p) !== p)) return s;
       const fileStates: Record<string, OpenFileState> = {};
       for (const [p, st] of Object.entries(s.fileStates)) {
         const np = mapPath(p);
-        fileStates[np] = np === p ? st : { ...st, path: np };
+        fileStates[np] = np === p ? st : { ...st, path: st.path === from ? to : to + st.path.slice(from.length) };
+        if (np !== p) {
+          fileReads.delete(p);
+          if (st.loading) reloads.push(np);
+        }
       }
       const dirtyPaths: Record<string, true> = {};
       for (const p of Object.keys(s.dirtyPaths)) dirtyPaths[mapPath(p)] = true;
@@ -400,11 +431,14 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
         dirtyPaths,
         activeFilePath: s.activeFilePath ? mapPath(s.activeFilePath) : null,
       };
-    }),
+    });
+    for (const key of reloads) void get().reloadFile(key);
+  },
 
   closeFilesUnder: (path) => {
     for (const p of [...get().openFiles]) {
-      if (p === path || p.startsWith(path + "/")) get().closeFile(p);
+      const entry = get().fileStates[p];
+      if (entry?.machine === get().machine && (entry.path === path || entry.path.startsWith(path + "/"))) get().closeFile(p);
     }
   },
   setClipboard: (item) => set({ clipboard: item }),

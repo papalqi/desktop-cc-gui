@@ -1,9 +1,12 @@
 import { IS_WINDOWS } from "@/lib/platform";
 import { isWeb, webToken } from "@/lib/transport";
+import { webMachine } from "@/lib/web-machine";
+import { webPublicPrefix } from "@/lib/web-public-prefix";
 
 function prefix(pluginId: string): string {
+  const machine = isWeb ? webMachine() : null;
   const origin = isWeb
-    ? `${window.location.origin}/plugin-asset/${encodeURIComponent(webToken ?? "-")}`
+    ? `${window.location.origin}${webPublicPrefix(window.location.pathname)}${machine ? `/m/${encodeURIComponent(machine)}` : ""}/plugin-asset/${encodeURIComponent(webToken ?? "-")}`
     : IS_WINDOWS
       ? "http://pluginasset.localhost"
       : "pluginasset://localhost";

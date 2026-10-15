@@ -10,11 +10,13 @@ vi.mock("@/lib/platform", () => ({
 }));
 
 import { directoryAssetUrl, fileAssetUrl, remoteAssetUrl } from "./asset-url";
+import { setWebMachine } from "@/lib/web-machine";
 
 beforeEach(() => {
   environment.web = true;
   environment.windows = false;
   environment.token = "lan-token";
+  setWebMachine(null);
 });
 
 describe("plugin resource URL resolution", () => {

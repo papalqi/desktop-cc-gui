@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { readStoredJson, writeStored } from "@/lib/storage";
 import { useChatStore } from "../store";
-import { sameTab, parseDraftSessionKey, sessionKey, type ActiveSession } from "../store/persistence";
+import { sameTab, parseDraftSessionKey, parseSessionKey, sessionKey, type ActiveSession } from "../store/persistence";
 import {
   findPane,
   listPanes,
@@ -58,7 +58,7 @@ interface SplitActions {
 export type SplitStore = SplitState & SplitActions;
 
 function keyOf(session: ActiveSession | null | undefined): string | null {
-  return session ? sessionKey(session.engine, session.sessionId, session.workspacePath) : null;
+  return session ? sessionKey(session.engine, session.sessionId, session.workspacePath, session.machine) : null;
 }
 
 function paneHolding(root: LayoutNode | null, session: ActiveSession | null): string | null {
@@ -72,7 +72,8 @@ function activateSession(session: ActiveSession | null | undefined): void {
   if (!session) return;
   const chat = useChatStore.getState();
   if (chat.active && keyOf(chat.active) === keyOf(session)) return;
-  chat.focusTab(session.engine, session.sessionId, session.workspacePath);
+  if (session.machine) chat.focusTab(session.engine, session.sessionId, session.workspacePath, session.machine);
+  else chat.focusTab(session.engine, session.sessionId, session.workspacePath);
 }
 
 function readPersisted(): SplitState {
@@ -283,7 +284,7 @@ export function reconcileLayout(
     // draft 转正：格子里的旧 key 就是这轮对话在激活前的 key，先不当作closed。
     if (paneKey === input.lastActiveKey) continue;
     const stillOpen = chat.openTabs.some((tab) =>
-      sameTab(tab, session.engine, session.sessionId, session.workspacePath),
+      sameTab(tab, session.engine, session.sessionId, session.workspacePath, session.machine),
     );
     if (stillOpen) continue;
     root = removePane(root, pane.id);
@@ -341,21 +342,16 @@ export function paneIdForSession(session: ActiveSession | null): string | null {
  *  → 可拖拽/可落位的会话；查不到时返回 null（不提供拖拽入口）。 */
 export function sessionFromThreadId(threadId: string | undefined): ActiveSession | null {
   if (!threadId) return null;
-  if (threadId.startsWith("new:")) {
-    const draft = parseDraftSessionKey(threadId);
-    return draft
-      ? { engine: draft.engine, sessionId: null, workspacePath: draft.workspacePath }
-      : null;
-  }
-  const slash = threadId.indexOf("/");
-  if (slash <= 0) return null;
-  const engine = threadId.slice(0, slash);
-  const sessionId = threadId.slice(slash + 1);
+  const draft = parseDraftSessionKey(threadId);
+  if (draft) return { ...draft, sessionId: null };
+  const identity = parseSessionKey(threadId);
+  if (!identity) return null;
+  const { engine, sessionId, machine } = identity;
   const chat = useChatStore.getState();
-  const tab = chat.openTabs.find((t) => t.engine === engine && t.sessionId === sessionId);
+  const tab = chat.openTabs.find((t) => t.engine === engine && t.sessionId === sessionId && t.machine === machine);
   if (tab) return tab;
-  const meta = chat.sessions.find((s) => s.engine === engine && s.sessionId === sessionId);
-  return meta ? { engine, sessionId, workspacePath: meta.workspacePath } : null;
+  const meta = chat.sessions.find((s) => s.engine === engine && s.sessionId === sessionId && s.machine === machine);
+  return meta ? { engine, sessionId, workspacePath: meta.workspacePath, ...(machine ? { machine } : {}) } : null;
 }
 
 /** 「在右侧/下方分屏打开」类入口：等价于把会话拖到聚焦格的对应边上。 */

@@ -1,4 +1,6 @@
 "use client";
+import { machineResourceKey } from "@/lib/web-machine";
+import { useScopedSession } from "@/features/chat/split/session-scope";
 
 import {
   memo,
@@ -88,10 +90,11 @@ export function FileMentionMenu({
   menuRef?: MutableRefObject<FileMentionMenuHandle | null>;
 }) {
   const { t } = useTranslation();
-  const index = useMentionIndexStore((s) => (root ? s.byRoot[root] : undefined));
+  const cacheRoot = machineResourceKey(root, useScopedSession()?.machine);
+  const index = useMentionIndexStore((s) => (root ? s.byRoot[cacheRoot] : undefined));
   useEffect(() => {
-    if (root) useMentionIndexStore.getState().ensure(root);
-  }, [root]);
+    if (root) useMentionIndexStore.getState().ensure(cacheRoot);
+  }, [root, cacheRoot]);
 
   const entries = index?.entries;
   const items = useMemo(

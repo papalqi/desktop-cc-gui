@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ModelOption } from "@/components/application/ai-chat/cli-menu";
 import type { ChannelOption } from "@/components/application/ai-chat/engine-model-panel";
-import { ipc, type CliConfig, type EngineCatalog, type EngineInfo } from "@/lib/ipc";
+import { ipc as defaultIpc, ipcForMachine, type CliConfig, type EngineCatalog, type EngineInfo } from "@/lib/ipc";
 import {
   CLI_CONFIG_CHANGED_EVENT,
   isPseudoProvider,
@@ -63,7 +63,9 @@ export function useEngineModels(
   /** Session-resolved channel per engine; falls back to `section.current`. */
   providers: Record<string, string> = {},
   workspacePath?: string,
+  machine?: string,
 ): EngineModelsState {
+  const ipc = machine ? ipcForMachine(machine) : defaultIpc;
   const { t } = useTranslation();
   const [cliConfig, setCliConfig] = useState<CliConfig | null>(null);
   // A catalog is a property of the *context*, not of every workspace: the
@@ -99,7 +101,7 @@ export function useEngineModels(
   // Provider configs feed the model picker's per-engine model lists.
   useEffect(() => {
     ipc.getCliConfig().then(setCliConfig).catch(() => {});
-  }, []);
+  }, [ipc]);
   // The settings CLI page mutates provider config and custom models outside
   // this tree; refetch so the picker tracks both immediately.
   useEffect(() => {
@@ -113,7 +115,7 @@ export function useEngineModels(
     reload();
     window.addEventListener(CLI_CONFIG_CHANGED_EVENT, reload);
     return () => window.removeEventListener(CLI_CONFIG_CHANGED_EVENT, reload);
-  }, []);
+  }, [ipc]);
   // Catalog for the active workspace. Until the workspace's context is known
   // the shared local catalog proves nothing about it (it may be a remote one),
   // so the picker starts empty there and fills as the workspace's probes land.
@@ -180,7 +182,7 @@ export function useEngineModels(
         .catch(() => {})
         .finally(() => markPending(wsKey, engineId, false));
     },
-    [wsKey, workspacePath, applyCatalog, markPending],
+    [wsKey, workspacePath, applyCatalog, markPending, ipc],
   );
   useEffect(() => {
     // One probe per engine (per workspace, per availability state). A probe
@@ -305,6 +307,7 @@ export function useEngineModels(
   // All engines' pins are computed first and written in ONE store action:
   useEffect(() => {
     const updates: Record<string, string> = {};
+    if (machine) return;
     for (const engine of engines) {
       // Remote catalogs (WSL 发行版) are display-only: `models` is a single
       // global record, so a pin from a distro catalog would (a) put a
@@ -333,7 +336,7 @@ export function useEngineModels(
       }
     }
     if (Object.keys(updates).length > 0) void pinModels(updates);
-  }, [engines, models, cliConfig, catalogs, wsKey, customModels, knownIdsByEngine, pinModels]);
+  }, [engines, models, cliConfig, catalogs, wsKey, customModels, knownIdsByEngine, pinModels, machine]);
 
   // Manual refresh from the flyout: re-read provider configs and re-probe the
   // catalogs. The probe effect skips engines already probed, so settings edits
@@ -369,7 +372,7 @@ export function useEngineModels(
       }
     }
     await Promise.all(probes);
-  }, [engines, wsKey, context, applyCatalog, markPending, contextByWs]);
+  }, [engines, wsKey, context, applyCatalog, markPending, contextByWs, ipc]);
 
   return {
     catalogs,

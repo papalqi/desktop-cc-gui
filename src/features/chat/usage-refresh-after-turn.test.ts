@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "./store";
-import { handleEngineEvents, type EngineEventDeps } from "./store/engine-events";
+import { handleEngineEvents, settledRuns, type EngineEventDeps } from "./store/engine-events";
 import { EMPTY_SESSION, runRouting } from "./store/stream";
 
 vi.mock("@/lib/ipc", () => ({
@@ -51,6 +51,7 @@ describe("a settled turn re-reads the live occupancy from session history", () =
     localStorage.clear();
     vi.clearAllMocks();
     runRouting.clear();
+    settledRuns.clear();
     const tab = { engine: "claude", sessionId: "sess-1", workspacePath: WS };
     useChatStore.setState({
       openTabs: [tab],
@@ -91,11 +92,15 @@ describe("a settled turn re-reads the live occupancy from session history", () =
     expect(refresh).not.toHaveBeenCalled();
   });
 
-  it("still re-reads after a /compact turn on any engine", () => {
+  it.each(["claude", "codex"])("still re-reads after a /compact turn on %s", (engine) => {
     const refresh = vi.fn(async () => {});
+    const key = `${engine}/sess-1`;
+    const tab = { engine, sessionId: "sess-1", workspacePath: WS };
     useChatStore.setState({
+      openTabs: [tab],
+      active: tab,
       bySession: {
-        [KEY]: {
+        [key]: {
           ...EMPTY_SESSION,
           messages: [
             { seq: 1, role: "user", text: "/compact", ts: "2026-09-16T00:00:00Z" },
@@ -105,11 +110,11 @@ describe("a settled turn re-reads the live occupancy from session history", () =
     });
 
     handleEngineEvents(
-      [ev("run-3", 3, { usage: { ...TURN_SUM } }, "codex")],
+      [ev("run-3", 3, { usage: { ...TURN_SUM } }, engine)],
       deps(refresh),
     );
 
     vi.advanceTimersByTime(400);
-    expect(refresh).toHaveBeenCalledWith(KEY);
+    expect(refresh).toHaveBeenCalledWith(key);
   });
 });

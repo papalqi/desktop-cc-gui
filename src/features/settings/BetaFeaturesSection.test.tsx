@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 /** Section reads the shared settings promise and writes whole snapshots. */
 const getAppSettings = vi.fn();
 const updateAppSettings = vi.fn();
+const bridge = vi.hoisted(() => ({ supported: false }));
+vi.mock("@/lib/transport", () => ({ isWeb: true, webBridgeFeature: () => bridge.supported }));
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     getAppSettings: () => getAppSettings(),
@@ -14,7 +16,7 @@ vi.mock("@/lib/ipc", () => ({
 
 import "@/lib/i18n";
 import { BetaFeaturesSection } from "./BetaFeaturesSection";
-import { useBetaFeaturesStore } from "./beta-features";
+import { multiMachinePageUrl, useBetaFeaturesStore } from "./beta-features";
 
 // React 18's act() requires this flag to be set by the test environment.
 declare global {
@@ -39,6 +41,8 @@ let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
+  bridge.supported = false;
+  window.history.replaceState(null, "", "/");
   getAppSettings.mockReset();
   updateAppSettings.mockReset();
   useBetaFeaturesStore.setState({ features: {} });
@@ -50,6 +54,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+  window.history.replaceState(null, "", "/");
 });
 
 async function render() {
@@ -68,7 +73,8 @@ describe("BetaFeaturesSection", () => {
     );
     // 任务工作台入口内测暂不放开（beta-features.ts 里已注释），恢复时同步改回
     // ["新建浏览器入口", "任务工作台入口"]。
-    expect(labels).toEqual(["新建浏览器入口"]);
+    expect(labels).toEqual(["新建浏览器入口", "多机器会话"]);
+    expect(switchFor("多机器会话").disabled).toBe(true);
     for (const label of labels) {
       expect(switchFor(label!).checked).toBe(false);
     }
@@ -120,5 +126,22 @@ describe("BetaFeaturesSection", () => {
     expect(useBetaFeaturesStore.getState().features.newBrowser).toBeUndefined();
     expect(switchFor("新建浏览器入口").checked).toBe(false);
     expect(container.textContent).toContain("disk full");
+  });
+
+  it("exposes the multi-machine beta only on a capable Hub and persists its flag", async () => {
+    bridge.supported = true;
+    window.history.replaceState(null, "", "/CCGUI/?global=1&machine=PC6");
+    getAppSettings.mockResolvedValue({ betaFeatures: {} });
+    updateAppSettings.mockResolvedValue(undefined);
+    await render();
+    await act(async () => click(switchFor("多机器会话")));
+    expect(updateAppSettings).toHaveBeenCalledWith(expect.objectContaining({ betaFeatures: { "web.multiMachine": true } }));
+    expect(new URL(multiMachinePageUrl(false)).searchParams.has("global")).toBe(false);
+    expect(new URL(multiMachinePageUrl(false)).searchParams.get("machine")).toBe("PC6");
+  });
+
+  it("rejects enabling multi-machine on an old Hub without writing the setting", async () => {
+    await expect(useBetaFeaturesStore.getState().setFeature("web.multiMachine", true)).rejects.toThrow(/Hub/);
+    expect(updateAppSettings).not.toHaveBeenCalled();
   });
 });

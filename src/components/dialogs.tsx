@@ -158,7 +158,7 @@ interface ConfirmDialogProps {
 export function ConfirmDialog({ message, danger = false, confirmLabel, onConfirm, onCancel, children }: ConfirmDialogProps) {
   const { t } = useTranslation();
   return (
-    <ModalShell onClose={onCancel}>
+    <ModalShell onClose={onCancel} label={message}>
       <p className="text-body-medium text-text-primary">{message}</p>
       {children}
       <div className="mt-4 flex justify-end gap-2">

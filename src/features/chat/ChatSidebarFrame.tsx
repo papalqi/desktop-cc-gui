@@ -8,6 +8,7 @@ import {
 } from "@/components/application/ai-chat/ai-chat-sidebar";
 import { cx } from "@/utils/cx";
 import { sessionKey, type ActiveSession } from "./store";
+import { SessionViewControls } from "./SessionViewControls";
 
 /** Left edge: the session sidebar, its full-height resize strip, and the
  * mobile drawer backdrop. Below the md breakpoint the sidebar floats over
@@ -40,7 +41,10 @@ export function ChatSidebarFrame({
   onReorderWorkspaces,
   onDropWorkspaceToSection,
   onCreateGroup,
+  staleSessionCount,
+  onArchiveWeek,
   archivedRepos,
+  liveRunningKeys,
 }: {
   active: ActiveSession | null;
   collapsed: boolean;
@@ -77,14 +81,19 @@ export function ChatSidebarFrame({
   onDropWorkspaceToSection: (workspaceId: string, targetSectionId: string | null) => void;
   /** Blank-area menu「新建分组」commit: localized validation error or null. */
   onCreateGroup: (name: string) => string | null;
+  staleSessionCount: number;
+  onArchiveWeek: () => void;
   /** Archived workspaces for the sidebar's bottom 已归档 section. */
   archivedRepos: AiChatRepo[];
+  /** `engine/sessionId` keys running on the desktop the page socket is on. */
+  liveRunningKeys?: readonly string[];
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   return (
     <>
       <AiChatSidebar
+        sessionViewControls={<SessionViewControls />}
         width={collapsed ? 0 : width}
         rootRef={sidebarRef}
         className={cx(
@@ -100,7 +109,7 @@ export function ChatSidebarFrame({
         repos={repos}
         sections={sections}
         activeThreadId={
-          active ? sessionKey(active.engine, active.sessionId, active.workspacePath) : undefined
+          active ? sessionKey(active.engine, active.sessionId, active.workspacePath, active.machine) : undefined
         }
         onThreadSelect={onThreadSelect}
         onThreadAction={onThreadAction}
@@ -120,6 +129,9 @@ export function ChatSidebarFrame({
         onReorderWorkspaces={onReorderWorkspaces}
         onDropWorkspaceToSection={onDropWorkspaceToSection}
         onCreateGroup={onCreateGroup}
+        staleSessionCount={staleSessionCount}
+        onArchiveWeek={onArchiveWeek}
+        liveRunningKeys={liveRunningKeys}
         onOpenSettings={() => navigate("/settings")}
         onClose={onClose}
       />

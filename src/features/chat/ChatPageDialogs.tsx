@@ -5,6 +5,7 @@ import { fileName, useFilesStore } from "@/features/files/store";
 import { WorktreeCreateDialog } from "@/features/worktree/WorktreeCreateDialog";
 import { DeleteWorktreeDialog } from "@/features/worktree/DeleteWorktreeDialog";
 import { useTerminalStore } from "@/features/terminal/store";
+import { ARCHIVE_WEEK_MS } from "@/features/chat/machine-catalog";
 import { worktreeMetaOf, type SessionMeta } from "@/lib/ipc";
 import { useChatStore } from "./store";
 
@@ -23,6 +24,8 @@ export type ChatPageDialog =
   | { kind: "deleteWorktree"; workspaceId: string }
   /** 归档带 worktree 子项的父工作区时的级联确认。 */
   | { kind: "archiveWorkspace"; workspaceId: string }
+  /** Batch-archive idle sessions older than a week. */
+  | { kind: "archiveWeek"; count: number }
   | { kind: "closeFile"; path: string };
 
 /** Session rename/delete, dirty-file close, and workspace removal
@@ -56,7 +59,7 @@ export function ChatPageDialogs({
           initial={dialog.session.customTitle || dialog.session.title}
           onSubmit={(title) => {
             onClose();
-            void renameSession(dialog.session.engine, dialog.session.sessionId, title);
+            void renameSession(dialog.session.engine, dialog.session.sessionId, title, dialog.session.machine);
           }}
           onCancel={onClose}
         />
@@ -109,7 +112,7 @@ export function ChatPageDialogs({
           const children = workspaces.filter((w) => w.parentId === dialog.workspaceId);
           const removeOne = async (id: string) => {
             const target = workspaces.find((w) => w.id === id);
-            if (target) removeTerminalWorkspace(target.path);
+            if (target) removeTerminalWorkspace(target.path, target.machine);
             await removeWorkspace(id);
           };
           // 级联提示（确认决策）：父行带 worktree 子项时列出受影响分支，
@@ -156,6 +159,17 @@ export function ChatPageDialogs({
             />
           );
         })()}
+      {dialog?.kind === "archiveWeek" && (
+        <ConfirmDialog
+          confirmLabel={t("chat.archiveWeekAction")}
+          message={t("chat.archiveWeekConfirm", { count: dialog.count })}
+          onConfirm={() => {
+            onClose();
+            void useChatStore.getState().archiveSessionsBefore(Date.now() - ARCHIVE_WEEK_MS);
+          }}
+          onCancel={onClose}
+        />
+      )}
       {dialog?.kind === "archiveWorkspace" &&
         (() => {
           const parent = workspaces.find((w) => w.id === dialog.workspaceId);
@@ -197,7 +211,7 @@ function DeleteSessionConfirm({
     message: t("chat.confirmDeleteSession"),
     onConfirm: () => {
       onClose();
-      void deleteSession(dialog.session.engine, dialog.session.sessionId);
+      void deleteSession(dialog.session.engine, dialog.session.sessionId, dialog.session.machine);
     },
     onCancel: onClose,
   };

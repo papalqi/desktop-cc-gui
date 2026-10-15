@@ -6,8 +6,10 @@ import {
   SettingsRow,
 } from "@/components/application/settings/settings-rows";
 import { errorText } from "@/lib/errors";
+import { webBridgeFeature } from "@/lib/transport";
+import { webMultiMachine } from "@/lib/web-machine";
 import {
-  BETA_FEATURES,
+  visibleBetaFeatures,
   hydrateBetaFeatures,
   useBetaFeaturesStore,
   type BetaFeatureId,
@@ -24,6 +26,7 @@ export function BetaFeaturesSection() {
   const features = useBetaFeaturesStore((s) => s.features);
   const setFeature = useBetaFeaturesStore((s) => s.setFeature);
   const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   // Authoritative read on mount: startup hydration may have raced the shared
   // settings fetch, and a failed startup fetch leaves the store all-off.
@@ -32,9 +35,10 @@ export function BetaFeaturesSection() {
   }, []);
 
   const toggle = (id: BetaFeatureId, enabled: boolean) => {
+    setSaving(true);
     void setFeature(id, enabled)
       .then(() => setError(null))
-      .catch((e) => setError(errorText(e)));
+      .catch((e) => setError(errorText(e))).finally(() => setSaving(false));
   };
 
   return (
@@ -49,17 +53,19 @@ export function BetaFeaturesSection() {
           {t("settings.betaFeaturesDesc")}
         </p>
         <SettingsCard className="mt-1">
-          {BETA_FEATURES.map((feature) => (
+          {visibleBetaFeatures.map((feature) => (
             <SettingsRow
               key={feature.id}
               anchor={feature.id}
               label={t(feature.labelKey)}
-              description={t(feature.descriptionKey)}
+              description={feature.id === "web.multiMachine" && !webBridgeFeature("multi-machine")
+                ? t("settings.betaMultiMachineUnavailable") : t(feature.descriptionKey)}
             >
               <Switch
                 size="sm"
                 aria-label={t(feature.labelKey)}
                 isSelected={features[feature.id] === true}
+                isDisabled={saving || feature.id === "web.multiMachine" && !webBridgeFeature("multi-machine") && !webMultiMachine()}
                 onChange={(enabled) => toggle(feature.id, enabled)}
               />
             </SettingsRow>

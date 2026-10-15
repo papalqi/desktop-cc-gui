@@ -1,4 +1,4 @@
-import { ipc, type BotConfig } from "@/lib/ipc";
+import { ipc, ipcForMachine, type BotConfig } from "@/lib/ipc";
 import { cachedInstalledSkills } from "@/features/skills/api";
 import { buildBotBlock } from "@/features/chat/components/agent-block";
 import { assembleBotPrompt, type SkillIndexEntry } from "./bot-prompt";
@@ -25,10 +25,10 @@ export function avatarGlyph(bot: BotConfig): string {
 }
 
 /** Enabled skills of one bot. `["*"]` means every skill the hub knows. */
-export async function skillIndexFor(bot: BotConfig): Promise<SkillIndexEntry[]> {
+export async function skillIndexFor(bot: BotConfig, machine?: string): Promise<SkillIndexEntry[]> {
   const enabled = bot.capabilities.skills;
   if (enabled.length === 0) return [];
-  const all = await cachedInstalledSkills().catch(() => null);
+  const all = await cachedInstalledSkills(machine).catch(() => null);
   if (!all) return [];
   const entries = all.skills.map((skill) => ({
     name: skill.name,
@@ -49,9 +49,10 @@ export async function skillIndexFor(bot: BotConfig): Promise<SkillIndexEntry[]> 
  */
 async function memoryForPrompt(
   bot: BotConfig,
+  machine?: string,
 ): Promise<{ user: string; memory: string }> {
   try {
-    const view = await ipc.memoryList(bot.id);
+    const view = await (machine ? ipcForMachine(machine) : ipc).memoryList(bot.id);
     return {
       user: renderMemory(view.user.entries),
       memory: view.memory ? renderMemory(view.memory.entries) : "",
@@ -65,11 +66,11 @@ async function memoryForPrompt(
 /** Build the `## Agent Role and Instructions` tail block for a bot. */
 export async function buildBotPromptBlock(
   bot: BotConfig,
-  options?: { memoryToolAvailable?: boolean },
+  options?: { memoryToolAvailable?: boolean; machine?: string },
 ): Promise<string> {
-  const skills = await skillIndexFor(bot);
+  const skills = await skillIndexFor(bot, options?.machine);
   const memoryOn = bot.memory.enabled !== false;
-  const ledgers = memoryOn ? await memoryForPrompt(bot) : null;
+  const ledgers = memoryOn ? await memoryForPrompt(bot, options?.machine) : null;
   const assembled = assembleBotPrompt({
     bot,
     skills,

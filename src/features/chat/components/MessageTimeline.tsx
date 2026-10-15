@@ -1,9 +1,10 @@
-import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from "react";
+import { lazy, memo, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from "react";
 import { useVirtualizer, type Virtualizer } from "@tanstack/react-virtual";
 import { useTranslation } from "react-i18next";
 import Copy from "lucide-react/dist/esm/icons/copy";
 import Check from "lucide-react/dist/esm/icons/check";
 import type { Message } from "@/lib/ipc";
+import { performanceRecorder } from "@/lib/performance-diagnostics";
 
 import type { SessionState } from "../store";
 import { useChatStore } from "../store";
@@ -58,8 +59,7 @@ const TimelineRowView = memo(function TimelineRowView({
   workspacePath: string;
   /** True while the current turn is still streaming; suppresses the footer. */
   turnLive: boolean;
-  /** True on the timeline's last process row: it rides open until a newer
-   * one appears, and stays open once the turn settles. */
+  /** True on the active search hit so hidden process details can be found. */
   autoExpand: boolean;
   /** False keeps a settled thinking row expanded (设置 → 通用 → 行为). */
   thinkingAutoCollapse: boolean;
@@ -521,22 +521,44 @@ function useTimelineSearch({
 }
 
 export const MessageTimeline = memo(function MessageTimeline({
+  sessionKey,
   session,
   streaming,
   onLoadEarlier,
   workspacePath,
 }: {
+  sessionKey?: string;
   session: SessionState;
   streaming: boolean;
   onLoadEarlier: () => void;
   workspacePath: string;
 }) {
-
+  const renderStartedAt = performanceRecorder.isEnabled() ? performance.now() : 0;
   const { t } = useTranslation();
   const thinkingAutoCollapse = useChatStore((s) => s.thinkingAutoCollapse);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const items = session.messages;
   const rows = useMemo(() => buildRows(items), [items]);
+  useLayoutEffect(() => {
+    if (!performanceRecorder.isEnabled() || !sessionKey) return;
+    const token = performanceRecorder.sessionToken(sessionKey);
+    performanceRecorder.transition("timeline-commit", { session: token, rows: rows.length, messages: items.length, elapsedMs: performance.now() - renderStartedAt });
+    if (session.loading || document.hidden) return;
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        if (!document.hidden) performanceRecorder.transition("timeline-paint", {
+          session: token, rows: rows.length, messages: items.length, elapsedMs: performance.now() - renderStartedAt,
+        });
+      });
+    });
+    const visibilityChanged = () => { if (document.hidden) cancelAnimationFrame(frame); };
+    document.addEventListener("visibilitychange", visibilityChanged);
+    return () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    };
+    // Session load completion and mount only; stream flushes must not create per-token logs.
+  }, [sessionKey, session.loading]);
   // Anchor rail: one dash per user message (reference: messageAnchors).
   const buildAnchorRows = useMemo(createAnchorRowsBuilder, []);
   const anchors = useMemo(() => buildAnchorRows(rows), [buildAnchorRows, rows]);
@@ -552,13 +574,6 @@ export const MessageTimeline = memo(function MessageTimeline({
     for (const key of collectToolKeys(rows)) seenTools.add(key);
     setPrimed(true);
   }
-  // Key of the last process row — the one that stays expanded by default.
-  const lastProcessKey = useMemo(() => {
-    for (let i = rows.length - 1; i >= 0; i--) {
-      if (rows[i].kind === "process") return rowKey(rows[i]);
-    }
-    return null;
-  }, [rows]);
   // Live stream rows are ordinary rows that grow in place; the only extra
   // tail item is the turn-status indicator below them.
   // The tail indicator stays mounted AND visible for the whole turn — a
@@ -731,6 +746,7 @@ export const MessageTimeline = memo(function MessageTimeline({
                       label={t("chat.thinking")}
                       className="py-2"
                       startedAt={session.turnStartedAt ?? undefined}
+                      showTimer={session.turnStartedAt != null}
                       durationFormatter={(d) => t("chat.metaDuration", { duration: d })}
                       model={activeModelFormatted}
                       effort={activeEffortFormatted}
@@ -754,10 +770,7 @@ export const MessageTimeline = memo(function MessageTimeline({
                     row={rows[item.index]}
                     workspacePath={workspacePath}
                     turnLive={turnLive}
-                    autoExpand={
-                      rowKey(rows[item.index]) === lastProcessKey ||
-                      item.index === currentSearchRow
-                    }
+                    autoExpand={item.index === currentSearchRow}
                     thinkingAutoCollapse={thinkingAutoCollapse}
                     seenTools={seenTools}
                     searchTarget={item.index === currentSearchRow ? processSearchTarget : undefined}

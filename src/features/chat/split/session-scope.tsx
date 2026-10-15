@@ -27,12 +27,12 @@ export function SessionScope({
 /** 当前栏位的会话；不在任何作用域内时按全局激活会话解析。 */
 export function useScopedSession(): ActiveSession | null {
   const scoped = useContext(SessionScopeContext);
-  const active = useChatStore((s) => s.active);
+  const active = useChatStore((s) => scoped === undefined ? s.active : null);
   return scoped === undefined ? active : scoped;
 }
 
 /** 当前栏位的会话 key；没有会话时为空串。 */
 export function useScopedSessionKey(): string {
   const session = useScopedSession();
-  return session ? sessionKey(session.engine, session.sessionId, session.workspacePath) : "";
+  return session ? sessionKey(session.engine, session.sessionId, session.workspacePath, session.machine) : "";
 }

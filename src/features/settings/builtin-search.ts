@@ -1,6 +1,6 @@
 import { IS_WINDOWS, isWeb } from "@/lib/platform";
 import { shortcutActions } from "@/features/shortcuts/actions";
-import { BETA_FEATURES } from "./beta-features";
+import { visibleBetaFeatures } from "./beta-features";
 import { ENGINE_IDS, type EngineId } from "./providers";
 import type { SettingsSearchEntry } from "./settings-search";
 
@@ -143,7 +143,7 @@ const shortcutEntries: SettingsSearchEntry[] = shortcutActions.map((action) => (
 /** 内测功能 (`BetaFeaturesSection.tsx`): one switch per entry, mapped from the
  *  catalog the page renders. No card heading on that page — the page name
  *  alone already names it. */
-const betaFeatureEntries: SettingsSearchEntry[] = BETA_FEATURES.map(
+const betaFeatureEntries: SettingsSearchEntry[] = visibleBetaFeatures.map(
   (feature) => ({
     page: "betaFeatures",
     anchor: feature.id,

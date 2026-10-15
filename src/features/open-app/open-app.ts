@@ -1,4 +1,4 @@
-import { ipc } from "@/lib/ipc";
+import { ipc, ipcForMachine } from "@/lib/ipc";
 import { readStoredJson, readStoredBool, writeStored } from "@/lib/storage";
 import vscodeIcon from "@/assets/app-icons/vscode.png?url";
 import cursorIcon from "@/assets/app-icons/cursor.png?url";
@@ -47,18 +47,19 @@ export function resolveOpenAppPath(
   return options.activeFilePath?.trim() || options.workspacePath;
 }
 
-export async function openPathInTarget(path: string, target: OpenAppTarget): Promise<void> {
+export async function openPathInTarget(path: string, target: OpenAppTarget, machine?: string): Promise<void> {
+  const client = machine ? ipcForMachine(machine) : ipc;
   if (target.kind === "finder") {
-    await ipc.revealInFileManager(path);
+    await client.revealInFileManager(path);
     return;
   }
   if (!target.appName) return;
-  await ipc.openWorkspaceIn(path, { appName: target.appName });
+  await client.openWorkspaceIn(path, { appName: target.appName });
 }
 
 /** Launch a custom program entry at `path` with the workspace path appended. */
-export async function openCustomProgram(path: string, app: CustomApp): Promise<void> {
-  await ipc.openCustomProgram(app.path, path);
+export async function openCustomProgram(path: string, app: CustomApp, machine?: string): Promise<void> {
+  await (machine ? ipcForMachine(machine) : ipc).openCustomProgram(app.path, path);
 }
 
 // ---------- user-added custom programs (header menu "添加程序") ----------

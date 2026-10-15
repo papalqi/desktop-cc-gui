@@ -3,10 +3,16 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { performanceRecorder } from "./performance-diagnostics";
 
 export interface EngineEventPayload {
+  machine?: string;
   runId: string;
   sessionId: string | null;
   engine: string;
   seq: number;
+  /** Persistent host cursor; independent of page lifetime and run sequence. */
+  cursor?: number;
+  historyEpoch?: number;
+  historySource?: "hub" | "executor";
+  workspacePath?: string;
   kind:
     | "delta"
     | "thinking"
@@ -29,6 +35,8 @@ export interface EngineEventPayload {
   /** Emit-side timestamp (Unix ms), stamped in TurnState::push. Absent from
    *  payloads produced before SDK 0.3.8. */
   ts?: number;
+  /** Original run reservation time (Unix ms), including on late events. */
+  startedAt?: number;
   /** Host-measured generation window (ms) for `usage`/`done` reports: the
    *  model's actual stream span (first delta / message_start → message_stop
    *  / usage), with tool execution and idle time excluded. Absent when the
@@ -40,9 +48,11 @@ export interface EngineEventPayload {
 /** Batched engine events arrive as an array under a single event name. */
 export function listenEngineEvents(
   cb: (events: EngineEventPayload[]) => void,
+  recovery?: { connected: (session?: { engine: string; sessionId: string; machine?: string }) => void; failed: () => void },
 ): Promise<UnlistenFn> {
-  return listen<EngineEventPayload[]>("engine://event", (event) => {
-    if (!performanceRecorder.isEnabled()) { cb(event.payload); return; }
+  const subscriptions = [listen<EngineEventPayload[]>("engine://event", (event) => {
+    const payload = event.machine ? event.payload.map((item) => ({ ...item, machine: event.machine })) : event.payload;
+    if (!performanceRecorder.isEnabled()) { cb(payload); return; }
     const startedAt = performance.now();
     performanceRecorder.count("engineEvents", event.payload.length);
     for (const item of event.payload) {
@@ -50,8 +60,23 @@ export function listenEngineEvents(
       if (item.kind === "message" && item.data && typeof item.data === "object" && "role" in item.data &&
         (item.data.role === "tool" || item.data.role === "tool_result")) performanceRecorder.count("toolEvents", 1);
     }
-    try { cb(event.payload); }
+    try { cb(payload); }
     finally { performanceRecorder.duration("engineBatch", performance.now() - startedAt); }
+  })];
+  if (recovery) {
+    subscriptions.push(listen("bridge://connected", () => recovery.connected()));
+    subscriptions.push(listen<{ engine?: string; sessionId?: string } | null>("engine://resync", (event) => {
+      const session = event.payload;
+      recovery.connected(typeof session?.engine === "string" && typeof session.sessionId === "string"
+        ? { engine: session.engine, sessionId: session.sessionId, ...(event.machine ? { machine: event.machine } : {}) } : undefined);
+    }));
+    subscriptions.push(listen("engine://history-error", recovery.failed));
+  }
+  return Promise.allSettled(subscriptions).then((results) => {
+    const stops = results.flatMap((r) => r.status === "fulfilled" ? [r.value] : []);
+    const failure = results.find((r) => r.status === "rejected");
+    if (failure?.status === "rejected") { stops.forEach((stop) => stop()); throw failure.reason; }
+    return () => stops.forEach((stop) => stop());
   });
 }
 
@@ -127,13 +152,14 @@ export function listenPluginInstallProgress(
 export interface TerminalOutputPayload {
   id: string;
   data: string;
+  machine?: string;
 }
 
 /** Batched PTY output: arrays of chunks flushed at 32ms / 64KB by the sink. */
 export function listenTerminalOutput(
   cb: (chunks: TerminalOutputPayload[]) => void,
 ): Promise<UnlistenFn> {
-  return listen<TerminalOutputPayload[]>("terminal://output", (e) => cb(e.payload));
+  return listen<TerminalOutputPayload[]>("terminal://output", (e) => cb(e.machine ? e.payload.map((chunk) => ({ ...chunk, machine: e.machine })) : e.payload));
 }
 export interface CliUpdateProgress {
   /** Scopes events to one confirmed run; other runs are ignored. */

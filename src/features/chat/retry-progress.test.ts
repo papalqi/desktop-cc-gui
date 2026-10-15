@@ -219,7 +219,8 @@ describe("provider retry progress", () => {
     expect(useChatStore.getState().bySession[KEY]!.streaming).toBe(false);
     expect(useChatStore.getState().streamingByKey[KEY]).toBeUndefined();
 
-    handleEngineEvents([retry(1, 1, 50, `${runId}-next`)], deps());
+    const startedAt = Date.now() - 30_000;
+    handleEngineEvents([{ ...retry(1, 1, 50, `${runId}-next`), startedAt }], deps());
 
     const state = useChatStore.getState();
     expect(state.bySession[KEY]).toMatchObject({
@@ -229,7 +230,7 @@ describe("provider retry progress", () => {
         max: 50,
         message: "API error (HTTP 529); retrying (1/50)",
       },
-      turnStartedAt: expect.any(Number),
+      turnStartedAt: startedAt,
     });
     expect(state.streamingByKey[KEY]).toBe(true);
   });

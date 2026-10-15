@@ -1,5 +1,8 @@
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
+import { isWeb, webBridgeFeature } from "@/lib/transport";
+import { webMultiMachine } from "@/lib/web-machine";
+import i18n from "@/lib/i18n";
 
 /**
  * Beta entry points (设置 → 其他 → 内测功能): feature id -> enabled, persisted
@@ -20,6 +23,11 @@ export const BETA_FEATURES = [
     labelKey: "settings.betaNewBrowser",
     descriptionKey: "settings.betaNewBrowserDesc",
   },
+  {
+    id: "web.multiMachine",
+    labelKey: "settings.betaMultiMachine",
+    descriptionKey: "settings.betaMultiMachineDesc",
+  },
   // 任务工作台入口：内测暂不放开，设置页开关先隐藏。恢复时取消注释，
   // 并删掉 TEMPORARILY_HIDDEN_BETA_FEATURES 里对应的 id。
   // {
@@ -38,6 +46,8 @@ export type BetaFeatureId =
   | (typeof BETA_FEATURES)[number]["id"]
   | (typeof TEMPORARILY_HIDDEN_BETA_FEATURES)[number];
 
+export const visibleBetaFeatures = BETA_FEATURES.filter((feature) => feature.id !== "web.multiMachine" || isWeb);
+
 interface BetaFeaturesState {
   features: Record<string, boolean>;
   hydrate: (features: Record<string, boolean> | null | undefined) => void;
@@ -48,6 +58,9 @@ export const useBetaFeaturesStore = create<BetaFeaturesState>((set, get) => ({
   features: {},
   hydrate: (features) => set({ features: features ? { ...features } : {} }),
   setFeature: async (id, enabled) => {
+    if (id === "web.multiMachine" && enabled && (!isWeb || !webBridgeFeature("multi-machine"))) {
+      throw new Error(i18n.t("settings.betaMultiMachineUnavailable"));
+    }
     const previous = get().features;
     // Apply in memory first so the entry appears/disappears without a reload;
     // a failed write rolls the switch back instead of faking a saved state.
@@ -58,12 +71,22 @@ export const useBetaFeaturesStore = create<BetaFeaturesState>((set, get) => ({
         ...settings,
         betaFeatures: { ...(settings.betaFeatures ?? {}), [id]: enabled },
       });
+      if (id === "web.multiMachine" && isWeb && enabled !== webMultiMachine()) {
+        window.location.assign(multiMachinePageUrl(enabled));
+      }
     } catch (error) {
       set({ features: previous });
       throw error;
     }
   },
 }));
+
+export function multiMachinePageUrl(enabled: boolean): string {
+  const url = new URL(window.location.href);
+  if (enabled) url.searchParams.set("global", "1");
+  else url.searchParams.delete("global");
+  return url.toString();
+}
 
 function isBetaFeatureHidden(id: BetaFeatureId): boolean {
   return (TEMPORARILY_HIDDEN_BETA_FEATURES as readonly string[]).includes(id);
@@ -81,6 +104,9 @@ export async function hydrateBetaFeatures(): Promise<void> {
   try {
     const settings = await ipc.getAppSettings();
     useBetaFeaturesStore.getState().hydrate(settings.betaFeatures);
+    if (settings.betaFeatures?.["web.multiMachine"] === true && isWeb && !webMultiMachine() && webBridgeFeature("multi-machine")) {
+      window.location.replace(multiMachinePageUrl(true));
+    }
   } catch {
     // Default off: an unreadable settings file never reveals beta entries.
   }

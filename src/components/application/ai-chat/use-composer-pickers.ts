@@ -51,9 +51,10 @@ import {
 import { type MentionEntry } from "@/components/application/ai-chat/mention-files";
 import { type CustomPromptEntry, type SlashCommandEntry } from "@/lib/ipc";
 import { useSelectedBot, type SelectedBot } from "@/features/bots/selected-bot";
-import { useChatStore } from "@/features/chat/store";
+import { useScopedSession } from "@/features/chat/split/session-scope";
 import { useMcpPanel } from "@/features/mcp/panel";
 import { joinPath } from "@/features/files/store";
+import { machineResourceKey } from "@/lib/web-machine";
 
 export interface UseComposerPickersArgs {
   /** The composer field itself. */
@@ -115,30 +116,31 @@ export function useComposerPickers({
   emitChange,
   syncTags,
 }: UseComposerPickersArgs): ComposerPickers {
+  const active = useScopedSession();
+  const cacheRoot = workspacePath ? machineResourceKey(workspacePath, active?.machine) : workspacePath;
   // @-mention file picker: trigger tracking, caret anchoring, and workspace
   // lifecycle live in useMentionPicker; the menu + select action stay wired
   // here. The parent owns the wrapper ref (root div + popover anchor).
   const { mention, setMention, mentionMenuRef, updateMentionTrigger } =
-    useMentionPicker({ editableRef, wrapperRef, workspacePath, value, lastEmittedRef });
+    useMentionPicker({ editableRef, wrapperRef, workspacePath: cacheRoot, value, lastEmittedRef });
   // `/` command picker: same trigger-tracking model as the mention picker.
   const { slash, setSlash, slashMenuRef, updateSlashTrigger } =
-    useSlashPicker({ editableRef, wrapperRef, workspacePath, value, lastEmittedRef });
+    useSlashPicker({ editableRef, wrapperRef, workspacePath: cacheRoot, value, lastEmittedRef });
 
   // `#` bot picker and `!` prompt picker: same trigger-tracking model.
   const { bot, setBot, botMenuRef, updateBotTrigger } =
     useBotPicker({ editableRef, wrapperRef, workspacePath, value, lastEmittedRef });
   const { prompt, setPrompt, promptMenuRef, updatePromptTrigger } =
-    usePromptPicker({ editableRef, wrapperRef, workspacePath, value, lastEmittedRef });
+    usePromptPicker({ editableRef, wrapperRef, workspacePath: cacheRoot, value, lastEmittedRef });
 
   const navigate = useNavigate();
   // The pinned bot is keyed per thread; draft tabs share a slot until the
   // engine stamps a native session id (see selected-bot.ts).
-  const activeSessionId = useChatStore((s) => s.active?.sessionId ?? null);
   const {
     bot: selectedBot,
     select: selectBot,
     clear: clearSelectedBot,
-  } = useSelectedBot(workspacePath ?? "", activeSessionId);
+  } = useSelectedBot(workspacePath ?? "", active?.sessionId ?? null, active?.machine);
 
   // One detection pass per input, priority `/` > `@` > `#` > `!`
   // (desktop-cc-gui parity: a line-start slash owns the completion surface;

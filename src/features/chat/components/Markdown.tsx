@@ -24,6 +24,7 @@ import { markdownRegistry, useRegistry } from "@ccgui/plugin-sdk";
 import { useCopied } from "@/hooks/use-copied";
 import { FileLinkContextMenu } from "./FileLinkContextMenu";
 import { resolveChatFileLink } from "@/features/chat/file-link-resolution";
+import { useScopedSession } from "../split/session-scope";
 import {
   decodeFileLink,
   isFileLinkUrl,
@@ -39,14 +40,14 @@ type PluginListProp = NonNullable<
   ComponentProps<typeof ReactMarkdown>["remarkPlugins"]
 >;
 
-function openFileFromChat(rawPath: string, workspacePath: string) {
+function openFileFromChat(rawPath: string, workspacePath: string, machine?: string) {
   // Async on purpose: a path that only exists nested below the workspace
   // root (outer folder opened as workspace) is found through the index
   // fallback instead of dead-ending in a not-found tab.
-  void resolveChatFileLink(rawPath, workspacePath).then((path) => {
+  void resolveChatFileLink(rawPath, workspacePath, machine).then((path) => {
     if (!path) return;
     // Opens as a center-area tab; visible at every window width.
-    void useFilesStore.getState().openFile(path);
+    void useFilesStore.getState().openFile(path, machine);
   });
 }
 
@@ -66,6 +67,7 @@ function FileLink({
   workspacePath: string;
   children: ReactNode;
 }) {
+  const machine = useScopedSession()?.machine;
   const resolved = resolveFilePath(path, workspacePath);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   return (
@@ -77,7 +79,7 @@ function FileLink({
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
-          openFileFromChat(path, workspacePath);
+          openFileFromChat(path, workspacePath, machine);
         }}
         onContextMenu={(event) => {
           event.preventDefault();
@@ -89,7 +91,7 @@ function FileLink({
       </a>
       {menu && (
         <FileLinkContextMenu
-          menu={{ ...menu, path, resolvedPath: resolved, workspacePath }}
+          menu={{ ...menu, path, resolvedPath: resolved, workspacePath, machine }}
           onClose={() => setMenu(null)}
         />
       )}

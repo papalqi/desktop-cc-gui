@@ -61,7 +61,7 @@ function normalizePathSegments(path: string): string {
 }
 
 /** Local relative image src → absolute path next to the markdown file. */
-function resolveMarkdownImageSrc(src: string, sourceFilePath: string): string {
+function resolveMarkdownImageSrc(src: string, sourceFilePath: string, machine?: string): string {
   let cleaned: string;
   try {
     cleaned = decodeURIComponent(src);
@@ -74,7 +74,7 @@ function resolveMarkdownImageSrc(src: string, sourceFilePath: string): string {
   }
   const pathOnly = cleaned.replace(/[?#].*$/, "");
   if (/^([a-zA-Z]:[\\/]|\/|\\\\)/.test(pathOnly)) {
-    return fileUrl(normalizePathSegments(pathOnly));
+    return fileUrl(normalizePathSegments(pathOnly), machine);
   }
   const sepIdx = Math.max(
     sourceFilePath.lastIndexOf("/"),
@@ -84,6 +84,7 @@ function resolveMarkdownImageSrc(src: string, sourceFilePath: string): string {
   try {
     return fileUrl(
       normalizePathSegments(`${sourceFilePath.slice(0, sepIdx)}/${pathOnly}`),
+      machine,
     );
   } catch {
     return cleaned;
@@ -153,6 +154,7 @@ const MarkdownDocument = memo(function MarkdownDocument({
 
 export function MarkdownPreview({
   path,
+  machine,
   draft,
   active = true,
   searchOpen = false,
@@ -160,6 +162,7 @@ export function MarkdownPreview({
   bindSearchShortcut = false,
 }: {
   path: string;
+  machine?: string;
   draft: string;
   /** Whether this preview is the visible surface. Kept so find highlights
    *  repaint when the tab comes back into view; standalone callers default
@@ -195,7 +198,7 @@ export function MarkdownPreview({
       img: (props: ImgHTMLAttributes<HTMLImageElement>) => (
         <img
           {...props}
-          src={props.src ? resolveMarkdownImageSrc(String(props.src), path) : props.src}
+          src={props.src ? resolveMarkdownImageSrc(String(props.src), path, machine) : props.src}
           className="max-w-full"
         />
       ),
@@ -237,7 +240,7 @@ export function MarkdownPreview({
               onClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                void useFilesStore.getState().openFile(localPath);
+                void useFilesStore.getState().openFile(localPath, machine);
               }}
             >
               {children}
@@ -249,7 +252,7 @@ export function MarkdownPreview({
         return <span>{children}</span>;
       },
     }),
-    [path],
+    [path, machine],
   );
   const translations = useMemo<Partial<StreamdownTranslations>>(
     () => ({

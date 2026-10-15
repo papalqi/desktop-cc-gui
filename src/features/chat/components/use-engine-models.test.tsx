@@ -7,12 +7,18 @@ import "@/lib/i18n";
 import i18n from "@/lib/i18n";
 import { useEngineModels, type EngineModelsState } from "./use-engine-models";
 
+const machineIpc = vi.hoisted(() => ({
+  getCliConfig: vi.fn(async () => ({})),
+  getAppSettings: vi.fn(async () => ({})),
+  listEngineModels: vi.fn(async () => ({ models: [{ id: "pc6-model", name: "PC6" }], authoritative: true })),
+}));
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     getCliConfig: vi.fn(async () => ({})),
     getAppSettings: vi.fn(async () => ({})),
     listEngineModels: vi.fn(async () => ({ models: [], authoritative: false })),
   },
+  ipcForMachine: () => machineIpc,
 }));
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
@@ -57,14 +63,16 @@ function Harness({
   pinModels,
   workspacePath,
   providers = {},
+  machine,
 }: {
   models: Record<string, string>;
   pinModels: (updates: Record<string, string>, persist?: boolean) => Promise<void>;
   workspacePath?: string;
   /** Session-resolved channel per engine (what the picker refreshes on). */
   providers?: Record<string, string>;
+  machine?: string;
 }) {
-  latest = useEngineModels(engines, models, pinModels, providers, workspacePath);
+  latest = useEngineModels(engines, models, pinModels, providers, workspacePath, machine);
   return null;
 }
 
@@ -85,6 +93,15 @@ const settle = () =>
     setTimeout(resolve, 80);
     await promise;
   });
+
+it("reads the pane's machine catalog without rewriting shared model defaults", async () => {
+  const pinModels = vi.fn(async () => {});
+  await render({ models: { omp: "pc0-model" }, pinModels, workspacePath: "E:/same", machine: "PC6" });
+  await settle();
+  expect(machineIpc.listEngineModels).toHaveBeenCalledWith("omp", "E:/same");
+  expect(latest.modelsByEngine.omp.map((model) => model.id)).toContain("pc6-model");
+  expect(pinModels).not.toHaveBeenCalled();
+});
 
 /** 探针类用例的渲染入口:可换 engines,渲染后等窗口落定。 */
 async function show(

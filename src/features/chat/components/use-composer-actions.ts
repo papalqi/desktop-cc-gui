@@ -1,5 +1,6 @@
 import { useCallback, useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import type { EngineInfo } from "@/lib/ipc";
 import { useShallow } from "zustand/react/shallow";
 import type { ComposerInputHandle } from "@/components/application/ai-chat/ai-chat-composer";
 import { mentionToken } from "@/components/application/ai-chat/file-tags";
@@ -13,6 +14,7 @@ import {
 import { useMcpPanel } from "@/features/mcp/panel";
 import { recordPrompt } from "../prompt-history";
 import { IMAGE_EXTENSIONS } from "./use-composer-images";
+const EMPTY_ENGINES: EngineInfo[] = [];
 
 /** Composer submit/draft/attach/stop handlers plus the pending-@mention
  * bridge, so ChatConversation stays a composition layer. */
@@ -36,7 +38,7 @@ export function useComposerActions({
 }) {
   const { t } = useTranslation();
   const pendingMention = useChatStore((s) => s.pendingMention);
-  const engines = useChatStore((s) => s.engines);
+  const engines = useChatStore((s) => active?.machine ? s.enginesByMachine[active.machine] ?? EMPTY_ENGINES : s.engines);
   const {
     setDraft,
     clearPendingMention,
@@ -100,7 +102,7 @@ export function useComposerActions({
       // user-defined catalog command of the same name takes precedence
       // (parseAppCommand).
       if (appCommand?.command === "new") {
-        startNewChat(active.workspacePath);
+        startNewChat(active.workspacePath, active.machine);
         return;
       }
       if (appCommand?.command === "compact" && active.sessionId && !streaming) {

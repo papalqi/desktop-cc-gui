@@ -11,6 +11,7 @@ const MAX_BUFFER_CHARS = 200_000;
 const buffers = new Map<string, string>();
 const writers = new Map<string, (data: string) => void>();
 const openSessions = new Set<string>();
+const owners = new Map<string, string | undefined>();
 let listening = false;
 
 /** One global `terminal://output` subscription; idempotent. */
@@ -18,7 +19,8 @@ export function ensureTerminalOutputListener(): void {
   if (listening) return;
   listening = true;
   void listenTerminalOutput((chunks) => {
-    for (const { id, data } of chunks) {
+    for (const { id, data, machine } of chunks) {
+      if (!owners.has(id) || owners.get(id) !== machine) continue;
       const next = (buffers.get(id) ?? "") + data;
       buffers.set(
         id,
@@ -39,6 +41,11 @@ export function clearTerminalSessionState(id: string): void {
   buffers.delete(id);
   writers.delete(id);
   openSessions.delete(id);
+  owners.delete(id);
+}
+
+export function registerTerminalOwner(id: string, machine?: string): void {
+  owners.set(id, machine);
 }
 
 /** Register the live xterm writer for a session; `null` unregisters. */

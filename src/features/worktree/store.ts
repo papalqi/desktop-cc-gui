@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { safeRandomUUID } from "@/lib/id";
 import {
   ipc,
+  ipcForMachine,
   type WorktreeRemoveResult,
   type WorktreeCreateArgs,
   type WorktreeCreateProgress,
@@ -10,10 +11,12 @@ import {
 } from "@/lib/ipc";
 import { listen } from "@/lib/transport";
 import { randomBranchSuffix, sanitizeDirName } from "./pr-input";
+import { machineResourceKey, machineResourceTarget } from "@/lib/web-machine";
 
 /** 进行中的创建阶段（后端 validate/fetch/add/register）之外，前端只关心
  *  「还在跑」；failed/canceled 是终态，行保留到用户关闭。 */
 export interface PendingCreation {
+  machine?: string;
   creationId: string;
   parentWorkspaceId: string;
   /** 父工作区路径（重试与「创建后开会话」用）。 */
@@ -94,7 +97,7 @@ interface WorktreeStore {
   /** git 判定目录已丢失的 worktree（prunable）；子行渲染「目录已丢失」态。 */
   missingPaths: Record<string, true>;
   /** 一次 worktree list 刷新同时更新锁定/丢失两集（同源数据，一次 set）。 */
-  setGitStates: (locked: Record<string, string>, missing: Record<string, true>) => void;
+  setGitStates: (locked: Record<string, string>, missing: Record<string, true>, machine?: string) => void;
   /** 后台直接删除：确认框即关，git worktree remove 在后台跑，成功后从
    *  侧栏移除登记；失败走 chat store 的 actionError 横幅。
    *  插件调用时传 silent + onResult：错误与非致命尾巴由调用方自己呈现
@@ -105,6 +108,7 @@ interface WorktreeStore {
     repoPath: string;
     branch: string | null;
     deleteBranch: boolean;
+    machine?: string;
     silent?: boolean;
     onResult?: (
       outcome: { ok: true; value: WorktreeRemoveResult } | { ok: false; error: unknown },
@@ -113,12 +117,12 @@ interface WorktreeStore {
   /** 创建完成后的后续动作（刷新工作区列表/开新会话）。对话框提交即返回，
    *  后续的 git 进度全靠事件驱动。返回本次创建的 creationId：进度事件、
    *  取消与终态都以它为准（插件 bridge 据此等待注册完成）。 */
-  start: (args: WorktreeCreateArgs, opts: { parentPath: string; openSessionAfter: boolean }) => string;
+  start: (args: WorktreeCreateArgs, opts: { parentPath: string; openSessionAfter: boolean; machine?: string }) => string;
   cancel: (creationId: string) => void;
   retry: (creationId: string) => void;
   dismiss: (creationId: string) => void;
   setPrefs: (patch: Partial<WorktreePrefs>) => void;
-  applyProgress: (progress: WorktreeCreateProgress) => void;
+  applyProgress: (progress: WorktreeCreateProgress, machine?: string) => void;
 }
 
 let eventsReady: Promise<unknown> | null = null;
@@ -127,7 +131,7 @@ let eventsReady: Promise<unknown> | null = null;
  *  都会触发，重复调用复用同一个 Promise。 */
 export function ensureWorktreeEvents(): void {
   eventsReady ??= listen<WorktreeCreateProgress>("worktree://create-progress", (e) => {
-    useWorktreeStore.getState().applyProgress(e.payload);
+    useWorktreeStore.getState().applyProgress(e.payload, e.machine);
   }).catch(() => undefined);
 }
 
@@ -139,7 +143,8 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
   const launch = (pending: PendingCreation) => {
     ensureWorktreeEvents();
     set((s) => ({ pending: [...s.pending, pending] }));
-    void ipc.gitWorktreeCreate(pending.creationId, pending.args).catch(() => {
+    const client = pending.machine ? ipcForMachine(pending.machine) : ipc;
+    void client.gitWorktreeCreate(pending.creationId, pending.args).catch(() => {
       // invoke 本身的失败（非 git 失败）也会以 failed 事件到达；什么都没
       // 到时兜底成行内失败，不留永远转圈的行。
       const current = get().pending.find((p) => p.creationId === pending.creationId);
@@ -174,8 +179,12 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
 
     lockedPaths: {},
     missingPaths: {},
-    setGitStates: (locked, missing) => {
+    setGitStates: (locked, missing, machine) => {
       const current = get();
+      locked = { ...Object.fromEntries(Object.entries(current.lockedPaths).filter(([key]) => machineResourceTarget(key).machine !== machine)),
+        ...Object.fromEntries(Object.entries(locked).map(([path, value]) => [machineResourceKey(path, machine), value])) };
+      missing = { ...Object.fromEntries(Object.entries(current.missingPaths).filter(([key]) => machineResourceTarget(key).machine !== machine)),
+        ...Object.fromEntries(Object.entries(missing).map(([path, value]) => [machineResourceKey(path, machine), value])) };
       const lockedSame =
         Object.keys(locked).length === Object.keys(current.lockedPaths).length &&
         Object.entries(locked).every(([k, v]) => current.lockedPaths[k] === v);
@@ -187,7 +196,7 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
       }
     },
 
-    remove: ({ workspaceId, worktreePath, repoPath, branch, deleteBranch, silent, onResult }) => {
+    remove: ({ workspaceId, worktreePath, repoPath, branch, deleteBranch, machine, silent, onResult }) => {
       void (async () => {
         const [{ useChatStore }, { useTerminalStore }, i18n] = await Promise.all([
           import("@/features/chat/store"),
@@ -195,8 +204,11 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
           import("@/lib/i18n"),
         ]);
         try {
-          const result = await ipc.gitWorktreeRemove(repoPath, worktreePath, branch, deleteBranch);
-          useTerminalStore.getState().removeWorkspace(worktreePath);
+          const owner = machine ?? useChatStore.getState().workspaces.find((workspace) => workspace.id === workspaceId)?.machine;
+          const client = owner ? ipcForMachine(owner) : ipc;
+          const result = await client.gitWorktreeRemove(repoPath, worktreePath, branch, deleteBranch);
+          if (owner) useTerminalStore.getState().removeWorkspace(worktreePath, owner);
+          else useTerminalStore.getState().removeWorkspace(worktreePath);
           await useChatStore.getState().removeWorkspace(workspaceId);
           // 非致命尾巴（目录没能删/分支保留原因）告知但不打断。
           const notes: string[] = [];
@@ -218,6 +230,7 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
     start: (args, opts) => {
       const creationId = newCreationId();
       launch({
+        ...(opts.machine ? { machine: opts.machine } : {}),
         creationId,
         parentWorkspaceId: args.parentWorkspaceId,
         parentPath: opts.parentPath,
@@ -230,7 +243,10 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
     },
 
     cancel: (creationId) => {
-      void ipc.gitWorktreeCreateCancel(creationId).catch(() => undefined);
+      const target = get().pending.find((row) => row.creationId === creationId);
+      if (!target) return;
+      const client = target.machine ? ipcForMachine(target.machine) : ipc;
+      void client.gitWorktreeCreateCancel(creationId).catch(() => undefined);
     },
 
     retry: (creationId) => {
@@ -255,9 +271,9 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
       }
     },
 
-    applyProgress: (progress) => {
+    applyProgress: (progress, machine) => {
       const target = get().pending.find((p) => p.creationId === progress.creationId);
-      if (!target) return;
+      if (!target || target.machine !== machine) return;
       if (progress.stage === "done") {
         set((s) => ({ pending: s.pending.filter((p) => p.creationId !== progress.creationId) }));
         // 注册已在后端落库：重读工作区让侧栏出现子行；按需在该 worktree
@@ -269,7 +285,8 @@ export const useWorktreeStore = create<WorktreeStore>((set, get) => {
             if (!target.openSessionAfter) return;
             void import("@/features/chat/center-surfaces").then((surfaces) => {
               surfaces.dismissCenterSurfaces();
-              chat.useChatStore.getState().startNewChat(target.args.worktreePath);
+              if (target.machine) chat.useChatStore.getState().startNewChat(target.args.worktreePath, target.machine);
+              else chat.useChatStore.getState().startNewChat(target.args.worktreePath);
             });
           });
         });

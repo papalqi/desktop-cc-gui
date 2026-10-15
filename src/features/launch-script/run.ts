@@ -1,4 +1,5 @@
-import { ipc } from "@/lib/ipc";
+import { ipc as defaultIpc, ipcForMachine } from "@/lib/ipc";
+import { machineResourceKey } from "@/lib/web-machine";
 import { readStoredJson, writeStored } from "@/lib/storage";
 import { useTerminalStore } from "@/features/terminal/store";
 import {
@@ -24,30 +25,32 @@ function readLaunchTabId(workspacePath: string): string | null {
 }
 
 /** Reuse the persisted launch tab when it still exists; otherwise create one. */
-function ensureLaunchTab(workspacePath: string): string {
+function ensureLaunchTab(workspacePath: string, machine?: string): string {
+  const key = machineResourceKey(workspacePath, machine);
   const store = useTerminalStore.getState();
-  const saved = readLaunchTabId(workspacePath);
+  const saved = readLaunchTabId(key);
   let id: string;
-  if (saved && (store.tabsByWorkspace[workspacePath] ?? []).some((tab) => tab.id === saved)) {
-    store.selectTab(workspacePath, saved);
+  if (saved && (store.tabsByWorkspace[key] ?? []).some((tab) => tab.id === saved)) {
+    store.selectTab(workspacePath, saved, machine);
     id = saved;
   } else {
     // newTab marks the created tab active, so it is recoverable right after.
-    store.newTab(workspacePath);
-    id = useTerminalStore.getState().activeByWorkspace[workspacePath];
-    writeStored(tabKeyFor(workspacePath), JSON.stringify(id));
+    store.newTab(workspacePath, machine);
+    id = useTerminalStore.getState().activeByWorkspace[key];
+    writeStored(tabKeyFor(key), JSON.stringify(id));
   }
   // The dock is the script's output surface; toggle only ever *opens* here.
   if (!useTerminalStore.getState().open) {
-    useTerminalStore.getState().toggle(workspacePath);
+    useTerminalStore.getState().toggle(workspacePath, machine);
   }
   return id;
 }
 
-export async function runLaunchScript(workspacePath: string, script: string): Promise<void> {
+export async function runLaunchScript(workspacePath: string, script: string, machine?: string): Promise<void> {
+  const ipc = machine ? ipcForMachine(machine) : defaultIpc;
   // Buffer output even when no terminal view has mounted yet this session.
   ensureTerminalOutputListener();
-  const id = ensureLaunchTab(workspacePath);
+  const id = ensureLaunchTab(workspacePath, machine);
   if (hasTerminalSession(id)) {
     markTerminalClosed(id);
     await ipc.terminalClose(id).catch(() => {});

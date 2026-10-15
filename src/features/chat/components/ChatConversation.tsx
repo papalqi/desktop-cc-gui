@@ -61,6 +61,7 @@ const SessionTimeline = memo(function SessionTimeline({
   return (
     <MessageTimeline
       key={key}
+      sessionKey={key}
       session={session}
       streaming={session.streaming}
       onLoadEarlier={onLoadEarlier}
@@ -267,9 +268,12 @@ function useConversationMenus({
  * high-frequency session/draft subscriptions live here so streaming deltas
  * (one store write per animation frame) re-render only this subtree — never
  * the sidebar, tab strip, or side panel. */
+const EMPTY_ENGINES: EngineInfo[] = [];
+const EMPTY_PROVIDERS: Record<string, string> = {};
+
 export const ChatConversation = memo(function ChatConversation({
   active,
-  engines,
+  engines: fallbackEngines,
   workspaces,
   startNewChat,
   composerInputRef,
@@ -277,16 +281,17 @@ export const ChatConversation = memo(function ChatConversation({
   active: ActiveSession | null;
   engines: EngineInfo[];
   workspaces: Workspace[];
-  startNewChat: (workspacePath: string) => void;
+  startNewChat: (workspacePath: string, machine?: string) => void;
   composerInputRef: React.RefObject<ComposerInputHandle | null>;
 }) {
   const { t, i18n } = useTranslation();
+  const engines = useChatStore((s) => active?.machine ? s.enginesByMachine[active.machine] ?? EMPTY_ENGINES : fallbackEngines);
   const conversationMode = useConversationMode(active);
   // 互斥:计划等待中且 run 活跃时不得切入插件会话模式(会搁置原生等待点);
   // 插件模式激活时整个普通会话区(含计划 dock)本就不挂载。
   const planReviewGate = usePlanReviewGateActive();
   const key = active
-    ? sessionKey(active.engine, active.sessionId, active.workspacePath)
+    ? sessionKey(active.engine, active.sessionId, active.workspacePath, active.machine)
     : "";
   // Key-scoped, LOW-frequency slices only: streaming flips at turn start/end,
   // queue/error/usage change on discrete actions. The per-flush messages
@@ -309,16 +314,21 @@ export const ChatConversation = memo(function ChatConversation({
   const draft = useChatStore((s) => s.drafts[key] ?? "");
   const sendShortcut = useChatStore((s) => s.sendShortcut);
   // Engine/effort/model prefs: low-frequency, grouped into one shallow watch.
-  const { activeEngine, efforts, models, providers, ompServiceTier, codexServiceTier } = useChatStore(
+  const { activeEngine: preferredEngine, efforts, models, providers, ompServiceTier, codexServiceTier } = useChatStore(
     useShallow((s) => ({
       activeEngine: s.activeEngine,
       efforts: s.efforts,
-      ompServiceTier: s.ompServiceTier,
-      codexServiceTier: s.codexServiceTier,
+      ompServiceTier: active?.machine ? s.serviceTiersByMachine[active.machine]?.omp ?? null : s.ompServiceTier,
+      codexServiceTier: active?.machine ? s.serviceTiersByMachine[active.machine]?.codex ?? null : s.codexServiceTier,
       models: s.models,
-      providers: s.providers,
+      providers: active?.machine ? s.providersByMachine[active.machine] ?? EMPTY_PROVIDERS : s.providers,
     })),
   );
+  const activeEngine = active?.engine ?? preferredEngine;
+  const refreshMachineRuntime = useChatStore((s) => s.refreshMachineRuntime);
+  useEffect(() => {
+    if (active?.machine) void refreshMachineRuntime(active.machine);
+  }, [active?.machine, refreshMachineRuntime]);
   const {
     setActiveEngine,
     setEffort,
@@ -371,7 +381,7 @@ export const ChatConversation = memo(function ChatConversation({
     pasteImages,
     importImageFiles,
     dismissImageError,
-  } = useComposerImages();
+  } = useComposerImages(active?.machine);
 
   const { displayModels, displayEfforts, displayProviders } = useTabModelDisplay({
     active,
@@ -388,7 +398,7 @@ export const ChatConversation = memo(function ChatConversation({
     channelsByEngine,
     refresh: refreshModels,
     pendingEngines,
-  } = useEngineModels(engines, models, pinModels, displayProviders, active?.workspacePath);
+  } = useEngineModels(engines, models, pinModels, displayProviders, active?.workspacePath, active?.machine);
   const loadingEngines = useMemo(
     () => Object.keys(pendingEngines),
     [pendingEngines],

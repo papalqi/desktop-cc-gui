@@ -5,12 +5,18 @@ export interface AiChatThread {
   label: string;
   /** CLI engine id — brand mark rendered left of the label. */
   engine?: string;
+  origin?: "hub" | "local";
+  updatedAt?: number;
+  description?: string;
+  metadataSyncPending?: boolean;
+  metadataSyncError?: string | null;
   /** Relative-time chip (e.g. "34m"). */
   time: string;
   isSelected?: boolean;
   pinned?: boolean;
   /** A turn is streaming in this session — breathing blue dot unless retrying. */
   streaming?: boolean;
+  activity?: "running" | "awaiting-approval" | "awaiting-input";
   /** Provider backoff is active; keep the running dot visible but static. */
   retrying?: boolean;
   unseen?: boolean;
@@ -19,6 +25,7 @@ export interface AiChatThread {
 }
 
 export interface AiChatRepo {
+  machine?: string;
   id?: string;
   /** Workspace path — the git store's status cache is keyed by it (worktree
    *  child rows read dirty counts through this). */
@@ -57,4 +64,6 @@ export interface AiChatRepoSection {
   id: string | null;
   name: string;
   repos: AiChatRepo[];
+  readOnly?: boolean;
+  notice?: string;
 }

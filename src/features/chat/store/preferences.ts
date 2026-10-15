@@ -1,4 +1,4 @@
-import { ipc } from "@/lib/ipc";
+import { ipc, ipcForMachine } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
 import { writeStored } from "@/lib/storage";
 import {
@@ -47,21 +47,30 @@ export function createPreferenceActions(
       set({ permission });
     },
     setOmpServiceTier: async (tier) => {
-      const settings = await ipc.getAppSettings();
-      await ipc.updateAppSettings({ ...settings, ompOpenaiServiceTier: tier });
-      set({ ompServiceTier: tier });
+      const machine = get().active?.machine;
+      const client = machine ? ipcForMachine(machine) : ipc;
+      const settings = await client.getAppSettings();
+      await client.updateAppSettings({ ...settings, ompOpenaiServiceTier: tier });
+      if (machine) set((state) => ({ serviceTiersByMachine: { ...state.serviceTiersByMachine,
+        [machine]: { omp: tier, codex: state.serviceTiersByMachine[machine]?.codex ?? null } } }));
+      else set({ ompServiceTier: tier });
     },
     setCodexServiceTier: async (tier) => {
-      const settings = await ipc.getAppSettings();
-      await ipc.updateAppSettings({ ...settings, codexServiceTier: tier });
-      set({ codexServiceTier: tier });
+      const machine = get().active?.machine;
+      const client = machine ? ipcForMachine(machine) : ipc;
+      const settings = await client.getAppSettings();
+      await client.updateAppSettings({ ...settings, codexServiceTier: tier });
+      if (machine) set((state) => ({ serviceTiersByMachine: { ...state.serviceTiersByMachine,
+        [machine]: { omp: state.serviceTiersByMachine[machine]?.omp ?? null, codex: tier } } }));
+      else set({ codexServiceTier: tier });
     },
     setEffort: async (engine, effort) => {
       const active = get().active;
       if (active?.engine === engine && active.sessionId) {
-        const key = sessionKey(engine, active.sessionId, active.workspacePath);
+        const key = sessionKey(engine, active.sessionId, active.workspacePath, active.machine);
         patchSession(set, key, { activeEffort: effort });
-        void ipc.rememberSessionEffort(engine, active.sessionId, effort).catch(() => {});
+        const client = active.machine ? ipcForMachine(active.machine) : ipc;
+        void client.rememberSessionEffort(engine, active.sessionId, effort).catch(() => {});
         return;
       }
       set({ efforts: { ...get().efforts, [engine]: effort } });
@@ -89,7 +98,7 @@ export function createPreferenceActions(
           return { defaultModels };
         });
       }
-      if (active?.engine === engine) {
+      if (get().active === active && active?.engine === engine) {
         // Empty = "CLI default": clear the tab override so the session falls
         // back to its own history/model default again.
         stampActiveTab({ model: model || undefined });
@@ -97,15 +106,19 @@ export function createPreferenceActions(
     },
     setProvider: async (engine, providerId) => {
       const active = get().active;
+      const client = active?.machine ? ipcForMachine(active.machine) : ipc;
       try {
         if (active?.engine === engine && active.sessionId) {
-          await ipc.rememberSessionProvider(engine, active.sessionId, providerId);
-          const key = sessionKey(engine, active.sessionId, active.workspacePath);
+          await client.rememberSessionProvider(engine, active.sessionId, providerId);
+          const key = sessionKey(engine, active.sessionId, active.workspacePath, active.machine);
           patchSession(set, key, { activeProvider: providerId });
           if (get().active === active) stampActiveTab({ provider: undefined });
         } else {
-          await ipc.setCurrentProvider(engine, providerId);
-          set({ providers: { ...get().providers, [engine]: providerId } });
+          await client.setCurrentProvider(engine, providerId);
+          if (active?.machine) {
+            const machine = active.machine;
+            set((state) => ({ providersByMachine:{ ...state.providersByMachine,[machine]:{ ...state.providersByMachine[machine],[engine]:providerId } } }));
+          } else set({ providers: { ...get().providers, [engine]: providerId } });
           if (get().active === active && active?.engine === engine) {
             stampActiveTab({ provider: providerId || undefined });
           }

@@ -4,7 +4,7 @@ import type { Extension } from "@codemirror/state";
 import { LanguageDescription } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { useTranslation } from "react-i18next";
-import { ipc, type FileContent } from "@/lib/ipc";
+import { ipc, ipcForMachine, type FileContent } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
 import { Button } from "@/components/base/buttons/button";
 import { useActionFeedback } from "@/components/base/action-feedback";
@@ -63,17 +63,17 @@ export function EditorPane({ path }: { path: string }) {
     return <CenteredSpinner />;
   }
   // key remounts the editor with a fresh draft whenever the file (re)loads.
-  return <FileEditor key={`${path}:${entry.loadNonce}`} path={path} content={entry.content} />;
+  return <FileEditor key={`${path}:${entry.loadNonce}`} path={path} filePath={entry.path} machine={entry.machine} content={entry.content} />;
 }
 
-function FileEditor({ path, content }: { path: string; content: FileContent }) {
+function FileEditor({ path, filePath, machine, content }: { path: string; filePath: string; machine?: string; content: FileContent }) {
   const setFileDirty = useFilesStore((s) => s.setFileDirty);
   // Inactive (invisible) editors stay mounted; only the visible tab may
   // answer Cmd/Ctrl+S, or every open file would save at once.
   const isActiveTab = useFilesStore((s) => s.activeFilePath === path);
   const dark = useIsDark();
 
-  const name = fileName(path);
+  const name = fileName(filePath);
   const isMarkdown = isMarkdownFile(name);
   const isHtml = isHtmlFile(name);
   // HTML opens rendered too, but only where the asset protocol serves real
@@ -136,14 +136,14 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
     setSaving(true);
     setSaveError(null);
     try {
-      await ipc.writeFile(path, draft);
+      await (machine ? ipcForMachine(machine) : ipc).writeFile(filePath, draft);
       setSavedText(draft);
     } catch (e) {
       setSaveError(errorText(e));
     } finally {
       setSaving(false);
     }
-  }, [path, draft]);
+  }, [filePath, machine, draft]);
 
   // Cmd/Ctrl+S saves from anywhere while this editor is mounted. The listener
   // subscribes once; refs keep it reading the latest save/dirty/saving so it
@@ -181,7 +181,7 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <FileEditorHeader
-        path={path}
+        path={filePath}
         name={name}
         dirty={dirty}
         readOnly={readOnly}
@@ -205,7 +205,8 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
       {canPreview && viewMode === "preview" ? (
         isMarkdown ? (
           <MarkdownPreview
-            path={path}
+            path={filePath}
+            machine={machine}
             draft={draft}
             active={isActiveTab}
             searchOpen={previewSearchOpen}
@@ -214,7 +215,7 @@ function FileEditor({ path, content }: { path: string; content: FileContent }) {
           />
         ) : (
           <HtmlPreview
-            path={path}
+            path={filePath}
             name={name}
             reloadKey={previewReloadKey}
             active={isActiveTab}

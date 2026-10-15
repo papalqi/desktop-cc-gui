@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /** The transport is the only backend edge this module has. */
-const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
+const { invoke, connection } = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  connection: { web: false, generation: 0 },
+}));
 vi.mock("./transport", () => ({
   invoke: (...args: unknown[]) => invoke(...args),
   listen: vi.fn(async () => () => {}),
-  isWeb: false,
+  get isWeb() { return connection.web; },
+  webBridgeGeneration: () => connection.generation,
   webToken: null,
   serverVersion: async () => null,
 }));
@@ -18,6 +22,8 @@ const settings = (over: Record<string, unknown>) =>
 let ipc: (typeof import("./ipc"))["ipc"];
 beforeEach(async () => {
   invoke.mockReset();
+  connection.web = false;
+  connection.generation = 0;
   vi.resetModules();
   ({ ipc } = await import("./ipc"));
 });
@@ -60,6 +66,47 @@ describe("app settings cache", () => {
       "update_app_settings",
       "get_app_settings",
     ]);
+  });
+
+  it("reads the selected desktop's settings after a connection switch", async () => {
+    connection.web = true;
+    invoke.mockResolvedValueOnce(settings({ webRelayUrl: "http://relay/m/MC2" }));
+    await ipc.getAppSettings();
+    connection.generation += 1;
+    invoke.mockResolvedValueOnce(settings({ webRelayUrl: "http://relay/m/PC0" }));
+    const next = await ipc.getAppSettings();
+    expect(next.webRelayUrl).toBe("http://relay/m/PC0");
+    await ipc.updateAppSettings({ ...next, theme: "light" });
+    expect(invoke).toHaveBeenLastCalledWith("update_app_settings", {
+      settings: expect.objectContaining({ webRelayUrl: "http://relay/m/PC0", theme: "light" }),
+    });
+  });
+
+  it("rejects a settings form read from the previous desktop", async () => {
+    connection.web = true;
+    invoke.mockResolvedValueOnce(settings({ webRelayUrl: "http://relay/m/MC2" }));
+    const previous = await ipc.getAppSettings();
+    connection.generation += 1;
+    await expect(ipc.updateAppSettings({ ...previous, theme: "light" })).rejects.toThrow(
+      "web bridge disconnected",
+    );
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("discards a late old read without evicting the new desktop's cache", async () => {
+    connection.web = true;
+    const old = Promise.withResolvers<never>();
+    invoke.mockReturnValueOnce(old.promise);
+    const previous = ipc.getAppSettings();
+    const rejected = expect(previous).rejects.toThrow("web bridge disconnected");
+    connection.generation += 1;
+    invoke.mockResolvedValueOnce(settings({ webRelayUrl: "http://relay/m/PC0" }));
+    const nextRead = ipc.getAppSettings();
+    old.resolve(settings({ webRelayUrl: "http://relay/m/MC2" }));
+    const next = await nextRead;
+    await rejected;
+    expect(await ipc.getAppSettings()).toBe(next);
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 });
 

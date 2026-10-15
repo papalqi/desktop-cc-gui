@@ -8,8 +8,16 @@ import { useBotStore } from "@/features/bots/bot-store";
 import type { BotConfig, Message } from "@/lib/ipc";
 import { EMPTY_SESSION, type SessionState } from "../store/stream";
 import i18n from "@/lib/i18n";
+import { performanceRecorder } from "@/lib/performance-diagnostics";
 
 const searchHarness = vi.hoisted(() => ({ handlers: new Map<string, () => void>(), scrollToIndex: vi.fn() }));
+
+// Timeline rendering tests do not need a live desktop connection.
+vi.mock("@/lib/transport", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/transport")>()),
+  invoke: vi.fn(async () => null),
+  listen: vi.fn(async () => () => {}),
+}));
 
 vi.mock("@/features/shortcuts/runtime", () => ({
   registerShortcutHandler: (name: string, handler: () => void) => {
@@ -71,6 +79,26 @@ describe("timeline search within bounded process history", () => {
     });
   }
 
+  it("shows a recovered run's elapsed time and does not start a timer without an origin", async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const renderRun = (turnStartedAt: number | null) => act(async () => {
+        root.render(
+          <MessageTimeline session={{ ...EMPTY_SESSION, streaming: true, turnStartedAt }}
+            streaming onLoadEarlier={() => {}} workspacePath="/ws" />,
+        );
+      });
+      await renderRun(null);
+      expect(container.textContent).toContain(i18n.t("chat.thinking"));
+      expect(container.textContent).not.toContain("耗时");
+      await renderRun(now - 120_000);
+      expect(container.textContent).toContain(i18n.t("chat.metaDuration", { duration: "2m0s" }));
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   async function click(label: string) {
     const button = [...container.querySelectorAll<HTMLButtonElement>("button")].find((element) => element.getAttribute("aria-label") === label || element.textContent === label);
     expect(button, label).toBeTruthy();
@@ -86,9 +114,51 @@ describe("timeline search within bounded process history", () => {
     });
   }
 
+  it.each([
+    ["tool", false],
+    ["tool", true],
+    ["thinking", false],
+    ["thinking", true],
+  ] as const)("defaults %s processes to collapsed when streaming is %s", async (role, streaming) => {
+    const text = "过程内容 中文🙂";
+    const messages: Message[] = [{ seq: 1, role, text, ts: null, live: streaming }];
+    await act(async () => {
+      root.render(<MessageTimeline session={{ ...EMPTY_SESSION, messages, streaming }} streaming={streaming} onLoadEarlier={() => {}} workspacePath="/ws" />);
+    });
+    const header = container.querySelector<HTMLButtonElement>("button[aria-expanded]")!;
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+    await act(async () => header.click());
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    expect(container.textContent).toContain(text);
+  });
+
+  it("keeps arriving thinking and tools collapsed and preserves manual toggles", async () => {
+    const tool: Message = { seq: 1, role: "tool", text: "Read", ts: null };
+    const thinking: Message = { seq: 2, role: "thinking", text: "正在分析 中文🙂", ts: null, live: true };
+    const renderRun = (messages: Message[], streaming = true) => act(async () => {
+      root.render(<MessageTimeline session={{ ...EMPTY_SESSION, messages, streaming }} streaming={streaming} onLoadEarlier={() => {}} workspacePath="/ws" />);
+    });
+    const header = () => container.querySelector<HTMLButtonElement>("button[aria-expanded]")!;
+    await renderRun([tool]);
+    expect(header().getAttribute("aria-expanded")).toBe("false");
+    await renderRun([tool, thinking]);
+    expect(header().getAttribute("aria-expanded")).toBe("false");
+    await act(async () => header().click());
+    const nextTool: Message = { seq: 3, role: "tool", text: "Grep", ts: null };
+    await renderRun([tool, { ...thinking, live: false }, nextTool]);
+    expect(header().getAttribute("aria-expanded")).toBe("true");
+    await act(async () => header().click());
+    await renderRun([tool, { ...thinking, live: false }, nextTool, { ...thinking, seq: 4 }]);
+    expect(header().getAttribute("aria-expanded")).toBe("false");
+    await renderRun([tool, { ...thinking, live: false }, nextTool, { ...thinking, seq: 4, live: false }], false);
+    expect(header().getAttribute("aria-expanded")).toBe("false");
+  });
+
   it("opens a manually collapsed group and navigates matches across its pages", async () => {
     await renderTimeline();
     await click("工具调用 500 次");
+    await click("工具调用 500 次");
+    expect(container.querySelector("button[aria-expanded]")!.getAttribute("aria-expanded")).toBe("false");
     await search("目标🙂");
     expect(container.querySelector("button[aria-expanded]")!.getAttribute("aria-expanded")).toBe("true");
     expect(container.textContent).toContain("工具 0 目标🙂");
@@ -556,5 +626,53 @@ describe("host compaction rows", () => {
     await renderCompacting(messages, null, true);
     expect(curtains().length).toBe(0);
     expect(container.textContent).toContain(i18n.t("chat.thinking"));
+  });
+});
+
+describe("timeline diagnostic paint timing", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  let hidden: boolean;
+  let frames: Map<number, FrameRequestCallback>;
+  let nextFrame: number;
+  beforeEach(() => {
+    hidden = false; frames = new Map(); nextFrame = 0;
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation((callback) => {
+      const id = ++nextFrame; frames.set(id, callback); return id;
+    });
+    vi.spyOn(globalThis, "cancelAnimationFrame").mockImplementation((id) => { frames.delete(id); });
+    performanceRecorder.setEnabled(false); performanceRecorder.setEnabled(true);
+    container = document.createElement("div"); document.body.appendChild(container);
+    root = createRoot(container);
+  });
+  afterEach(() => {
+    act(() => root.unmount()); container.remove(); vi.restoreAllMocks();
+    performanceRecorder.setEnabled(false); performanceRecorder.setEnabled(true);
+  });
+  const mount = () => act(() => root.render(<MessageTimeline sessionKey="codex/fixture" session={{ ...EMPTY_SESSION }}
+    streaming={false} workspacePath="" onLoadEarlier={() => {}} />));
+  const frame = () => act(() => {
+    const callbacks = [...frames.values()]; frames.clear(); callbacks.forEach((callback) => callback(performance.now()));
+  });
+
+  it("records paint timing only after two visible animation frames", () => {
+    mount(); frame();
+    expect(performanceRecorder.snapshot().transitions.some((e) => e.phase === "timeline-paint")).toBe(false);
+    frame();
+    expect(performanceRecorder.snapshot().transitions.filter((e) => e.phase === "timeline-paint")).toHaveLength(1);
+  });
+
+  it("cancels a pending measurement on hide instead of reporting suspended time as rendering", () => {
+    mount(); frame(); hidden = true;
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    hidden = false; frame();
+    expect(performanceRecorder.snapshot().transitions.some((e) => e.phase === "timeline-paint")).toBe(false);
+  });
+
+  it("does not arm a paint measurement for a timeline mounted in the background", () => {
+    hidden = true; mount(); hidden = false; frame(); frame();
+    expect(performanceRecorder.snapshot().transitions.find((e) => e.phase === "timeline-commit")?.hidden).toBe(1);
+    expect(performanceRecorder.snapshot().transitions.some((e) => e.phase === "timeline-paint")).toBe(false);
   });
 });

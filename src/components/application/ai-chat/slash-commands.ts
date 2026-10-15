@@ -1,4 +1,5 @@
-import { ipc, type SlashCommandEntry } from "@/lib/ipc";
+import { ipc, ipcForMachine, type SlashCommandEntry } from "@/lib/ipc";
+import { machineResourceTarget } from "@/lib/web-machine";
 import {
   createRootCacheStore,
   type RootCache,
@@ -53,7 +54,10 @@ const COMMANDS_TTL_MS = 60_000;
 
 const { useStore: useSlashCommandStore, prune: pruneSlashCommands, invalidate: invalidateSlashCommandCatalog } =
   createRootCacheStore<SlashCommandEntry>({
-    fetch: (root) => ipc.listSlashCommands(root),
+    fetch: (root) => {
+      const target = machineResourceTarget(root);
+      return (target.machine ? ipcForMachine(target.machine) : ipc).listSlashCommands(target.path);
+    },
     ttlMs: COMMANDS_TTL_MS,
   });
 

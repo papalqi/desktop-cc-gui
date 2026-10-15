@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type MouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { copyText } from "@/lib/clipboard";
-import { ipc } from "@/lib/ipc";
+import { ipc as defaultIpc, ipcForMachine } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
 import { joinPath, parentPath, useFilesStore, type TreeClipboard } from "./store";
 import type { FileTreeMenuState } from "./FileTreeContextMenu";
@@ -53,6 +53,9 @@ export interface FileTreeOperations {
 export function useFileTreeOperations(): FileTreeOperations {
   const { t } = useTranslation();
   const root = useFilesStore((s) => s.root);
+  const machine = useFilesStore((s) => s.machine);
+  const ipc = machine ? ipcForMachine(machine) : defaultIpc;
+  const treeCurrent = useCallback(() => useFilesStore.getState().machine === machine && useFilesStore.getState().root === root, [machine, root]);
   const clipboard = useFilesStore((s) => s.clipboard);
   const toggleDir = useFilesStore((s) => s.toggleDir);
   const invalidateDir = useFilesStore((s) => s.invalidateDir);
@@ -87,13 +90,14 @@ export function useFileTreeOperations(): FileTreeOperations {
    *  select the operation result so the user sees what changed. */
   const revealInTree = useCallback(
     async (dir: string, target: string | null, isDir: boolean) => {
+      if (!treeCurrent()) return;
       if (dir && dir !== root && !useFilesStore.getState().expanded[dir]) {
         await toggleDir(dir);
       }
       await invalidateDir(dir);
-      if (target) selectPath(target, isDir);
+      if (target && treeCurrent()) selectPath(target, isDir);
     },
-    [root, toggleDir, invalidateDir, selectPath],
+    [root, toggleDir, invalidateDir, selectPath, treeCurrent],
   );
 
   const closeMenu = useCallback(() => setMenu(null), []);
@@ -113,9 +117,10 @@ export function useFileTreeOperations(): FileTreeOperations {
           const to = joinPath(parent, name);
           if (to !== p.path) {
             await ipc.renameItem(p.path, to);
+            if (!treeCurrent()) return;
             useFilesStore.getState().remapTreePath(p.path, to);
             await invalidateDir(parent);
-            selectPath(to, p.isDir);
+            if (treeCurrent()) selectPath(to, p.isDir);
           }
           return;
         }
@@ -131,7 +136,7 @@ export function useFileTreeOperations(): FileTreeOperations {
         opFailed(e);
       }
     },
-    [prompt, t, invalidateDir, selectPath, revealInTree, opFailed],
+    [prompt, t, invalidateDir, selectPath, revealInTree, opFailed, ipc, treeCurrent],
   );
 
   const confirmTrash = useCallback(async () => {
@@ -140,12 +145,13 @@ export function useFileTreeOperations(): FileTreeOperations {
     if (!target) return;
     try {
       await ipc.trashItem(target.path);
+      if (!treeCurrent()) return;
       useFilesStore.getState().removeTreePath(target.path);
       await invalidateDir(parentPath(target.path));
     } catch (e) {
       opFailed(e);
     }
-  }, [trashTarget, invalidateDir, opFailed]);
+  }, [trashTarget, invalidateDir, opFailed, ipc, treeCurrent]);
 
   const handlePaste = useCallback(
     async (targetDir: string) => {
@@ -161,7 +167,7 @@ export function useFileTreeOperations(): FileTreeOperations {
         opFailed(e);
       }
     },
-    [t, revealInTree, opFailed],
+    [t, revealInTree, opFailed, ipc],
   );
 
   const handleDuplicate = useCallback(async () => {
@@ -172,7 +178,7 @@ export function useFileTreeOperations(): FileTreeOperations {
     } catch (e) {
       opFailed(e);
     }
-  }, [menu, revealInTree, opFailed]);
+  }, [menu, revealInTree, opFailed, ipc]);
 
   const copyItem = useCallback(() => {
     if (!menu) return;
@@ -194,7 +200,7 @@ export function useFileTreeOperations(): FileTreeOperations {
   const revealInFileManager = useCallback(() => {
     if (!menu) return;
     void ipc.revealInFileManager(menu.path).catch(opFailed);
-  }, [menu, opFailed]);
+  }, [menu, opFailed, ipc]);
 
   return {
     clipboard,

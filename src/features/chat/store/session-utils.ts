@@ -1,4 +1,5 @@
 import type {
+  ActiveRun,
   EngineInfo,
   Message,
   SessionMeta,
@@ -7,6 +8,18 @@ import type {
 import { EMPTY_SESSION, type SessionState } from "./stream";
 import { sessionKey } from "./persistence";
 import type { ChatStore } from "./types";
+import { webMultiMachine } from "@/lib/web-machine";
+
+export function runTimestamp(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** Older hosts only expose the prompt timestamp in the transcript. Match
+ * the history reader's duration origin; never substitute the time of a click. */
+export function historyTurnStartedAt(messages: readonly Message[]): number | null {
+  const prompt = messages.findLast((message) => message.role === "user");
+  return prompt?.ts ? runTimestamp(Date.parse(prompt.ts)) : null;
+}
 
 /** Sidebar workspace groups (工作区二级分类), ordered by sortOrder then name. */
 export function sortedWorkspaceGroups(
@@ -20,6 +33,45 @@ export function sortedWorkspaceGroups(
   });
 }
 
+/** Keep a live turn visible before the history scan has indexed its file.
+ *  The CLI announces a session id first and flushes the transcript later,
+ *  often on the first reply. A reload in between used to drop the row. */
+export function sessionsHeldByLiveRuns(
+  sessions: SessionMeta[],
+  runs: readonly ActiveRun[],
+  current: readonly SessionMeta[] = [],
+): SessionMeta[] {
+  const extra: SessionMeta[] = [];
+  for (const run of runs) {
+    const sessionId = run.sessionId?.trim();
+    if (!run.runId || !run.engine || !sessionId || !run.workspacePath) continue;
+    const known =
+      sessions.some((s) => s.engine === run.engine && s.sessionId === sessionId && s.machine === run.machine) ||
+      extra.some((s) => s.engine === run.engine && s.sessionId === sessionId && s.machine === run.machine);
+    if (known) continue;
+    const existing = current.find((s) => s.engine === run.engine && s.sessionId === sessionId && s.machine === run.machine);
+    if (existing) { extra.push(existing); continue; }
+    const now = runTimestamp(run.startedAt) ?? Date.now();
+    extra.push({
+      ...(run.machine ? { machine:run.machine } : {}),
+      engine: run.engine,
+      sessionId,
+      workspacePath: run.workspacePath,
+      filePath: "",
+      fileSize: 0,
+      fileMtimeMs: 0,
+      title: "",
+      preview: "",
+      createdAt: now,
+      updatedAt: now,
+      messageCount: 0,
+      pinned: false,
+      customTitle: null,
+    });
+  }
+  return extra.length === 0 ? sessions : [...extra, ...sessions];
+}
+
 /** History lists hide sessions of CLIs the user disabled in settings. An
  * empty engines list means listEngines failed — keep sessions rather than
  * blanking the sidebar. */
@@ -27,7 +79,7 @@ export function visibleSessions(
   sessions: SessionMeta[],
   engines: EngineInfo[],
 ): SessionMeta[] {
-  if (engines.length === 0) return sessions;
+  if (engines.length === 0 || webMultiMachine()) return sessions;
   const enabled = new Set<string>();
   for (const e of engines) {
     if (e.enabled) enabled.add(e.id);
@@ -46,12 +98,12 @@ export function mergeExternalSessions(
   if (external.length === 0) return local;
   const known = new Set(workspacePaths);
   const seen = new Set(
-    local.map((s) => sessionKey(s.engine, s.sessionId, s.workspacePath)),
+    local.map((s) => sessionKey(s.engine, s.sessionId, s.workspacePath, s.machine)),
   );
   const extra = external.filter(
     (e) =>
       known.has(e.workspacePath) &&
-      !seen.has(sessionKey(e.engine, e.sessionId, e.workspacePath)),
+      !seen.has(sessionKey(e.engine, e.sessionId, e.workspacePath, e.machine)),
   );
   return extra.length === 0 ? local : [...local, ...extra];
 }
@@ -74,10 +126,10 @@ export function preserveUnscannedSessions(
 ): SessionMeta[] {
   if (current.length === 0) return refreshed;
   const scanned = new Set(
-    refreshed.map((s) => sessionKey(s.engine, s.sessionId, s.workspacePath)),
+    refreshed.map((s) => sessionKey(s.engine, s.sessionId, s.workspacePath, s.machine)),
   );
   const missing = current.filter((s) => {
-    const key = sessionKey(s.engine, s.sessionId, s.workspacePath);
+    const key = sessionKey(s.engine, s.sessionId, s.workspacePath, s.machine);
     return !scanned.has(key) && bySession[key];
   });
   return missing.length === 0 ? refreshed : [...refreshed, ...missing];

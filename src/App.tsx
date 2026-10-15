@@ -7,6 +7,7 @@ import PluginPageHost from "@/features/plugins/manager/PluginPageHost";
 import { PluginOverlayHost } from "@/features/plugins/runtime/overlay-host";
 import { bindSystemThemeSync, bindThemeChangePersistence } from "@/features/settings/theme";
 import { UpdateToast } from "@/features/update/UpdateToast";
+import { RelayUpdateNotice } from "@/features/update/RelayUpdateNotice";
 import { useUpdateStore } from "@/features/update/store";
 import { announceReleaseAfterUpgrade } from "@/features/update/upgrade-announcement";
 import { GrantAccessDialogHost } from "@/components/dialogs";
@@ -133,6 +134,7 @@ function MainApp() {
         <PluginOverlayHost />
       </HashRouter>
       <UpdateToast />
+      <RelayUpdateNotice />
       <GrantAccessDialogHost />
       <CloseConfirmDialogHost />
       <ShortcutsGuideModal />

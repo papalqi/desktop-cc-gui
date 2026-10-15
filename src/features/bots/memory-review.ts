@@ -12,7 +12,7 @@
  * 上下文时就筛掉，渠道缺失由后端返回 skipped 原因（界面就地说明）。
  */
 
-import { ipc, type BotConfig, type MemoryReviewOutcome, type Message } from "@/lib/ipc";
+import { ipc, ipcForMachine, type BotConfig, type MemoryReviewOutcome, type Message } from "@/lib/ipc";
 import { stripAgentBlock } from "@/features/chat/components/agent-block";
 import { useMemoryStore } from "./memory";
 
@@ -20,6 +20,7 @@ import { useMemoryStore } from "./memory";
 export interface ReviewContext {
   /** 会话 key（`engine/sessionId` 或 draft key），只用于本模块去重。 */
   key: string;
+  machine?: string;
   botId: string;
   engine: string;
   providerId: string | null;
@@ -97,7 +98,7 @@ async function runReview(ctx: ReviewContext, turns: number) {
   }
   inFlight.add(ctx.key);
   try {
-    const outcome = await ipc.memoryReview({
+    const outcome = await (ctx.machine ? ipcForMachine(ctx.machine) : ipc).memoryReview({
       botId: ctx.botId,
       engine: ctx.engine,
       providerId: ctx.providerId,

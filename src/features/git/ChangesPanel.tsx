@@ -10,6 +10,7 @@ import { ConfirmDialog } from "@/components/dialogs";
 import { Checkbox } from "@/components/base/checkbox/checkbox";
 import { type GitFileEntry, type GitStatus } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
+import { machineResourceKey } from "@/lib/web-machine";
 import { cx } from "@/utils/cx";
 import { useFilesStore } from "@/features/files/store";
 import { resolveWorkspaceRepository } from "@/features/files/repositorySelection";
@@ -39,6 +40,7 @@ function useVisibleGitValue<Value>(
 }
 
 const VIEW_MODE_KEY = "ccgui-next.git.viewMode";
+const EMPTY_REPOSITORIES = {};
 
 /** Persisted flat/tree preference. The read lives in the lazy initializer, so
  *  a disabled localStorage only costs one fallback on first mount. */
@@ -139,6 +141,7 @@ function useChangesActions(
   gitWorkspacePath: string,
   status: GitStatus | undefined,
   selection: ReturnType<typeof useChangesSelection>,
+  machine?: string,
 ) {
   const { selectedFiles, setSelectedFiles } = selection;
   const [actionError, setActionError] = useState<string | null>(null);
@@ -174,8 +177,8 @@ function useChangesActions(
    *  last refresh failure. */
   const dismissError = useCallback(() => {
     setActionError(null);
-    useGitStore.getState().clearError(gitWorkspacePath);
-  }, [gitWorkspacePath]);
+    useGitStore.getState().clearError(gitWorkspacePath, machine);
+  }, [gitWorkspacePath, machine]);
 
   const stage = useCallback(
     (files: string[]) => {
@@ -184,9 +187,9 @@ function useChangesActions(
         for (const f of files) next.add(f);
         return next;
       });
-      run("stage", () => useGitStore.getState().stage(gitWorkspacePath, files));
+      run("stage", () => useGitStore.getState().stage(gitWorkspacePath, files, machine));
     },
-    [run, gitWorkspacePath, setSelectedFiles],
+    [run, gitWorkspacePath, machine, setSelectedFiles],
   );
 
   const unstage = useCallback(
@@ -196,9 +199,9 @@ function useChangesActions(
         for (const f of files) next.delete(f);
         return next;
       });
-      run("unstage", () => useGitStore.getState().unstage(gitWorkspacePath, files));
+      run("unstage", () => useGitStore.getState().unstage(gitWorkspacePath, files, machine));
     },
-    [run, gitWorkspacePath, setSelectedFiles],
+    [run, gitWorkspacePath, machine, setSelectedFiles],
   );
 
   const stageOne = useCallback((file: string) => stage([file]), [stage]);
@@ -207,24 +210,24 @@ function useChangesActions(
   const discardRow = useCallback((file: string) => setDiscardTarget([file]), []);
   const confirmDiscard = useCallback(() => {
     if (discardTarget === null) return;
-    run("discard", () => useGitStore.getState().discard(gitWorkspacePath, discardTarget));
+    run("discard", () => useGitStore.getState().discard(gitWorkspacePath, discardTarget, machine));
     setDiscardTarget(null);
-  }, [run, gitWorkspacePath, discardTarget]);
+  }, [run, gitWorkspacePath, machine, discardTarget]);
 
   const runCommitPlan = useCallback(
     (plan: { message: string; toStage: string[]; toUnstage: string[] }) => {
       run("commit", async () => {
         if (plan.toUnstage.length > 0) {
-          await useGitStore.getState().unstage(gitWorkspacePath, plan.toUnstage);
+          await useGitStore.getState().unstage(gitWorkspacePath, plan.toUnstage, machine);
         }
         if (plan.toStage.length > 0) {
-          await useGitStore.getState().stage(gitWorkspacePath, plan.toStage);
+          await useGitStore.getState().stage(gitWorkspacePath, plan.toStage, machine);
         }
-        await useGitStore.getState().commit(gitWorkspacePath, plan.message);
+        await useGitStore.getState().commit(gitWorkspacePath, plan.message, machine);
         setCommitMsg("");
       });
     },
-    [run, gitWorkspacePath],
+    [run, gitWorkspacePath, machine],
   );
 
   const confirmCommitPlan = useCallback(() => {
@@ -268,12 +271,12 @@ function useChangesActions(
   }, [commitMsg, selectedFiles, status, runCommitPlan]);
 
   const openStagedDiff = useCallback(
-    (file: string) => useGitStore.getState().openDiff(gitWorkspacePath, { file, staged: true }),
-    [gitWorkspacePath],
+    (file: string) => useGitStore.getState().openDiff(gitWorkspacePath, { file, staged: true }, machine),
+    [gitWorkspacePath, machine],
   );
   const openUnstagedDiff = useCallback(
-    (file: string) => useGitStore.getState().openDiff(gitWorkspacePath, { file, staged: false }),
-    [gitWorkspacePath],
+    (file: string) => useGitStore.getState().openDiff(gitWorkspacePath, { file, staged: false }, machine),
+    [gitWorkspacePath, machine],
   );
 
   return {
@@ -303,11 +306,13 @@ function useChangesActions(
 
 export function ChangesPanel({
   workspacePath,
+  machine,
   repoPath,
   className,
   visible = true,
 }: {
   workspacePath: string;
+  machine?: string;
   /** Pin the panel to this repository instead of following the file tree's
    *  selection — for callers that render the panel outside the files
    *  context, where a global selectedPath would silently steer it. */
@@ -316,8 +321,8 @@ export function ChangesPanel({
   visible?: boolean;
 }) {
   const { t } = useTranslation();
-  const selectedPath = useFilesStore((s) => s.selectedPath);
-  const repositories = useFilesStore((s) => s.repositories);
+  const selectedPath = useFilesStore((s) => s.machine === machine ? s.selectedPath : null);
+  const repositories = useFilesStore((s) => s.machine === machine ? s.repositories : EMPTY_REPOSITORIES);
   const gitWorkspacePath = useMemo(
     () =>
       repoPath ??
@@ -328,10 +333,11 @@ export function ChangesPanel({
       }),
     [repositories, selectedPath, workspacePath, repoPath],
   );
-  const status = useVisibleGitValue(visible, (s) => s.statusByWorkspace[gitWorkspacePath]);
-  const notRepo = useVisibleGitValue(visible, (s) => s.notRepoByWorkspace[gitWorkspacePath]);
-  const refreshError = useVisibleGitValue(visible, (s) => s.errorByWorkspace[gitWorkspacePath]);
-  const branches = useVisibleGitValue(visible, (s) => s.branchesByWorkspace[gitWorkspacePath]);
+  const workspaceKey = machineResourceKey(gitWorkspacePath, machine);
+  const status = useVisibleGitValue(visible, (s) => s.statusByWorkspace[workspaceKey]);
+  const notRepo = useVisibleGitValue(visible, (s) => s.notRepoByWorkspace[workspaceKey]);
+  const refreshError = useVisibleGitValue(visible, (s) => s.errorByWorkspace[workspaceKey]);
+  const branches = useVisibleGitValue(visible, (s) => s.branchesByWorkspace[workspaceKey]);
   const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
   const scrollOffset = useRef(0);
 
@@ -364,7 +370,7 @@ export function ChangesPanel({
     handleCommitSelected,
     openStagedDiff,
     openUnstagedDiff,
-  } = useChangesActions(gitWorkspacePath, status, selection);
+  } = useChangesActions(gitWorkspacePath, status, selection, machine);
 
   useLayoutEffect(() => {
     if (visible && scrollElement) scrollElement.scrollTop = scrollOffset.current;
@@ -372,13 +378,14 @@ export function ChangesPanel({
 
   useEffect(() => {
     if (!visible) return;
-    void useGitStore.getState().refresh(gitWorkspacePath);
-    void useGitStore.getState().loadBranches(gitWorkspacePath);
-  }, [gitWorkspacePath, visible]);
+    void useGitStore.getState().refresh(gitWorkspacePath, false, machine);
+    void useGitStore.getState().loadBranches(gitWorkspacePath, machine);
+  }, [gitWorkspacePath, machine, visible]);
 
   const header = visible ? (
     <ChangesPanelHeader
       workspacePath={gitWorkspacePath}
+      machine={machine}
       // Name the repository when the panel followed the file tree's
       // selection into a nested repo — otherwise a commit there looks
       // identical to one against the workspace root.
@@ -454,6 +461,7 @@ export function ChangesPanel({
       {visible && (
         <CommitFooter
           workspacePath={gitWorkspacePath}
+          machine={machine}
           stagedCount={status?.staged.length ?? 0}
           selectedCount={selectedFiles.size}
           onCommitSelected={handleCommitSelected}

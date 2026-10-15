@@ -9,20 +9,21 @@ import { FileSearchOverlay } from "./FileSearchOverlay";
  * opens it as a tab in the center area (see ChatPage). The workspace search
  * overlay (tree right-click → Search) covers the tree while it is open.
  */
-export function FilesPanel({ workspacePath }: { workspacePath: string }) {
+export function FilesPanel({ workspacePath, machine }: { workspacePath: string; machine?: string }) {
   const { t } = useTranslation();
   const root = useFilesStore((s) => s.root);
+  const treeMachine = useFilesStore((s) => s.machine);
   const setRoot = useFilesStore((s) => s.setRoot);
   const searchRoot = useFilesStore((s) => s.searchRoot);
 
   // The tree always roots at the active workspace.
   useEffect(() => {
-    setRoot(workspacePath);
-  }, [workspacePath, setRoot]);
+    setRoot(workspacePath, machine);
+  }, [workspacePath, machine, setRoot]);
 
   // Guard against the store still pointing at a previously persisted root:
   // the tree only renders once it tracks this workspace.
-  const ready = root === workspacePath;
+  const ready = root === workspacePath && treeMachine === machine;
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">

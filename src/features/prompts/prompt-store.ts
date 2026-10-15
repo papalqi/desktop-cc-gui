@@ -12,7 +12,8 @@
  */
 
 import { create } from "zustand";
-import { ipc, type CustomPromptEntry, type PromptScope } from "@/lib/ipc";
+import { ipc, ipcForMachine, type CustomPromptEntry, type PromptScope } from "@/lib/ipc";
+import { machineResourceTarget } from "@/lib/web-machine";
 import type { RootCache } from "@/components/application/ai-chat/create-root-cache-store";
 
 /** Broadcast after any prompt mutation; detail carries the workspace root. */
@@ -57,8 +58,9 @@ export const usePromptStore = create<PromptStore>()((set, get) => {
   const load = (root: string): Promise<void> => {
     const existing = inFlight.get(root);
     if (existing) return existing;
-    const p = ipc
-      .listPrompts(root)
+    const target = machineResourceTarget(root);
+    const p = (target.machine ? ipcForMachine(target.machine) : ipc)
+      .listPrompts(target.path)
       .then((entries) => {
         set((s) => {
           // Pruned while the fetch was in flight (workspace removed): stay gone.

@@ -4,7 +4,7 @@ import FolderOpen from "lucide-react/dist/esm/icons/folder-open";
 import Link2 from "lucide-react/dist/esm/icons/link-2";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { copyText } from "@/lib/clipboard";
-import { ipc } from "@/lib/ipc";
+import { ipc, ipcForMachine } from "@/lib/ipc";
 import { useFilesStore } from "@/features/files/store";
 import { resolveChatFileLink } from "@/features/chat/file-link-resolution";
 import {
@@ -24,6 +24,7 @@ export interface FileLinkMenuState {
   /** Session workspace root — anchors the async existence/index fallback
    *  (see resolveChatFileLink). */
   workspacePath: string;
+  machine?: string;
 }
 
 /**
@@ -69,7 +70,7 @@ export function FileLinkContextMenu({
   // whose file sits nested below the workspace root would otherwise open
   // nothing. Resolving can reject only by returning null, so `act` is total.
   const act = (run: (path: string) => void) => {
-    void resolveChatFileLink(menu.path, menu.workspacePath).then((path) => {
+    void resolveChatFileLink(menu.path, menu.workspacePath, menu.machine).then((path) => {
       if (path) run(path);
     });
   };
@@ -80,7 +81,7 @@ export function FileLinkContextMenu({
     disabled: !resolved,
     onSelect: () =>
       act((path) => {
-        void ipc.revealInFileManager(path).catch(() => {});
+        void (menu.machine ? ipcForMachine(menu.machine) : ipc).revealInFileManager(path).catch(() => {});
       }),
   };
 
@@ -92,7 +93,7 @@ export function FileLinkContextMenu({
       disabled: !resolved,
       onSelect: () =>
         act((path) => {
-          void useFilesStore.getState().openFile(path);
+          void useFilesStore.getState().openFile(path, menu.machine);
         }),
     },
     target.kind === "finder"
@@ -104,7 +105,7 @@ export function FileLinkContextMenu({
           disabled: !resolved,
           onSelect: () =>
             act((path) => {
-              void openPathInTarget(path, target).catch(() => {});
+              void openPathInTarget(path, target, menu.machine).catch(() => {});
             }),
         },
     ...(target.kind === "finder" ? [] : [revealEntry]),

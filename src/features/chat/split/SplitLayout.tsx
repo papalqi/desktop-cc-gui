@@ -71,7 +71,7 @@ export function SplitLayout({
   active: ActiveSession | null;
   engines: EngineInfo[];
   workspaces: Workspace[];
-  startNewChat: (workspacePath: string) => void;
+  startNewChat: (workspacePath: string, machine?: string) => void;
 }) {
   // 分屏布局与聊天 store 的同步订阅（幂等，卸载不解除：布局活在 store 里）。
   useEffect(() => installSplitSync(), []);
@@ -83,6 +83,7 @@ export function SplitLayout({
   useEffect(() => registerPaneComposerRef(SOLO_PANE_ID, soloComposerRef), []);
   const geometry = useMemo(() => (root ? layoutGeometry(root) : null), [root]);
   const fallbackWorkspacePath = active?.workspacePath ?? workspaces[0]?.path ?? "";
+  const fallbackMachine = active ? active.machine : workspaces[0]?.machine;
 
   const body =
     !root || !geometry ? (
@@ -91,6 +92,7 @@ export function SplitLayout({
         className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background-primary-default"
       >
         <ChatConversation
+          key={active?.machine ?? "local"}
           active={active}
           engines={engines}
           workspaces={workspaces}
@@ -111,6 +113,7 @@ export function SplitLayout({
             workspaces={workspaces}
             startNewChat={startNewChat}
             fallbackWorkspacePath={fallbackWorkspacePath}
+            fallbackMachine={fallbackMachine}
           />
         ))}
         {geometry.dividers.map((divider) => (
@@ -138,6 +141,7 @@ const SplitPaneView = memo(function SplitPaneView({
   workspaces,
   startNewChat,
   fallbackWorkspacePath,
+  fallbackMachine,
 }: {
   pane: PaneNode;
   rect: Rect;
@@ -145,13 +149,14 @@ const SplitPaneView = memo(function SplitPaneView({
   animate: boolean;
   engines: EngineInfo[];
   workspaces: Workspace[];
-  startNewChat: (workspacePath: string) => void;
+  startNewChat: (workspacePath: string, machine?: string) => void;
   fallbackWorkspacePath: string;
+  fallbackMachine?: string;
 }) {
   const { t } = useTranslation();
   const session = pane.session;
   const key = session
-    ? sessionKey(session.engine, session.sessionId, session.workspacePath)
+    ? sessionKey(session.engine, session.sessionId, session.workspacePath, session.machine)
     : "";
   const sessions = useChatStore((s) => s.sessions);
   const streaming = useChatStore((s) => (key ? s.streamingByKey[key] === true : false));
@@ -164,7 +169,7 @@ const SplitPaneView = memo(function SplitPaneView({
     if (!session) return "";
     if (!session.sessionId) return t("chat.newChat");
     const meta = sessions.find(
-      (item) => item.engine === session.engine && item.sessionId === session.sessionId,
+      (item) => item.engine === session.engine && item.sessionId === session.sessionId && item.machine === session.machine,
     );
     return meta?.customTitle || meta?.title || session.sessionId.slice(0, 8);
   }, [session, sessions, t]);
@@ -194,6 +199,7 @@ const SplitPaneView = memo(function SplitPaneView({
     <div
       data-split-pane={pane.id}
       onPointerDownCapture={handlePointerDownCapture}
+      onFocusCapture={() => focusPane(pane.id)}
       style={rectStyle(rect)}
       className={cx(
         "absolute flex min-h-0 min-w-0 flex-col overflow-hidden bg-background-primary-default",
@@ -265,6 +271,7 @@ const SplitPaneView = memo(function SplitPaneView({
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {session ? (
           <ChatConversation
+            key={session?.machine ?? "local"}
             active={session}
             engines={engines}
             workspaces={workspaces}
@@ -275,6 +282,7 @@ const SplitPaneView = memo(function SplitPaneView({
           <EmptyPane
             paneId={pane.id}
             workspacePath={fallbackWorkspacePath}
+            machine={fallbackMachine}
             startNewChat={startNewChat}
           />
         )}
@@ -287,11 +295,13 @@ const SplitPaneView = memo(function SplitPaneView({
 function EmptyPane({
   paneId,
   workspacePath,
+  machine,
   startNewChat,
 }: {
   paneId: string;
   workspacePath: string;
-  startNewChat: (workspacePath: string) => void;
+  machine?: string;
+  startNewChat: (workspacePath: string, machine?: string) => void;
 }) {
   const { t } = useTranslation();
   const focusPane = useSplitStore((s) => s.focusPane);
@@ -305,7 +315,7 @@ function EmptyPane({
           // 先聚焦这一格：新会话（pending 页签）会落进当前聚焦格；输入框
           // 挂载后把焦点给它（隐藏面里 focus() 会被忽略，交给重试助手）。
           focusPane(paneId);
-          startNewChat(workspacePath);
+          startNewChat(workspacePath, machine);
           focusComposerWhenVisible(composerBridgeRef);
         }}
         className="cursor-pointer rounded-md border border-border-secondary bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover disabled:cursor-not-allowed disabled:opacity-60"

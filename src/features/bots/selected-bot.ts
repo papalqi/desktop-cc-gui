@@ -35,8 +35,8 @@ export interface SelectedBot {
   assembledAt?: number;
 }
 
-export function selectedBotKey(root: string, sessionId: string | null): string {
-  return `${root}::${sessionId ?? DRAFT_SESSION}`;
+export function selectedBotKey(root: string, sessionId: string | null, machine?: string): string {
+  return `${machine ? encodeURIComponent(machine) + "/" : ""}${root}::${sessionId ?? DRAFT_SESSION}`;
 }
 
 function validate(value: unknown): Record<string, SelectedBot> | null {
@@ -101,7 +101,7 @@ interface SelectedBotState {
   /** Merge fields into an existing pick (used to freeze the prompt block). */
   patch(key: string, patch: Partial<SelectedBot>): void;
   clear(key: string): void;
-  migrate(root: string, sessionId: string): void;
+  migrate(root: string, sessionId: string, machine?: string): void;
   /** Drop a bot from every thread (a deleted bot must not stay pinned). */
   forgetBot(botId: string): void;
 }
@@ -130,10 +130,10 @@ const useSelectedBotStore = create<SelectedBotState>((set, get) => ({
       delete next[key];
       return persist(next);
     }),
-  migrate: (root, sessionId) =>
+  migrate: (root, sessionId, machine) =>
     set((s) => {
-      const draftKey = selectedBotKey(root, null);
-      const nextKey = selectedBotKey(root, sessionId);
+      const draftKey = selectedBotKey(root, null, machine);
+      const nextKey = selectedBotKey(root, sessionId, machine);
       const bot = s.byThread[draftKey];
       if (!bot || s.byThread[nextKey]) return s;
       const next = { ...s.byThread, [nextKey]: bot };
@@ -152,8 +152,8 @@ const useSelectedBotStore = create<SelectedBotState>((set, get) => ({
 }));
 
 /** Hook for the composer pickers: the bot pinned to this thread. */
-export function useSelectedBot(root: string, sessionId: string | null) {
-  const key = selectedBotKey(root, sessionId);
+export function useSelectedBot(root: string, sessionId: string | null, machine?: string) {
+  const key = selectedBotKey(root, sessionId, machine);
   const bot = useSelectedBotStore((s) => s.byThread[key] ?? null);
   const selectEntry = useSelectedBotStore((s) => s.select);
   const clearEntry = useSelectedBotStore((s) => s.clear);
@@ -171,8 +171,9 @@ export function useSelectedBot(root: string, sessionId: string | null) {
 export function getSelectedBot(
   root: string,
   sessionId: string | null,
+  machine?: string,
 ): SelectedBot | null {
-  return useSelectedBotStore.getState().byThread[selectedBotKey(root, sessionId)] ?? null;
+  return useSelectedBotStore.getState().byThread[selectedBotKey(root, sessionId, machine)] ?? null;
 }
 
 /** Non-hook select, the write half of getSelectedBot (send path, tests). */
@@ -180,14 +181,15 @@ export function selectSelectedBot(
   root: string,
   sessionId: string | null,
   bot: SelectedBot,
+  machine?: string,
 ): void {
-  useSelectedBotStore.getState().select(selectedBotKey(root, sessionId), bot);
+  useSelectedBotStore.getState().select(selectedBotKey(root, sessionId, machine), bot);
 }
 
 /** Non-hook clear for the send path (e.g. a built-in pick whose catalog
  *  entry was disabled since). */
-export function clearSelectedBot(root: string, sessionId: string | null): void {
-  useSelectedBotStore.getState().clear(selectedBotKey(root, sessionId));
+export function clearSelectedBot(root: string, sessionId: string | null, machine?: string): void {
+  useSelectedBotStore.getState().clear(selectedBotKey(root, sessionId, machine));
 }
 
 /** Freeze the assembled prompt block onto this thread's pick. */
@@ -195,22 +197,23 @@ export function freezeSelectedBotBlock(
   root: string,
   sessionId: string | null,
   block: string,
+  machine?: string,
 ): void {
   useSelectedBotStore
     .getState()
-    .patch(selectedBotKey(root, sessionId), { block, assembledAt: Date.now() });
+    .patch(selectedBotKey(root, sessionId, machine), { block, assembledAt: Date.now() });
 }
 
 /** Drop the frozen block so the next send re-assembles it (刷新上下文). */
-export function refreshSelectedBotBlock(root: string, sessionId: string | null): void {
+export function refreshSelectedBotBlock(root: string, sessionId: string | null, machine?: string): void {
   useSelectedBotStore
     .getState()
-    .patch(selectedBotKey(root, sessionId), { block: undefined, assembledAt: undefined });
+    .patch(selectedBotKey(root, sessionId, machine), { block: undefined, assembledAt: undefined });
 }
 
 /** Move a draft-tab selection onto the freshly stamped native session id. */
-export function migrateSelectedBot(root: string, sessionId: string): void {
-  useSelectedBotStore.getState().migrate(root, sessionId);
+export function migrateSelectedBot(root: string, sessionId: string, machine?: string): void {
+  useSelectedBotStore.getState().migrate(root, sessionId, machine);
 }
 
 /** Forget a deleted bot everywhere it was pinned. */

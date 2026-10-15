@@ -19,6 +19,7 @@ import {
   type LaunchScriptEntry,
 } from "./launch-script";
 import { runLaunchScript } from "./run";
+import { machineResourceKey } from "@/lib/web-machine";
 
 const RUN_BUTTON_CLASSES = cx(
   "flex h-7 shrink-0 cursor-pointer items-center justify-center rounded-lg outline-none transition-colors",
@@ -33,10 +34,11 @@ const RUN_BUTTON_CLASSES = cx(
  * dialog edits the primary script with an expandable "new script" section.
  * `index: null` edits the not-yet-created first script.
  */
-export function LaunchScriptActions({ workspacePath }: { workspacePath: string }) {
+export function LaunchScriptActions({ workspacePath, machine }: { workspacePath: string; machine?: string }) {
+  const storagePath = machineResourceKey(workspacePath, machine);
   const { t } = useTranslation();
   const [entries, setEntries] = useState<LaunchScriptEntry[]>(() =>
-    readLaunchScripts(workspacePath),
+    readLaunchScripts(storagePath),
   );
   const [editIndex, setEditIndex] = useState<number | null | false>(false);
   const [showNew, setShowNew] = useState(false);
@@ -52,9 +54,9 @@ export function LaunchScriptActions({ workspacePath }: { workspacePath: string }
   const persist = useCallback(
     (next: LaunchScriptEntry[]) => {
       setEntries(next);
-      writeLaunchScripts(workspacePath, next);
+      writeLaunchScripts(storagePath, next);
     },
-    [workspacePath],
+    [storagePath],
   );
 
   const dialogOpen = editIndex !== false;
@@ -63,7 +65,7 @@ export function LaunchScriptActions({ workspacePath }: { workspacePath: string }
     (index: number | null) => {
       // Read from storage (not render state) so the 更多 menu's editor request
       // can call this without depending on a possibly stale closure.
-      const stored = readLaunchScripts(workspacePath);
+      const stored = readLaunchScripts(storagePath);
       const entry = index === null ? null : stored[index];
       setDraftLabel(entry?.label ?? "");
       setDraftScript(entry?.script ?? "");
@@ -73,7 +75,7 @@ export function LaunchScriptActions({ workspacePath }: { workspacePath: string }
       setError(null);
       setEditIndex(index);
     },
-    [workspacePath],
+    [storagePath],
   );
 
   // Pin state lives in the open-app cluster's storage so the 更多 menu's
@@ -85,9 +87,9 @@ export function LaunchScriptActions({ workspacePath }: { workspacePath: string }
   // dialog stays reachable even while the header buttons are unpinned.
   useEffect(() => {
     return onLaunchScriptEditorRequest(() => {
-      openEditor(readLaunchScripts(workspacePath).length > 0 ? 0 : null);
+      openEditor(readLaunchScripts(storagePath).length > 0 ? 0 : null);
     });
-  }, [workspacePath, openEditor]);
+  }, [storagePath, openEditor]);
 
   const closeDialog = useCallback(() => {
     setEditIndex(false);
@@ -98,13 +100,13 @@ export function LaunchScriptActions({ workspacePath }: { workspacePath: string }
   const runEntry = useCallback(
     (entry: LaunchScriptEntry, index: number) => {
       setError(null);
-      void runLaunchScript(workspacePath, entry.script).catch((e: unknown) => {
+      void runLaunchScript(workspacePath, entry.script, machine).catch((e: unknown) => {
         // Surface the failure in the editor so a rejected run is never silent.
         setError(t("launchScript.runFailed", { message: String(e) }));
         openEditor(index);
       });
     },
-    [workspacePath, t, openEditor],
+    [workspacePath, machine, t, openEditor],
   );
 
   const saveEdit = useCallback(() => {

@@ -1,4 +1,6 @@
 "use client";
+import { machineResourceKey } from "@/lib/web-machine";
+import { useScopedSession } from "@/features/chat/split/session-scope";
 
 import {
   memo,
@@ -102,10 +104,11 @@ export function SlashCommandMenu({
   menuRef?: MutableRefObject<SlashCommandMenuHandle | null>;
 }) {
   const { t } = useTranslation();
-  const catalog = useSlashCommandStore((s) => (root ? s.byRoot[root] : undefined));
+  const cacheRoot = machineResourceKey(root, useScopedSession()?.machine);
+  const catalog = useSlashCommandStore((s) => (root ? s.byRoot[cacheRoot] : undefined));
   useEffect(() => {
-    if (root) useSlashCommandStore.getState().ensure(root);
-  }, [root]);
+    if (root) useSlashCommandStore.getState().ensure(cacheRoot);
+  }, [root, cacheRoot]);
 
   const entries = catalog?.entries;
   const items = useMemo(

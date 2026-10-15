@@ -35,8 +35,10 @@ export function sessionContributionScope(
   engine: string,
   sessionId: string | null,
   workspacePath: string,
+  machine?: string,
 ): string {
-  return sessionId ? `${engine}/${sessionId}` : `pending:${engine}:${workspacePath}`;
+  const key = sessionId ? `${engine}/${sessionId}` : `pending:${engine}:${workspacePath}`;
+  return machine ? `${encodeURIComponent(machine)}/${key}` : key;
 }
 
 /** Remembered session contributions first, then this turn's; a fresh
@@ -139,11 +141,12 @@ export function migrateSessionContributions(
   engine: string,
   workspacePath: string,
   sessionId: string,
+  machine?: string,
 ): SessionContributions | null {
-  const from = sessionContributionScope(engine, null, workspacePath);
+  const from = sessionContributionScope(engine, null, workspacePath, machine);
   const pending = all[from];
   if (!pending) return null;
-  const to = sessionContributionScope(engine, sessionId, workspacePath);
+  const to = sessionContributionScope(engine, sessionId, workspacePath, machine);
   const existing = all[to];
   const resets = Object.assign(Object.create(null), existing?.resets, pending.resets) as Record<string, PromptContribution>;
   for (const [owner, notice] of Object.entries(existing?.resets ?? {})) {
@@ -165,8 +168,9 @@ export function forgetSessionContributions(
   engine: string,
   sessionId: string | null,
   workspacePath: string,
+  machine?: string,
 ): SessionContributions | null {
-  const scope = sessionContributionScope(engine, sessionId, workspacePath);
+  const scope = sessionContributionScope(engine, sessionId, workspacePath, machine);
   if (!(scope in all)) return null;
   const next = { ...all };
   delete next[scope];

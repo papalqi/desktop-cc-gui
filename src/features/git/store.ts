@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import { ipc, type BranchInfo, type GitStatus } from "@/lib/ipc";
+import { ipc, ipcForMachine, type BranchInfo, type GitStatus } from "@/lib/ipc";
+import { machineResourceKey } from "@/lib/web-machine";
 import { errorText } from "@/lib/errors";
 
 const TTL_MS = 30_000;
@@ -30,26 +31,26 @@ interface GitStore {
   /** epoch ms of last successful/failed fetch per workspace (TTL bookkeeping) */
   fetchedAtByWorkspace: Record<string, number>;
   /** Diff open in the center area; null = center shows chat/files. */
-  diffView: { workspacePath: string; target: DiffTarget } | null;
-  openDiff: (workspacePath: string, target: DiffTarget) => void;
+  diffView: { workspacePath: string; target: DiffTarget; machine?: string } | null;
+  openDiff: (workspacePath: string, target: DiffTarget, machine?: string) => void;
   closeDiff: () => void;
   /** Dismiss the surfaced refresh error for one workspace. */
-  clearError: (workspacePath: string) => void;
+  clearError: (workspacePath: string, machine?: string) => void;
 
   /** Refreshes status; skipped when fetched < 30s ago unless `force`. */
-  refresh: (workspacePath: string, force?: boolean) => Promise<void>;
-  loadBranches: (workspacePath: string) => Promise<void>;
+  refresh: (workspacePath: string, force?: boolean, machine?: string) => Promise<void>;
+  loadBranches: (workspacePath: string, machine?: string) => Promise<void>;
 
   // Mutating actions — each force-refreshes status afterwards. Errors are
   // re-thrown so callers can surface them inline.
-  stage: (workspacePath: string, files: string[]) => Promise<void>;
-  unstage: (workspacePath: string, files: string[]) => Promise<void>;
-  discard: (workspacePath: string, files: string[]) => Promise<void>;
-  commit: (workspacePath: string, message: string) => Promise<string>;
-  push: (workspacePath: string) => Promise<void>;
-  pull: (workspacePath: string) => Promise<void>;
-  checkout: (workspacePath: string, branch: string) => Promise<void>;
-  createBranch: (workspacePath: string, name: string) => Promise<void>;
+  stage: (workspacePath: string, files: string[], machine?: string) => Promise<void>;
+  unstage: (workspacePath: string, files: string[], machine?: string) => Promise<void>;
+  discard: (workspacePath: string, files: string[], machine?: string) => Promise<void>;
+  commit: (workspacePath: string, message: string, machine?: string) => Promise<string>;
+  push: (workspacePath: string, machine?: string) => Promise<void>;
+  pull: (workspacePath: string, machine?: string) => Promise<void>;
+  checkout: (workspacePath: string, branch: string, machine?: string) => Promise<void>;
+  createBranch: (workspacePath: string, name: string, machine?: string) => Promise<void>;
 }
 
 /** In-flight refresh dedup per workspace. */
@@ -59,27 +60,29 @@ export const useGitStore = create<GitStore>((set, get) => {
   const runMutation = async (
     workspacePath: string,
     action: () => Promise<unknown>,
+    machine?: string,
   ) => {
+    const key = machineResourceKey(workspacePath, machine);
     try {
       return await action();
     } catch (err) {
       if (isNotARepo(err)) {
-        set(notRepoPatch(workspacePath));
+        set(notRepoPatch(key));
       }
       throw err;
     } finally {
       // Status changed (or may have): drop the TTL and refetch.
       set((s) => ({
-        fetchedAtByWorkspace: { ...s.fetchedAtByWorkspace, [workspacePath]: 0 },
+        fetchedAtByWorkspace: { ...s.fetchedAtByWorkspace, [key]: 0 },
       }));
       get()
-        .refresh(workspacePath, true)
+        .refresh(workspacePath, true, machine)
         .catch(() => undefined);
       // The file tree's git badges/colors are stale after any mutation
       // (commit/stage/checkout); refreshTree re-walks every loaded level.
       // 动态引入避免与 files/store 的模块环：文件抢到中心时也要关差异页签。
       void import("@/features/files/store")
-        .then((m) => m.useFilesStore.getState().refreshTree())
+        .then((m) => m.useFilesStore.getState().machine === machine ? m.useFilesStore.getState().refreshTree() : undefined)
         .catch(() => undefined);
     }
   };
@@ -92,89 +95,91 @@ export const useGitStore = create<GitStore>((set, get) => {
     fetchedAtByWorkspace: {},
     diffView: null,
 
-    openDiff: (workspacePath, target) => set({ diffView: { workspacePath, target } }),
+    openDiff: (workspacePath, target, machine) => set({ diffView: { workspacePath, target, ...(machine ? { machine } : {}) } }),
     closeDiff: () => set({ diffView: null }),
-    clearError: (workspacePath) =>
+    clearError: (workspacePath, machine) =>
       set((s) => ({
-        errorByWorkspace: { ...s.errorByWorkspace, [workspacePath]: null },
+        errorByWorkspace: { ...s.errorByWorkspace, [machineResourceKey(workspacePath, machine)]: null },
       })),
 
-    refresh: (workspacePath, force = false) => {
-      const last = get().fetchedAtByWorkspace[workspacePath];
+    refresh: (workspacePath, force = false, machine) => {
+      const key = machineResourceKey(workspacePath, machine);
+      const last = get().fetchedAtByWorkspace[key];
       if (!force && last && Date.now() - last < TTL_MS) return Promise.resolve();
-      const pending = inflight.get(workspacePath);
+      const pending = inflight.get(key);
       if (pending) return pending;
 
-      const task = ipc
+      const task = (machine ? ipcForMachine(machine) : ipc)
         .gitStatus(workspacePath)
         .then((status) => {
           set((s) => ({
-            statusByWorkspace: { ...s.statusByWorkspace, [workspacePath]: status },
-            notRepoByWorkspace: { ...s.notRepoByWorkspace, [workspacePath]: false },
-            errorByWorkspace: { ...s.errorByWorkspace, [workspacePath]: null },
+            statusByWorkspace: { ...s.statusByWorkspace, [key]: status },
+            notRepoByWorkspace: { ...s.notRepoByWorkspace, [key]: false },
+            errorByWorkspace: { ...s.errorByWorkspace, [key]: null },
             fetchedAtByWorkspace: {
               ...s.fetchedAtByWorkspace,
-              [workspacePath]: Date.now(),
+              [key]: Date.now(),
             },
           }));
         })
         .catch((err: unknown) => {
           set((s) => ({
-            statusByWorkspace: { ...s.statusByWorkspace, [workspacePath]: undefined },
+            statusByWorkspace: { ...s.statusByWorkspace, [key]: undefined },
             notRepoByWorkspace: {
               ...s.notRepoByWorkspace,
-              [workspacePath]: isNotARepo(err),
+              [key]: isNotARepo(err),
             },
             errorByWorkspace: {
               ...s.errorByWorkspace,
-              [workspacePath]: isNotARepo(err) ? null : errorText(err),
+              [key]: isNotARepo(err) ? null : errorText(err),
             },
             fetchedAtByWorkspace: {
               ...s.fetchedAtByWorkspace,
-              [workspacePath]: Date.now(),
+              [key]: Date.now(),
             },
           }));
         })
         .finally(() => {
-          inflight.delete(workspacePath);
+          inflight.delete(key);
         });
-      inflight.set(workspacePath, task);
+      inflight.set(key, task);
       return task;
     },
 
-    loadBranches: async (workspacePath) => {
-      if (get().notRepoByWorkspace[workspacePath]) return;
+    loadBranches: async (workspacePath, machine) => {
+      const key = machineResourceKey(workspacePath, machine);
+      if (get().notRepoByWorkspace[key]) return;
       try {
-        const branches = await ipc.gitBranches(workspacePath);
+        const branches = await (machine ? ipcForMachine(machine) : ipc).gitBranches(workspacePath);
         set((s) => ({
-          branchesByWorkspace: { ...s.branchesByWorkspace, [workspacePath]: branches },
+          branchesByWorkspace: { ...s.branchesByWorkspace, [key]: branches },
         }));
       } catch (err) {
         if (isNotARepo(err)) {
-          set(notRepoPatch(workspacePath));
+          set(notRepoPatch(key));
         }
       }
     },
 
-    stage: (workspacePath, files) =>
-      runMutation(workspacePath, () => ipc.gitStage(workspacePath, files)) as Promise<void>,
-    unstage: (workspacePath, files) =>
-      runMutation(workspacePath, () => ipc.gitUnstage(workspacePath, files)) as Promise<void>,
-    discard: (workspacePath, files) =>
-      runMutation(workspacePath, () => ipc.gitDiscard(workspacePath, files)) as Promise<void>,
-    commit: (workspacePath, message) =>
-      runMutation(workspacePath, () => ipc.gitCommit(workspacePath, message)) as Promise<string>,
-    push: (workspacePath) =>
-      runMutation(workspacePath, () => ipc.gitPush(workspacePath)) as Promise<void>,
-    pull: (workspacePath) =>
-      runMutation(workspacePath, () => ipc.gitPull(workspacePath)) as Promise<void>,
-    checkout: async (workspacePath, branch) => {
-      await runMutation(workspacePath, () => ipc.gitCheckout(workspacePath, branch));
-      await get().loadBranches(workspacePath);
+    stage: (workspacePath, files, machine) =>
+      runMutation(workspacePath, () => (machine ? ipcForMachine(machine) : ipc).gitStage(workspacePath, files), machine) as Promise<void>,
+    unstage: (workspacePath, files, machine) =>
+      runMutation(workspacePath, () => (machine ? ipcForMachine(machine) : ipc).gitUnstage(workspacePath, files), machine) as Promise<void>,
+    discard: (workspacePath, files, machine) =>
+      runMutation(workspacePath, () => (machine ? ipcForMachine(machine) : ipc).gitDiscard(workspacePath, files), machine) as Promise<void>,
+    commit: (workspacePath, message, machine) =>
+      runMutation(workspacePath, () => (machine ? ipcForMachine(machine) : ipc).gitCommit(workspacePath, message), machine) as Promise<string>,
+    push: (workspacePath, machine) =>
+      runMutation(workspacePath, () => (machine ? ipcForMachine(machine) : ipc).gitPush(workspacePath), machine) as Promise<void>,
+    pull: (workspacePath, machine) =>
+      runMutation(workspacePath, () => (machine ? ipcForMachine(machine) : ipc).gitPull(workspacePath), machine) as Promise<void>,
+    checkout: async (workspacePath, branch, machine) => {
+      await runMutation(workspacePath, () => (machine ? ipcForMachine(machine) : ipc).gitCheckout(workspacePath, branch), machine);
+      await get().loadBranches(workspacePath, machine);
     },
-    createBranch: async (workspacePath, name) => {
-      await runMutation(workspacePath, () => ipc.gitCreateBranch(workspacePath, name));
-      await get().loadBranches(workspacePath);
+    createBranch: async (workspacePath, name, machine) => {
+      await runMutation(workspacePath, () => (machine ? ipcForMachine(machine) : ipc).gitCreateBranch(workspacePath, name), machine);
+      await get().loadBranches(workspacePath, machine);
     },
   };
 });

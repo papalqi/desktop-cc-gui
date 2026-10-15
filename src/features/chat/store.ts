@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, type SessionMeta, type SessionPage } from "@/lib/ipc";
+import { ipc, ipcForMachine, type SessionMeta, type SessionPage } from "@/lib/ipc";
 import { botById } from "@/features/bots/bot-store";
 import { getSelectedBot } from "@/features/bots/selected-bot";
 import {
@@ -12,6 +12,7 @@ import {
 import {
   ENGINE_PREF_KEY,
   persistTabs,
+  persistUnseen,
   sessionKey,
 } from "./store/persistence";
 import { patchSession, resolveSessionModel } from "./store/stream";
@@ -22,10 +23,11 @@ import { createSessionActions } from "./store/sessions";
 import { createWorkspaceActions } from "./store/workspaces";
 import { createPreferenceActions } from "./store/preferences";
 import { createComposerActions } from "./store/composer";
+import { performanceRecorder } from "@/lib/performance-diagnostics";
 import type { ChatStore } from "./store/types";
 
 // Facade re-exports: callers keep importing everything from "../store".
-export { parseDraftSessionKey, sessionKey } from "./store/persistence";
+export { parseDraftSessionKey, parseSessionKey, sessionKey } from "./store/persistence";
 export type { ActiveSession } from "./store/persistence";
 export type {
   QueuedMessage,
@@ -51,6 +53,7 @@ function loadHistoryPage(
   limit?: number,
   beforeSeq?: number | null,
   meta?: SessionMeta,
+  machine?: string,
 ): Promise<SessionPage> {
   const m =
     meta ??
@@ -60,10 +63,11 @@ function loadHistoryPage(
         (s) =>
           s.engine === engine &&
           s.sessionId === sessionId &&
-          s.workspacePath === workspacePath,
+          s.workspacePath === workspacePath && s.machine === machine,
       );
+  const client = (machine ?? m?.machine) ? ipcForMachine(machine ?? m?.machine) : ipc;
   if (m?.remote && m.remotePath) {
-    return ipc.loadRemoteSessionPage(
+    return client.loadRemoteSessionPage(
       workspacePath,
       engine,
       sessionId,
@@ -73,8 +77,8 @@ function loadHistoryPage(
     );
   }
   return beforeSeq === undefined
-    ? ipc.loadSessionPage(engine, sessionId, limit)
-    : ipc.loadSessionPage(engine, sessionId, limit, beforeSeq);
+    ? client.loadSessionPage(engine, sessionId, limit)
+    : client.loadSessionPage(engine, sessionId, limit, beforeSeq);
 }
 
 export const useChatStore = create<ChatStore>((set, get) => {
@@ -87,18 +91,19 @@ export const useChatStore = create<ChatStore>((set, get) => {
     // 否则整理的是半截对话还多付一次调用。
     if (!session || session.streaming) return null;
     const tab = s.openTabs.find(
-      (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
+      (t) => sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === key,
     );
     const meta = tab
       ? undefined
       : s.sessions.find(
-          (m) => sessionKey(m.engine, m.sessionId, m.workspacePath) === key,
+          (m) => sessionKey(m.engine, m.sessionId, m.workspacePath, m.machine) === key,
         );
     const engine = tab?.engine ?? meta?.engine;
     const sessionId = tab?.sessionId ?? meta?.sessionId;
     const workspacePath = tab?.workspacePath ?? meta?.workspacePath;
+    const machine = tab?.machine ?? meta?.machine;
     if (!engine || !sessionId || !workspacePath) return null;
-    const selected = getSelectedBot(workspacePath, sessionId);
+    const selected = getSelectedBot(workspacePath, sessionId, tab?.machine ?? meta?.machine);
     const bot = selected ? botById(selected.id) : null;
     const schedule = reviewSchedule(bot);
     if (!bot || !schedule) return null;
@@ -107,9 +112,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
     if (!transcript.trim()) return null;
     return {
       key,
+      machine,
       botId: bot.id,
       engine,
-      providerId: session.activeProvider ?? s.providers[engine] ?? null,
+      providerId: session.activeProvider ?? (machine ? s.providersByMachine[machine] : s.providers)?.[engine] ?? null,
       model: resolveSessionModel(tab ?? { engine }, session, s.models[engine]) ?? null,
       everyNTurns: schedule.everyNTurns,
       transcript,
@@ -124,9 +130,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
     engine: string,
     sessionId: string,
     workspacePath: string,
+    machine?: string,
   ) => {
     const context = memoryReviewContext(
-      sessionKey(engine, sessionId, workspacePath),
+      sessionKey(engine, sessionId, workspacePath, machine),
     );
     if (context) noteSessionEnded(context);
   };
@@ -174,8 +181,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
   return {
     workspaces: [],
     sessions: [],
+    sessionScope: "all",
+    sessionSort: "workspace",
     archivedSessionKeys: {},
     engines: [],
+    enginesByMachine: {},
+    providersByMachine: {},
+    serviceTiersByMachine: {},
     active: null,
     openTabs: [],
     activeEngine: localStorage.getItem(ENGINE_PREF_KEY) ?? "claude",
@@ -241,17 +253,27 @@ export function setPluginSessionEffort(
   if (!engine || !sessionId) {
     throw new Error("sessions.setEffort: engine and sessionId are required");
   }
-  const key = sessionKey(engine, sessionId, workspacePath);
   const state = useChatStore.getState();
+  let machine: string | undefined;
+  let key = sessionKey(engine, sessionId, workspacePath);
+  if (!state.bySession[key]) {
+    const targets = [...state.openTabs, ...state.sessions].filter((row) =>
+      row.engine === engine && row.sessionId === sessionId && row.workspacePath === workspacePath);
+    const machines = [...new Set(targets.map((row) => row.machine))];
+    if (machines.length > 1) throw new Error("sessions.setEffort: ambiguous machine");
+    machine = machines[0];
+    key = sessionKey(engine, sessionId, workspacePath, machine);
+  }
   if (!state.bySession[key]) {
     throw new Error(`sessions.setEffort: unknown session ${key}`);
   }
   patchSession(useChatStore.setState, key, { activeEffort: trimmed });
-  void ipc.rememberSessionEffort?.(engine, sessionId, trimmed)?.catch(() => {});
-  const clearStamp = <T extends { engine: string; sessionId: string | null; workspacePath: string; effort?: string }>(
+  const client = machine ? ipcForMachine(machine) : ipc;
+  void client.rememberSessionEffort?.(engine, sessionId, trimmed)?.catch(() => {});
+  const clearStamp = <T extends { engine: string; sessionId: string | null; workspacePath: string; effort?: string; machine?: string }>(
     t: T,
   ): T =>
-    sessionKey(t.engine, t.sessionId, t.workspacePath) === key && t.effort !== undefined
+    sessionKey(t.engine, t.sessionId, t.workspacePath, t.machine) === key && t.effort !== undefined
       ? { ...t, effort: undefined }
       : t;
   const openTabs = state.openTabs.map(clearStamp);
@@ -261,6 +283,17 @@ export function setPluginSessionEffort(
     persistTabs(openTabs, active);
   }
 }
+
+eventTeardowns.push(useChatStore.subscribe((state, previous) => {
+  if (state.unseen !== previous.unseen && state.workspaces.length > 0) persistUnseen(state.unseen);
+  if (state.active === previous.active || !performanceRecorder.isEnabled()) return;
+  const key = (active: typeof state.active) => active ? sessionKey(active.engine, active.sessionId, active.workspacePath, active.machine) : null;
+  const currentKey = key(state.active);
+  const previousKey = key(previous.active);
+  if (currentKey !== previousKey) performanceRecorder.transition("active-change", {
+    session: performanceRecorder.sessionToken(currentKey), previous: performanceRecorder.sessionToken(previousKey),
+  });
+}));
 
 // HMR swaps this module for a fresh store; without dispose the old module's
 // engine/session listeners keep firing into the dead store (and init on the
