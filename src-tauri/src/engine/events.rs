@@ -165,7 +165,7 @@ pub enum EngineEvent {
     },
 }
 /// One todo entry carried to the frontend.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct TodoItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -193,7 +193,7 @@ impl TodoItem {
 }
 /// `replace: true` is a full snapshot of the todo list; `false` is a patch
 /// the frontend applies by matching on `content`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct TodosPayload {
     pub items: Vec<TodoItem>,
     pub replace: bool,

@@ -1,3 +1,5 @@
+#[macro_use]
+mod diagnostics;
 pub mod agent_catalog;
 pub mod app_info;
 pub mod app_menu;
@@ -38,6 +40,8 @@ pub mod provider_models;
 pub mod proxy;
 pub mod quit_guard;
 pub mod relay;
+pub(crate) mod agent_link;
+pub mod relay_update;
 pub mod settings;
 pub mod skills_hub;
 pub mod slash_commands;
@@ -94,6 +98,7 @@ pub fn run() {
         }
         return;
     }
+    diagnostics::init();
     engine::images::sweep_pasted_images();
     // Restore workspace .omp/mcp.json files left injected by a crash
     // (computer use writes them per send and restores on run exit).
@@ -134,6 +139,7 @@ pub fn run() {
         )
         .setup(|app| {
             let db = Arc::new(db::Db::open().expect("failed to open app db"));
+            history::journal::recover_runs(&db).map_err(std::io::Error::other)?;
             // Sweep per-send credential staging left behind by a crash.
             engine::sweep_staging_dirs();
             if let Err(error) = db::import_legacy_workspaces_once(&db) {
@@ -167,9 +173,13 @@ pub fn run() {
             // confinement, so the Arc itself must be managed alongside.
             app.manage(Arc::clone(&db));
             let emitters = event_sink::BroadcastEmit::new(Arc::new(app.handle().clone()));
+            let log_emitters = emitters.clone();
+            diagnostics::observe(Arc::new(move |entry| {
+                event_sink::Emit::emit_json(log_emitters.as_ref(), "diagnostics://logs", &entry.to_string());
+            }));
             let state = AppState {
+                sink: event_sink::EventSink::with_journal(emitters.clone(), db.clone()),
                 db,
-                sink: event_sink::EventSink::new(emitters.clone()),
                 terminal_sink: event_sink::EventSink::with_name(
                     emitters.clone(),
                     terminal::TERMINAL_OUTPUT_EVENT,
@@ -193,10 +203,12 @@ pub fn run() {
                 ),
                 worktree_creations: git_worktree::CreationRegistry::default(),
             };
+            relay_update::initialize(&state.relay.update);
             // Clone what the initial scan needs before state moves into manage.
             let scan_db = Arc::clone(&state.db);
             let scan_sink = Arc::clone(&state.sink);
             app.manage(state);
+            relay_update::start(app.handle().clone());
             // Provider commands inject State<'_, ConfigStore> directly (not
             // via AppState), so the store must be managed as its own type —
             // otherwise every provider mutation panics with "state() called
@@ -427,6 +439,9 @@ pub fn run() {
             plugins::assets::plugin_reveal_path,
             db::workspace_metadata,
             history::reader::record_accepted_internal_frame,
+            history::journal::run_status,
+            history::journal::set_session_origin,
+            history::log::session_log_since,
             // narrow host capabilities exposed through PluginContext
             plugin_host::plugin_window_state,
             plugin_host::plugin_window_set_normal_bounds,
@@ -443,6 +458,7 @@ pub fn run() {
             // engine
             engine::send_message,
             engine::interrupt_session,
+            engine::list_active_runs,
             engine::answer_question,
             engine::respond_plan_review,
             engine::list_plan_reviews,
@@ -476,6 +492,7 @@ pub fn run() {
             usage::usage_summary,
             usage::usage_clear,
             history::reader::load_session_page,
+            history::journal::load_session_events,
             history::reader::load_remote_session_page,
             history::search::search_messages,
             history::reader::delete_session,
@@ -590,6 +607,9 @@ pub fn run() {
             web::web_access_start,
             web::web_access_stop,
             web::web_access_status,
+            relay_update::relay_update_status,
+            relay_update::relay_update_defer,
+            relay_update::relay_update_blackout,
             web::web_access_available_ips,
             web::web_access_rotate_token,
             // Device rows: the bridge already dispatched these for phones,
@@ -626,6 +646,7 @@ pub fn run() {
                 if let Some(metrics) = app.try_state::<metrics::MetricsState>() {
                     metrics.stop();
                 }
+                diagnostics::shutdown();
             }
         });
 }

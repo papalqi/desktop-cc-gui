@@ -1,0 +1,29 @@
+{
+  "publicKey": "rc8nM0A3DLInoNSAkTJ4N8tWiej4aNpTc5jNOJLokXs=",
+  "manifest": {
+    "version": "1.2.1",
+    "protocol": 0,
+    "minHubProtocol": 0,
+    "files": [
+      {
+        "name": "package.zip",
+        "url": "http://hub.example/releases/windows/1.2.1/package.zip",
+        "bytes": 3,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "name": "install-windows.ps1",
+        "url": "http://hub.example/releases/windows/1.2.1/install-windows.ps1",
+        "bytes": 3,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "name": "install-self-update.ps1",
+        "url": "http://hub.example/releases/windows/1.2.1/install-self-update.ps1",
+        "bytes": 3,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "signature": "co/u3rMWfK0MVzrxm7Zzv1JhPrL8f5Zw6ViyNKIFqbfZae4ttDpzV7zmTv3LHqMcvjItXNbyN/+dkdlOX+KPBQ=="
+  }
+}

@@ -194,6 +194,11 @@ impl AppServer {
     ) -> Result<Option<Value>, String> {
         let mut interrupted = false;
         let mut deadline = deadline;
+        // A turn can keep doing useful work beyond the initial window. Only
+        // turn notifications renew it; RPC replies and interrupt grace remain
+        // bounded by their original deadlines.
+        let idle_timeout = matches!(expect, Expect::Turn)
+            .then(|| deadline.saturating_duration_since(Instant::now()));
         loop {
             if killed.load(Ordering::SeqCst) {
                 match interrupt {
@@ -287,6 +292,11 @@ impl AppServer {
                     ));
                 }
                 return Ok(Some(value.get("result").cloned().unwrap_or(Value::Null)));
+            }
+            if !interrupted {
+                if let Some(idle_timeout) = idle_timeout {
+                    deadline = Instant::now() + idle_timeout;
+                }
             }
             match on_message(&value) {
                 Handled::Ended => return Ok(None),
@@ -2060,6 +2070,88 @@ mod tests {
 
     fn parked(rpc_id: Value, ids: Value) -> Value {
         json!({ "rpcId": rpc_id, "ids": ids })
+    }
+
+    async fn streaming_pump_peer() -> SpawnedCodex {
+        let peer = r#"
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+require('node:readline').createInterface({input: process.stdin}).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') {
+    send({jsonrpc: '2.0', id: request.id, result: {}});
+  } else if (request.method === 'fixture/start') {
+    let count = 0;
+    const timer = setInterval(() => {
+      send({jsonrpc: '2.0', method: 'item/agentMessage/delta', params: {delta: '片段😀'}});
+      if (++count === 8) {
+        clearInterval(timer);
+        send({jsonrpc: '2.0', method: 'turn/completed', params: {turn: {status: 'completed'}}});
+      }
+    }, 200);
+  }
+});
+"#;
+        let mut command = Command::new("node");
+        command.args(["-e", peer]);
+        let mut spawned = spawn_app_server(&mut command, &std::env::temp_dir()).unwrap();
+        let key = spawned.server.request("initialize", json!({})).await.unwrap();
+        spawned.server.pump(
+            "initialize", Expect::Reply(&key), Instant::now() + Duration::from_secs(5),
+            &AtomicBool::new(false), None, &mut |_| Handled::Ignore,
+        ).await.unwrap();
+        spawned
+    }
+
+    #[tokio::test]
+    async fn turn_pump_keeps_active_output_past_the_initial_deadline() {
+        let mut spawned = streaming_pump_peer().await;
+        spawned.server.request("fixture/start", json!({})).await.unwrap();
+        let mut updates = 0;
+        let result = spawned.server.pump(
+            "turn", Expect::Turn, Instant::now() + Duration::from_secs(1),
+            &AtomicBool::new(false), None, &mut |value| {
+                match value["method"].as_str() {
+                    Some("item/agentMessage/delta") => {
+                        updates += 1;
+                        Handled::Ignore
+                    }
+                    Some("turn/completed") => Handled::Ended,
+                    _ => Handled::Ignore,
+                }
+            },
+        ).await;
+        teardown(&mut spawned.child).await;
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(updates, 8, "the final output must survive a long active turn");
+    }
+
+    #[tokio::test]
+    async fn turn_pump_still_times_out_without_output() {
+        let mut spawned = streaming_pump_peer().await;
+        let result = spawned.server.pump(
+            "turn", Expect::Turn, Instant::now() + Duration::from_millis(100),
+            &AtomicBool::new(false), None, &mut |_| Handled::Ignore,
+        ).await;
+        teardown(&mut spawned.child).await;
+        assert_eq!(result.unwrap_err(), "turn timed out");
+    }
+
+    #[tokio::test]
+    async fn turn_pump_output_does_not_extend_rpc_or_interrupt_deadlines() {
+        for interrupted in [false, true] {
+            let mut spawned = streaming_pump_peer().await;
+            spawned.server.request("fixture/start", json!({})).await.unwrap();
+            let killed = AtomicBool::new(interrupted);
+            let expect = if interrupted { Expect::Turn } else { Expect::Reply("missing") };
+            let result = timeout(Duration::from_secs(2), spawned.server.pump(
+                "turn", expect, Instant::now() + Duration::from_secs(1), &killed,
+                interrupted.then_some(("thread-123", "turn-123")),
+                &mut |_| Handled::Ignore,
+            )).await;
+            teardown(&mut spawned.child).await;
+            let result = result.expect("output must not prolong the RPC or interrupt deadline");
+            assert_eq!(result.unwrap_err(), if interrupted { CANCELLED } else { "turn timed out" });
+        }
     }
 
     #[cfg(target_os = "macos")]

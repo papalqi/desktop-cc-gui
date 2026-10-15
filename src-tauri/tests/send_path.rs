@@ -15,6 +15,66 @@ use tauri::{Listener, Manager};
 /// each test awaits only its own child processes).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+struct TestEnvironment {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    #[cfg(windows)]
+    portable: std::path::PathBuf,
+}
+
+impl TestEnvironment {
+    fn new(home: &std::path::Path, bin: &std::path::Path) -> Self {
+        let keys = ["HOME", "PATH", "APPDATA", "USERPROFILE", "LOCALAPPDATA"];
+        let saved = keys.into_iter().map(|key| (key, std::env::var_os(key))).collect();
+        std::env::set_var("HOME", home);
+        std::env::set_var("APPDATA", home.join("appdata"));
+        std::env::set_var("USERPROFILE", home.join("profile"));
+        std::env::set_var("LOCALAPPDATA", home.join("localappdata"));
+        let mut paths = vec![bin.to_path_buf()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        ccgui_next_lib::engine::resolve::clear_search_paths_cache();
+        #[cfg(windows)]
+        {
+            // Integration targets use the production path resolver. Portable
+            // mode keeps settings writes away from the actual user's profile.
+            use std::io::Write;
+            let directory = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+            let portable = directory.join("portable-data.json");
+            let app_home = directory.join(format!("send-path-data-{}", std::process::id()));
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&portable).unwrap();
+            file.write_all(serde_json::json!({"appHome": app_home}).to_string().as_bytes()).unwrap();
+            assert_eq!(ccgui_next_lib::paths::app_home(), app_home);
+            ccgui_next_lib::paths::ensure_dirs().unwrap();
+            Self { saved, portable }
+        }
+        #[cfg(not(windows))]
+        {
+            ccgui_next_lib::paths::ensure_dirs().unwrap();
+            Self { saved }
+        }
+    }
+}
+
+impl Drop for TestEnvironment {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        #[cfg(windows)]
+        std::fs::remove_file(&self.portable).unwrap();
+        ccgui_next_lib::engine::resolve::clear_search_paths_cache();
+    }
+}
+
+#[cfg(windows)]
+fn write_windows_cli(dir: &std::path::Path, name: &str, script: &str) {
+    std::fs::write(dir.join(format!("{name}.cmd")), format!("@echo off\r\nnode \"%~dp0{name}.cjs\" %*\r\n")).unwrap();
+    std::fs::write(dir.join(format!("{name}.cjs")), script).unwrap();
+}
+
 fn temp_home(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("ccgui-send-test-{}-{}", tag, std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -22,6 +82,20 @@ fn temp_home(tag: &str) -> std::path::PathBuf {
 }
 
 fn write_fake_claude(dir: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        write_windows_cli(dir, "claude", r#"
+process.stdin.once('data', () => {
+  for (const event of [
+    {type:'system',subtype:'init',session_id:'fake-session-123'},
+    {type:'stream_event',event:{type:'content_block_delta',delta:{type:'text_delta',text:'Hello '}}},
+    {type:'stream_event',event:{type:'content_block_delta',delta:{type:'text_delta',text:'from fake'}}},
+    {type:'result',subtype:'success',session_id:'fake-session-123',usage:{input_tokens:10,output_tokens:5}}
+  ]) console.log(JSON.stringify(event));
+  process.stdin.destroy();
+});
+"#);
+    }
     let script = r#"#!/bin/sh
 read -r line
 echo '{"type":"system","subtype":"init","session_id":"fake-session-123"}'
@@ -45,9 +119,10 @@ fn build_app(
     let app = tauri::test::mock_builder()
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
+    let db = Arc::new(Db::open_at(&home.join("app.db")).unwrap());
     let state = AppState {
-        db: Arc::new(Db::open_at(&home.join("app.db")).unwrap()),
-        sink: EventSink::new(Arc::new(app.handle().clone())),
+        db: db.clone(),
+        sink: EventSink::with_journal(Arc::new(app.handle().clone()), db),
         terminal_sink: EventSink::with_name(
             Arc::new(app.handle().clone()),
             ccgui_next_lib::terminal::TERMINAL_OUTPUT_EVENT,
@@ -90,10 +165,10 @@ fn build_app(
 async fn send_message_streams_events_end_to_end() {
     let _env_guard = ENV_LOCK.lock().unwrap();
     let home = temp_home("stream");
-    let bin_dir = home.join("bin");
+    let bin_dir = home.join("appdata").join("npm");
     std::fs::create_dir_all(&bin_dir).unwrap();
     write_fake_claude(&bin_dir);
-    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+    let _environment = TestEnvironment::new(&home, &bin_dir);
 
     let workspace = home.join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -117,6 +192,7 @@ async fn send_message_streams_events_end_to_end() {
         None,
         None,
         None,
+        Some("hub".into()),
     )
     .await
     .expect("send_message must succeed");
@@ -131,12 +207,12 @@ async fn send_message_streams_events_end_to_end() {
             .iter()
             .filter_map(|e| e.get("kind").and_then(Value::as_str).map(str::to_string))
             .collect();
-        if kinds.iter().any(|k| k == "done") {
+        if kinds.iter().any(|k| k == "done") && app.state::<AppState>().processes.0.lock().unwrap().is_empty() {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "no done event within 5s"
+            "no done event within 5s: {kinds:?}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -184,6 +260,18 @@ async fn send_message_streams_events_end_to_end() {
         .lock()
         .unwrap()
         .is_empty());
+    drop(collected);
+    let statuses = ccgui_next_lib::history::journal::run_status(app.state(), vec![result.run_id, "unknown-run".into()]).unwrap();
+    let statuses = serde_json::to_value(statuses).unwrap();
+    assert_eq!(statuses[0]["state"], "done");
+    assert_eq!(statuses[0]["origin"], "hub");
+    assert_eq!(statuses[0]["sessionId"], "fake-session-123");
+    assert_eq!(statuses[1]["known"], false);
+    let sessions = ccgui_next_lib::history::reader::list_sessions(app.state()).unwrap();
+    assert!(sessions.iter().any(|s| s.session_id == "fake-session-123" && s.origin == "hub"));
+    let page = ccgui_next_lib::history::reader::load_session_page(app.state(), "claude".into(), "fake-session-123".into(), None, None).await.unwrap();
+    assert_eq!(page.origin, "hub");
+    assert!(page.messages.iter().any(|m| m.text == "Hello from fake"));
 }
 
 #[tokio::test]
@@ -191,7 +279,7 @@ async fn send_message_streams_events_end_to_end() {
 async fn interrupt_kills_running_child() {
     let _env_guard = ENV_LOCK.lock().unwrap();
     let home = temp_home("interrupt");
-    let bin_dir = home.join("bin");
+    let bin_dir = home.join("appdata").join("npm");
     std::fs::create_dir_all(&bin_dir).unwrap();
     // Fake engine that emits a session id then hangs forever.
     let script = r#"#!/bin/sh
@@ -206,7 +294,14 @@ sleep 60
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+    #[cfg(windows)]
+    write_windows_cli(&bin_dir, "claude", r#"
+process.stdin.once('data', () => {
+  console.log(JSON.stringify({type:'system',subtype:'init',session_id:'fake-hang-1'}));
+  setInterval(() => {}, 1000);
+});
+"#);
+    let _environment = TestEnvironment::new(&home, &bin_dir);
 
     let workspace = home.join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -220,6 +315,7 @@ sleep 60
         None,
         "hi".to_string(),
         Vec::new(),
+        None,
         None,
         None,
         None,
@@ -284,11 +380,10 @@ sleep 60
 fn ipc_send_message_accepts_camel_case_args() {
     let _env_guard = ENV_LOCK.lock().unwrap();
     let home = temp_home("ipc");
-    let bin_dir = home.join("bin");
+    let bin_dir = home.join("appdata").join("npm");
     std::fs::create_dir_all(&bin_dir).unwrap();
     write_fake_claude(&bin_dir);
-    std::env::set_var("HOME", &home);
-    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+    let _environment = TestEnvironment::new(&home, &bin_dir);
     let workspace = home.join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
 
@@ -296,9 +391,10 @@ fn ipc_send_message_accepts_camel_case_args() {
         .invoke_handler(tauri::generate_handler![engine::send_message])
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
+    let db = Arc::new(Db::open_at(&home.join("app.db")).unwrap());
     app.manage(AppState {
-        db: Arc::new(Db::open_at(&home.join("app.db")).unwrap()),
-        sink: EventSink::new(Arc::new(app.handle().clone())),
+        db: db.clone(),
+        sink: EventSink::with_journal(Arc::new(app.handle().clone()), db),
         terminal_sink: EventSink::with_name(
             Arc::new(app.handle().clone()),
             ccgui_next_lib::terminal::TERMINAL_OUTPUT_EVENT,
@@ -333,7 +429,7 @@ fn ipc_send_message_accepts_camel_case_args() {
             cmd: "send_message".into(),
             callback: tauri::ipc::CallbackFn(0),
             error: tauri::ipc::CallbackFn(1),
-            url: "tauri://localhost".parse().unwrap(),
+            url: if cfg!(windows) { "http://tauri.localhost" } else { "tauri://localhost" }.parse().unwrap(),
             body: tauri::ipc::InvokeBody::Json(serde_json::json!({
                 "engine": "claude",
                 "workspacePath": workspace.to_string_lossy(),
@@ -359,7 +455,7 @@ async fn omp_send_uses_persisted_tier_and_model_without_touching_cli_config() {
     let _env_guard = ENV_LOCK.lock().unwrap();
     let home = temp_home("omp-tier");
     std::fs::create_dir_all(home.join(".ccgui-next")).unwrap();
-    let bin_dir = home.join("bin");
+    let bin_dir = home.join("appdata").join("npm");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let script = bin_dir.join("omp");
     std::fs::write(
@@ -376,7 +472,13 @@ echo '{"type":"agent_end"}'
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+    #[cfg(windows)]
+    write_windows_cli(&bin_dir, "omp", r#"
+require('node:fs').writeFileSync('omp-args.txt', process.argv.slice(2).join('\n')+'\n');
+console.log(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:'ok'}}));
+console.log(JSON.stringify({type:'agent_end'}));
+"#);
+    let _environment = TestEnvironment::new(&home, &bin_dir);
     let workspace = home.join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
     let (app, events) = build_app(&home);
@@ -402,6 +504,7 @@ echo '{"type":"agent_end"}'
             None,
             "hi".into(),
             Vec::new(),
+            None,
             None,
             None,
             None,

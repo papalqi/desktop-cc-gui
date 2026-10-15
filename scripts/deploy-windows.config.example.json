@@ -1,0 +1,12 @@
+{
+  "relay": {
+    "host": "ccgui-relay",
+    "directory": "/data/workspace/ccgui-relay",
+    "bun": "/root/.bun/bin/bun",
+    "wsUrl": "ws://127.0.0.1:8787/ws",
+    "releaseUrl": "http://relay-host:8787/"
+  },
+  "machines": {
+    "PC6": { "host": "pc6", "task": "CCGUIRelay" }
+  }
+}

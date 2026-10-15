@@ -14,15 +14,24 @@ pub struct SessionPage {
     pub next_before: Option<i64>,
     /// Earlier delegation rows and turn boundaries, independent of paging.
     pub subagent_history: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_cursor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_runs: Option<Vec<crate::engine::ActiveRun>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled_run_ids: Option<Vec<String>>,
+    /// No completion was saved for the latest turn and this host has no live run.
+    pub incomplete_turn: bool,
+    pub origin: String,
 }
 
 /// Lock the db, run a parameterless query, and collect rows through `map_row`.
 fn query_rows<T>(
-    state: &crate::AppState,
+    db: &crate::db::Db,
     sql: &str,
     map_row: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
 ) -> Result<Vec<T>, String> {
-    let conn = state.db.0.lock();
+    let conn = db.0.lock();
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], map_row).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -35,30 +44,24 @@ fn query_rows<T>(
     Ok(out)
 }
 
-/// Run a sessions-table mutation, then notify listeners.
-fn mutate_sessions(
-    state: &crate::AppState,
-    sql: &str,
-    params: impl rusqlite::Params,
-) -> Result<(), String> {
-    let conn = state.db.0.lock();
-    conn.execute(sql, params).map_err(|e| e.to_string())?;
-    drop(conn);
-    state.sink.emit_sessions_changed();
-    Ok(())
-}
-
 #[tauri::command]
 pub fn list_sessions(state: tauri::State<'_, crate::AppState>) -> Result<Vec<SessionMeta>, String> {
-    query_rows(
-        &state,
+    list_sessions_from(&state.db)
+}
+
+fn list_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>, String> {
+    let mut sessions = query_rows(
+        db,
         "SELECT s.engine, s.session_id, s.workspace_path, s.file_path, s.file_size, s.file_mtime_ms,
-                s.title, s.preview, s.created_at, s.updated_at, s.message_count, s.pinned, s.custom_title,
-                m.model, e.effort, p.provider_id
+                s.title, s.preview, s.created_at, s.updated_at, s.message_count, COALESCE(pin.pinned, s.pinned), CASE WHEN title.value IS NOT NULL THEN json_extract(title.value,'$') ELSE s.custom_title END,
+                m.model, e.effort, p.provider_id, COALESCE(o.origin,'local')
          FROM sessions s
+         LEFT JOIN session_pins pin ON pin.engine = s.engine AND pin.session_id = s.session_id
+         LEFT JOIN session_metadata_clocks title ON title.engine=s.engine AND title.session_id=s.session_id AND title.field='customTitle'
          LEFT JOIN session_models m ON m.engine = s.engine AND m.session_id = s.session_id
          LEFT JOIN session_efforts e ON e.engine = s.engine AND e.session_id = s.session_id
          LEFT JOIN session_providers p ON p.engine = s.engine AND p.session_id = s.session_id
+         LEFT JOIN session_origins o ON o.engine = s.engine AND o.session_id = s.session_id
          WHERE NOT EXISTS (
              SELECT 1 FROM session_archives a
              WHERE a.engine = s.engine AND a.session_id = s.session_id
@@ -84,24 +87,45 @@ pub fn list_sessions(state: tauri::State<'_, crate::AppState>) -> Result<Vec<Ses
                 provider: r.get(15)?,
                 remote: None,
                 remote_path: None,
+                origin: r.get(16)?,
             })
         },
-    )
+    )?;
+    sessions.extend(super::journal::unindexed_sessions(db)?);
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at.unwrap_or(0)));
+    Ok(sessions)
 }
 
 fn list_archived_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>, String> {
     let conn = db.0.lock();
     let mut stmt = conn
-        .prepare("SELECT snapshot_json FROM session_archives ORDER BY archived_at DESC")
+        .prepare("SELECT a.snapshot_json,pin.pinned,COALESCE(s.session_id,title.session_id),CASE WHEN title.value IS NOT NULL THEN json_extract(title.value,'$') ELSE s.custom_title END,m.model,e.effort,p.provider_id,COALESCE(o.origin,'local')
+                  FROM session_archives a
+                  LEFT JOIN session_pins pin ON pin.engine=a.engine AND pin.session_id=a.session_id
+                  LEFT JOIN sessions s ON s.engine=a.engine AND s.session_id=a.session_id
+                  LEFT JOIN session_metadata_clocks title ON title.engine=a.engine AND title.session_id=a.session_id AND title.field='customTitle'
+                  LEFT JOIN session_models m ON m.engine=a.engine AND m.session_id=a.session_id
+                  LEFT JOIN session_efforts e ON e.engine=a.engine AND e.session_id=a.session_id
+                  LEFT JOIN session_providers p ON p.engine=a.engine AND p.session_id=a.session_id
+                  LEFT JOIN session_origins o ON o.engine=a.engine AND o.session_id=a.session_id
+                  ORDER BY a.archived_at DESC")
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))
+        .query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<bool>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?)))
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for row in rows {
         match row {
-            Ok(json) => match serde_json::from_str::<SessionMeta>(&json) {
-                Ok(session) => out.push(session),
+            Ok((json,pinned,indexed,custom_title,model,effort,provider,origin)) => match serde_json::from_str::<SessionMeta>(&json) {
+                Ok(mut session) => {
+                    session.origin = origin;
+                    if let Some(pinned) = pinned { session.pinned = pinned; }
+                    if indexed.is_some() { session.custom_title = custom_title; }
+                    if model.is_some() { session.model = model; }
+                    if effort.is_some() { session.effort = effort; }
+                    if provider.is_some() { session.provider = provider; }
+                    out.push(session);
+                }
                 Err(e) => eprintln!("[history] skipping corrupt archive snapshot: {e}"),
             },
             Err(e) => eprintln!("[history] skipping unreadable archive row: {e}"),
@@ -118,35 +142,7 @@ pub fn list_archived_sessions(
 }
 
 fn archive_session_in(db: &crate::db::Db, session: &SessionMeta) -> Result<(), String> {
-    if session.engine.trim().is_empty()
-        || session.session_id.trim().is_empty()
-        || session.workspace_path.trim().is_empty()
-    {
-        return Err("archive_session: engine, sessionId and workspacePath are required".into());
-    }
-    let snapshot = serde_json::to_string(session).map_err(|e| e.to_string())?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    let conn = db.0.lock();
-    conn.execute(
-        "INSERT INTO session_archives(engine, session_id, workspace_path, snapshot_json, archived_at)
-         VALUES(?1,?2,?3,?4,?5)
-         ON CONFLICT(engine, session_id) DO UPDATE SET
-           workspace_path=excluded.workspace_path,
-           snapshot_json=excluded.snapshot_json,
-           archived_at=excluded.archived_at",
-        rusqlite::params![
-            session.engine,
-            session.session_id,
-            session.workspace_path,
-            snapshot,
-            now
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    super::metadata::write(db, &session.engine, &session.session_id, "archived", serde_json::json!(true), None, Some(session)).map(|_| ())
 }
 
 #[tauri::command]
@@ -160,13 +156,7 @@ pub fn archive_session(
 }
 
 fn restore_session_in(db: &crate::db::Db, engine: &str, session_id: &str) -> Result<(), String> {
-    let conn = db.0.lock();
-    conn.execute(
-        "DELETE FROM session_archives WHERE engine=?1 AND session_id=?2",
-        rusqlite::params![engine, session_id],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    super::metadata::write(db, engine, session_id, "archived", serde_json::json!(false), None, None).map(|_| ())
 }
 
 #[tauri::command]
@@ -302,18 +292,28 @@ struct CachedSession {
     fold: SubagentFold,
 }
 
-/// Parsed sessions keyed by (path, size, mtime_ms, accepted-frame signature):
+/// Parsed sessions keyed by (path, source stamp, accepted-frame signature):
 /// paging re-slices a cached parse instead of re-reading the file. The
 /// signature belongs in the key because recording a newly accepted frame
 /// changes what the parse must hide while the file's stat key is unchanged.
 /// Bounded two ways: 32 entries and a ~128MB byte budget (image data URLs
 /// make entries heavy).
-static PARSED_CACHE: LazyLock<Mutex<HashMap<(PathBuf, i64, i64, String), Arc<CachedSession>>>> =
+type FileStamp = (u64, u128);
+type SourceStamp = (FileStamp, Option<FileStamp>);
+static PARSED_CACHE: LazyLock<Mutex<HashMap<(PathBuf, SourceStamp, String), Arc<CachedSession>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PARSED_CACHE_BYTES: LazyLock<Mutex<usize>> = LazyLock::new(|| Mutex::new(0));
 
 const PARSED_CACHE_CAPACITY: usize = 32;
 const PARSED_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+
+fn source_stamp(path: &Path) -> Option<SourceStamp> {
+    let file_stamp = |path:&Path| { let meta = std::fs::metadata(path).ok()?; Some((meta.len(),meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos())) };
+    if let Some((db,_)) = super::split_opencode_db_path(path) {
+        let mut wal = db.as_os_str().to_os_string(); wal.push("-wal");
+        Some((file_stamp(&db)?,file_stamp(Path::new(&wal))))
+    } else { Some((file_stamp(path)?,None)) }
+}
 
 /// Rough in-memory footprint of one parsed session. Text and images used to
 /// be the whole story, but tool-result-heavy sessions keep most of their
@@ -366,7 +366,7 @@ fn cached_session(
     accepted_frames: &HashSet<String>,
     accepted_signature: &str,
 ) -> Result<Arc<CachedSession>, String> {
-    let Some((size, mtime_ms)) = super::stat_signature(path) else {
+    let Some(stamp) = source_stamp(path) else {
         // Unstattable file: let the parse produce the real error.
         let parsed = parse_session_file(engine, path, accepted_frames)?;
         let fold = subagent_fold(&parsed.messages);
@@ -374,8 +374,7 @@ fn cached_session(
     };
     let key = (
         path.to_path_buf(),
-        size,
-        mtime_ms,
+        stamp,
         accepted_signature.to_string(),
     );
     if let Some(hit) = PARSED_CACHE.lock().map_err(|e| e.to_string())?.get(&key) {
@@ -438,6 +437,10 @@ fn subagent_fold(messages: &[Message]) -> SubagentFold {
         }
     }
     rows
+}
+
+pub(super) fn subagent_projection(messages:&[Message]) -> (Vec<Message>,Vec<Option<i64>>) {
+    subagent_fold(messages).into_iter().map(|(trigger,row)| (row,messages.get(trigger).map(|message| message.seq))).unzip()
 }
 
 /// The fold of one prefix, kept for tests as the reference the cached
@@ -535,6 +538,7 @@ fn subagent_history_row(message: &Message, delegation: bool) -> Message {
         effort: None,
         duration_ms: None,
         images: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -574,6 +578,11 @@ fn page_from_cached(
         messages: page,
         next_before,
         subagent_history: subagent_history_until(messages, &cached.fold, start),
+        event_cursor: None,
+        active_runs: None,
+        settled_run_ids: None,
+        incomplete_turn: false,
+        origin: "local".into(),
     }
 }
 
@@ -592,6 +601,71 @@ fn load_session_page_blocking(
     Ok(page_from_cached(&cached, limit, before_seq))
 }
 
+/// Native position captured before a send; it never consults the journal.
+pub(crate) fn journal_anchor(db: &crate::db::Db, engine: &str, session: &str) -> Result<Option<Message>, String> {
+    Ok(load_session_page_blocking(db, engine, session, Some(1), None)?.messages.pop())
+}
+
+fn journal_page(
+    db: &crate::db::Db, engine: &str, session: &str, native: &ParsedSession,
+    processes: &crate::engine::ProcessRegistry, limit: Option<usize>, before: Option<i64>,
+) -> Result<SessionPage, String> {
+    let (mut page, _) = canonical_page(db, engine, session, native, processes)?;
+    let fold = subagent_fold(&page.messages);
+    let sliced = page_from_cached(&CachedSession { parsed: ParsedSession { messages: std::mem::take(&mut page.messages), ..Default::default() }, fold }, limit, before);
+    page.messages = sliced.messages;
+    page.next_before = sliced.next_before;
+    page.subagent_history = sliced.subagent_history;
+    Ok(page)
+}
+
+fn canonical_page(
+    db: &crate::db::Db, engine: &str, session: &str, native: &ParsedSession,
+    processes: &crate::engine::ProcessRegistry,
+) -> Result<(SessionPage, Vec<String>), String> {
+    let (cursor, runs) = super::journal::snapshot(db, engine, session)?;
+    let settled = super::journal::settled_ids(&runs);
+    let active: Vec<_> = processes.active_runs().into_iter().filter(|r| r.engine == engine && r.session_id.as_deref() == Some(session) && !settled.contains(&r.run_id)).collect();
+    let active_ids = active.iter().map(|r| r.run_id.clone()).collect();
+    let (accepted, _) = db.accepted_internal_frames(engine, session)?;
+    let (ids, mut messages): (Vec<_>, Vec<_>) = super::journal::overlay_identified(&native.messages, runs, &active_ids, &accepted).into_iter().unzip();
+    for message in &mut messages {
+        if let Some(question) = &mut message.question {
+            let pending = question["runId"].as_str().and_then(|id| processes.get(id)).is_some_and(|entry|
+                entry.questions.lock().is_ok_and(|questions| question["requestId"].as_str().is_some_and(|id| questions.contains_key(id))));
+            if !pending { question["status"] = "cancelled".into(); }
+        }
+    }
+    let incomplete_turn = active.is_empty() && messages.last().and_then(|m| m.run_id.as_ref())
+        .map_or(native.unfinished_turn, |id| !settled.contains(id));
+    Ok((SessionPage { messages, next_before: None, subagent_history: Vec::new(), event_cursor: Some(cursor),
+        active_runs: Some(active), settled_run_ids: Some(settled.into_iter().collect()), incomplete_turn,
+        origin: super::journal::session_origin(db, engine, session)? }, ids))
+}
+
+pub(super) fn canonical_session(db: &crate::db::Db, engine: &str, session: &str, processes: &crate::engine::ProcessRegistry, source: Option<&Path>) -> Result<(SessionPage, Vec<String>), String> {
+    let path = match source { Some(path) => Some(path.to_path_buf()), None => find_session_file_path(db, engine, session)? };
+    let (accepted, signature) = db.accepted_internal_frames(engine, session)?;
+    let native = path.map(|p| cached_session(engine, &p, &accepted, &signature)).transpose()?;
+    if native.is_none() && super::journal::snapshot(db, engine, session)?.1.is_empty() { return Err("session not found".into()); }
+    canonical_page(db, engine, session, native.as_ref().map(|c| &c.parsed).unwrap_or(&ParsedSession::default()), processes)
+}
+
+pub(super) fn log_source_signature(db: &crate::db::Db, engine: &str, session: &str, processes: &crate::engine::ProcessRegistry, source: Option<&Path>) -> Result<String, String> {
+    let path = match source { Some(path) => Some(path.to_path_buf()), None => find_session_file_path(db, engine, session)? };
+    let stat = path.as_ref().and_then(|p| source_stamp(p));
+    let (_, accepted) = db.accepted_internal_frames(engine, session)?;
+    let head: i64 = db.0.lock().query_row("SELECT COALESCE(MAX(e.cursor),0) FROM chat_events e JOIN chat_runs r ON r.run_id=e.run_id WHERE r.engine=?1 AND r.session_id=?2", rusqlite::params![engine,session], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let mut live: Vec<_> = processes.active_runs().into_iter().filter(|r| r.engine == engine && r.session_id.as_deref() == Some(session)).map(|r| {
+        let entry = processes.get(&r.run_id);
+        let mut questions: Vec<_> = entry.as_ref().and_then(|e| e.questions.lock().ok().map(|q| q.keys().cloned().collect())).unwrap_or_default();
+        questions.sort();
+        (r.run_id, questions)
+    }).collect();
+    live.sort();
+    serde_json::to_string(&(path,stat,accepted,head,live,super::journal::session_origin(db,engine,session)?)).map_err(|e| e.to_string())
+}
+
 /// Sync body of `load_remote_session_page`, once the remote transcript is
 /// cached on this machine. A remote page must consult the same accepted-frame
 /// table as a local one: `record_accepted_internal_frame` scopes an identity by
@@ -599,6 +673,7 @@ fn load_session_page_blocking(
 /// turn run in a remote workspace goes through the same send path, so its
 /// accepted frames are recorded exactly like a local session's. Parsing with an
 /// empty set would re-reveal every frame the capture validator hid.
+#[cfg(test)]
 fn remote_session_page_blocking(
     db: &crate::db::Db,
     engine: &str,
@@ -620,9 +695,18 @@ pub async fn load_session_page(
     limit: Option<usize>,
     before_seq: Option<i64>,
 ) -> Result<SessionPage, String> {
+    state.sink.flush();
     let db = Arc::clone(&state.db);
+    let processes = state.processes.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        load_session_page_blocking(&db, &engine, &session_id, limit, before_seq)
+        let path = find_session_file_path(&db, &engine, &session_id)?;
+        let (accepted, signature) = db.accepted_internal_frames(&engine, &session_id)?;
+        let native = path.map(|p| cached_session(&engine, &p, &accepted, &signature)).transpose()?;
+        if native.is_none() && super::journal::snapshot(&db, &engine, &session_id)?.1.is_empty() {
+            return Err("session not found".into());
+        }
+        journal_page(&db, &engine, &session_id,
+            native.as_ref().map(|c| &c.parsed).unwrap_or(&ParsedSession::default()), &processes, limit, before_seq)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -661,22 +745,15 @@ const MAX_REMOTE_SESSION_BYTES: u64 = 64 * 1024 * 1024;
 /// 上报;这里经引擎 spawn 同一套远程通道 `base64` 拉回转录本,落到本机缓存
 /// 文件后复用既有解析/分页/子代理折叠。缓存文件仅在内容有变化时重写(stat
 /// 签名不变 → 翻页命中解析缓存,不重析)。
-#[tauri::command]
-pub async fn load_remote_session_page(
-    state: tauri::State<'_, crate::AppState>,
-    workspace_path: String,
-    engine: String,
-    session_id: String,
-    remote_path: String,
-    limit: Option<usize>,
-    before_seq: Option<i64>,
-) -> Result<SessionPage, String> {
+pub(super) async fn remote_session_cache(
+    db: &crate::db::Db, workspace_path: &str, engine: &str, session_id: &str, remote_path: &str,
+) -> Result<PathBuf, String> {
     use sha2::Digest as _;
     if !is_plausible_remote_session_path(&engine, &remote_path) {
         return Err(format!("远程会话路径不合法: {remote_path}"));
     }
     let transport =
-        crate::engine::wsl_transport::transport_for_workspace(&state.db, &workspace_path)
+        crate::engine::wsl_transport::transport_for_workspace(db, workspace_path)
             .ok_or_else(|| format!("工作区 {workspace_path} 未登记远程传输"))?;
     // 先远端 stat 卡住字节上限再 base64,超限/不可读直接非零退出,
     // 避免超大转录本经 1.33× 膨胀后全量进内存。
@@ -703,22 +780,35 @@ pub async fn load_remote_session_page(
         .map(|old| old != bytes)
         .unwrap_or(true);
     if stale {
-        let tmp = dir.join(format!("{name}.jsonl.tmp"));
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("写缓存失败: {e}"))?;
-        std::fs::rename(&tmp, &cache_path).map_err(|e| format!("缓存落位失败: {e}"))?;
+        let tmp = dir.join(format!("{name}.{}.jsonl.tmp", uuid::Uuid::new_v4()));
+        if let Err(error) = std::fs::write(&tmp, &bytes) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("写缓存失败: {error}"));
+        }
+        if let Err(error) = std::fs::rename(&tmp, &cache_path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("缓存落位失败: {error}"));
+        }
     }
+    Ok(cache_path)
+}
 
+#[tauri::command]
+pub async fn load_remote_session_page(
+    state: tauri::State<'_, crate::AppState>,
+    workspace_path: String, engine: String, session_id: String, remote_path: String,
+    limit: Option<usize>, before_seq: Option<i64>,
+) -> Result<SessionPage, String> {
+    let cache_path = remote_session_cache(&state.db, &workspace_path, &engine, &session_id, &remote_path).await?;
     let engine_for_parse = engine.clone();
+    state.sink.flush();
+    let processes = state.processes.clone();
     let db = Arc::clone(&state.db);
     tauri::async_runtime::spawn_blocking(move || {
-        remote_session_page_blocking(
-            &db,
-            &engine_for_parse,
-            &session_id,
-            &cache_path,
-            limit,
-            before_seq,
-        )
+        let (accepted, signature) = db.accepted_internal_frames(&engine_for_parse, &session_id)?;
+        let cached = cached_session(&engine_for_parse, &cache_path, &accepted, &signature)?;
+        journal_page(&db, &engine_for_parse, &session_id, &cached.parsed,
+            &processes, limit, before_seq)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -947,13 +1037,21 @@ pub(super) fn delete_session_blocking(
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     // Recorded frame identities become unreachable with their session and
     // must be reclaimed in the same transaction as its indexed metadata.
+    tx.execute("INSERT OR IGNORE INTO chat_run_tombstones(run_id) SELECT run_id FROM chat_runs WHERE engine=?1 AND session_id=?2",
+        rusqlite::params![engine,session_id]).map_err(|e| e.to_string())?;
     for table in [
+        "chat_runs",
         "accepted_internal_frames",
         "sessions",
+        "session_pins",
+        "session_metadata_clocks",
         "session_models",
         "session_efforts",
         "session_providers",
         "session_archives",
+        "session_origins",
+        "session_log_heads",
+        "session_log_rows",
     ] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE engine=?1 AND session_id=?2"),
@@ -1010,13 +1108,16 @@ async fn delete_remote_session_and_frames(
 ) -> Result<(), String> {
     delete_disk.await?;
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = db.0.lock();
-        conn.execute(
-            "DELETE FROM accepted_internal_frames WHERE engine=?1 AND session_id=?2",
-            rusqlite::params![engine, session_id],
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        let mut conn = db.0.lock();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for table in ["accepted_internal_frames", "session_pins", "session_metadata_clocks", "session_log_heads", "session_log_rows"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE engine=?1 AND session_id=?2"),
+                rusqlite::params![engine, session_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1047,6 +1148,15 @@ pub async fn delete_remote_session(
     .await
 }
 
+fn pin_session_in(
+    db: &crate::db::Db,
+    engine: &str,
+    session_id: &str,
+    pinned: bool,
+) -> Result<(), String> {
+    super::metadata::write(db, engine, session_id, "pinned", serde_json::json!(pinned), None, None).map(|_| ())
+}
+
 #[tauri::command]
 pub fn pin_session(
     state: tauri::State<'_, crate::AppState>,
@@ -1054,11 +1164,9 @@ pub fn pin_session(
     session_id: String,
     pinned: bool,
 ) -> Result<(), String> {
-    mutate_sessions(
-        &state,
-        "UPDATE sessions SET pinned=?3 WHERE engine=?1 AND session_id=?2",
-        rusqlite::params![engine, session_id, pinned as i64],
-    )
+    pin_session_in(&state.db, &engine, &session_id, pinned)?;
+    state.sink.emit_sessions_changed();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1068,16 +1176,9 @@ pub fn rename_session(
     session_id: String,
     title: String,
 ) -> Result<(), String> {
-    let value = if title.trim().is_empty() {
-        None
-    } else {
-        Some(title.trim().to_string())
-    };
-    mutate_sessions(
-        &state,
-        "UPDATE sessions SET custom_title=?3 WHERE engine=?1 AND session_id=?2",
-        rusqlite::params![engine, session_id, value],
-    )
+    super::metadata::write(&state.db, &engine, &session_id, "customTitle", serde_json::json!(title), None, None)?;
+    state.sink.emit_sessions_changed();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1238,7 +1339,7 @@ pub struct Workspace {
 #[tauri::command]
 pub fn list_workspaces(state: tauri::State<'_, crate::AppState>) -> Result<Vec<Workspace>, String> {
     query_rows(
-        &state,
+        &state.db,
         "SELECT id, path, name, last_opened_at, sort_order, group_id, kind, parent_id, meta FROM workspaces
          ORDER BY sort_order IS NULL, sort_order, COALESCE(last_opened_at, 0) DESC",
         |r| {
@@ -1479,6 +1580,190 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn pin_session_survives_before_indexing_restart_and_indexing() {
+        let scratch = Scratch::new();
+        let db_path = scratch.0.join("app.db");
+        let db = crate::db::Db::open_at(&db_path).unwrap();
+        super::super::journal::begin(&db, "pin-run", "codex", Some("pin-new"), "/ws", 1000, None).unwrap();
+        super::super::journal::append(&db, &[
+            json!({"runId":"pin-run","sessionId":"pin-new","seq":0,"kind":"message",
+                "data":{"role":"user","text":"更新本仓库"}}).to_string(),
+        ]).unwrap();
+        assert!(!list_sessions_from(&db).unwrap()[0].pinned);
+
+        pin_session_in(&db, "codex", "pin-new", true).unwrap();
+        let sessions = list_sessions_from(&db).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "更新本仓库");
+        assert!(sessions[0].pinned, "a new session must be pinnable before indexing");
+
+        pin_session_in(&db, "codex", "pin-new", false).unwrap();
+        assert!(!list_sessions_from(&db).unwrap()[0].pinned);
+        pin_session_in(&db, "codex", "pin-new", true).unwrap();
+
+        drop(db);
+        let db = crate::db::Db::open_at(&db_path).unwrap();
+        assert!(list_sessions_from(&db).unwrap()[0].pinned);
+        db.0.lock().execute(
+            "INSERT INTO sessions(engine,session_id,workspace_path,file_path,file_size,file_mtime_ms,title)
+             VALUES('codex','pin-new','/ws','native.jsonl',1,1,'Indexed title')", [],
+        ).unwrap();
+        let sessions = list_sessions_from(&db).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "Indexed title");
+        assert!(sessions[0].pinned, "indexing must preserve the saved pin");
+
+        pin_session_in(&db, "codex", "pin-new", false).unwrap();
+        assert!(!list_sessions_from(&db).unwrap()[0].pinned);
+        drop(db);
+        let db = crate::db::Db::open_at(&db_path).unwrap();
+        assert!(!list_sessions_from(&db).unwrap()[0].pinned);
+    }
+
+    #[test]
+    fn pin_session_keeps_existing_pins_and_engine_scope() {
+        let scratch = Scratch::new();
+        let db_path = scratch.0.join("app.db");
+        let db = crate::db::Db::open_at(&db_path).unwrap();
+        for engine in ["codex", "omp"] {
+            db.0.lock().execute(
+                "INSERT INTO sessions(engine,session_id,workspace_path,file_path,file_size,file_mtime_ms,pinned)
+                 VALUES(?1,'shared-id','/ws','native.jsonl',1,1,1)", [engine],
+            ).unwrap();
+        }
+        drop(db);
+        let db = crate::db::Db::open_at(&db_path).unwrap();
+        assert!(list_sessions_from(&db).unwrap().iter().all(|s| s.pinned));
+
+        pin_session_in(&db, "codex", "shared-id", false).unwrap();
+        for session in list_sessions_from(&db).unwrap() {
+            assert_eq!(session.pinned, session.engine == "omp");
+        }
+    }
+
+    #[test]
+    fn pin_session_is_reclaimed_when_the_session_is_deleted() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let path = scratch.0.join("native.jsonl");
+        std::fs::write(&path, "").unwrap();
+        db.0.lock().execute(
+            "INSERT INTO sessions(engine,session_id,workspace_path,file_path,file_size,file_mtime_ms)
+             VALUES('codex','pin-delete','/ws',?1,0,0)", [path.to_string_lossy().as_ref()],
+        ).unwrap();
+        pin_session_in(&db, "codex", "pin-delete", true).unwrap();
+        pin_session_in(&db, "omp", "pin-delete", true).unwrap();
+
+        delete_session_blocking(&db, "codex", "pin-delete").unwrap();
+
+        assert!(!path.exists());
+        assert!(list_sessions_from(&db).unwrap().is_empty());
+        let pins: Vec<String> = query_rows(&db, "SELECT engine FROM session_pins", |r| r.get(0)).unwrap();
+        assert_eq!(pins, ["omp"]);
+    }
+
+    #[test]
+    fn unfinished_codex_history_reports_missing_end_without_changing_messages() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let path = scratch.0.join("unfinished.jsonl");
+        let processes = crate::engine::ProcessRegistry::default();
+        for (end, turn, incomplete) in [
+            (None, "latest", true),
+            (Some("task_complete"), "latest", false),
+            (Some("turn_aborted"), "latest", false),
+            (Some("task_complete"), "older", true),
+        ] {
+            let mut lines = vec![
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"latest"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"saved progress 中文🙂"}]}}),
+            ];
+            if let Some(end) = end {
+                lines.push(json!({"type":"event_msg","payload":{"type":end,"turn_id":turn}}));
+            }
+            std::fs::write(&path, lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+            let parsed = parse_session_file("codex", &path, &HashSet::new()).unwrap();
+            let page = journal_page(&db, "codex", "s", &parsed, &processes, Some(100), None).unwrap();
+            assert_eq!(page.messages.len(), 2);
+            assert_eq!(page.messages[1].text, "saved progress 中文🙂");
+            assert_eq!(serde_json::to_value(page).unwrap()["incompleteTurn"], incomplete);
+            let summary = super::super::scan_summary_file("codex", &path, &HashSet::new()).unwrap();
+            assert_eq!(summary.message_count, 2, "turn markers must not become conversation rows");
+            processes.insert("live".into(), crate::engine::ChildEntry {
+                child: None, pid: 0, run_id: "live".into(), killed: Default::default(),
+                reader_abort: Default::default(), stdin: None,
+                questions: Default::default(), plans: Default::default(),
+            });
+            processes.note_run("live", "codex", Some("s"), "/ws");
+            assert!(!journal_page(&db, "codex", "s", &parsed, &processes, None, None).unwrap().incomplete_turn);
+            processes.remove_reservation("live");
+        }
+    }
+
+    #[test]
+    fn completed_journal_run_supersedes_an_unfinished_native_turn() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let native = ParsedSession { unfinished_turn: true, ..Default::default() };
+        let processes = crate::engine::ProcessRegistry::default();
+        super::super::journal::begin(&db, "r", "codex", Some("s"), "/ws", 2000, None).unwrap();
+        let event = |seq, kind, data| json!({"runId":"r","sessionId":"s","seq":seq,"kind":kind,"data":data}).to_string();
+        super::super::journal::append(&db, &[event(0, "message", json!({"role":"user","text":"continue"}))]).unwrap();
+        assert!(journal_page(&db, "codex", "s", &native, &processes, None, None).unwrap().incomplete_turn);
+        super::super::journal::append(&db, &[event(1, "done", json!({}))]).unwrap();
+        assert!(!journal_page(&db, "codex", "s", &native, &processes, None, None).unwrap().incomplete_turn);
+    }
+
+    #[test]
+    fn large_journal_pages_preserve_unicode_and_full_tool_results() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let path = scratch.0.join("large.jsonl");
+        let text = "中文🙂".repeat(1638);
+        let lines: Vec<_> = (0..600).map(|index| {
+            let role = if index % 2 == 0 { "user" } else { "assistant" };
+            json!({"type":"response_item","payload":{"type":"message","role":role,
+                "content":[{"type":if role=="user" {"input_text"} else {"output_text"},"text":format!("{index}:{text}")}]}}).to_string()
+        }).collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(bytes > 9 * 1024 * 1024);
+        let cold = std::time::Instant::now();
+        let cached = cached_session("codex", &path, &HashSet::new(), "").unwrap();
+        let parse_ms = cold.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(cached.parsed.messages.len(), 600);
+        super::super::journal::begin(&db, "large-run", "codex", Some("large"), "/ws", 2000, cached.parsed.messages.last()).unwrap();
+        let event = |seq, kind, data| json!({"runId":"large-run","sessionId":"large","seq":seq,"kind":kind,"data":data}).to_string();
+        super::super::journal::append(&db, &[
+            event(0,"message",json!({"role":"user","text":"新回合🙂"})),
+            event(1,"message",json!({"role":"tool","text":"exec","toolCallId":"t","args":{"command":"test"}})),
+            event(2,"message",json!({"role":"tool","text":"exec","toolCallId":"t","patch":true,"result":{"text":"完整结果🙂\n```js\nconst x = 1;\n```"}})),
+            event(3,"delta",json!("回答🙂")), event(4,"done",json!({})),
+        ]).unwrap();
+        let processes = crate::engine::ProcessRegistry::default();
+        let mut before = None;
+        let mut samples = Vec::new();
+        let mut count = 0;
+        let mut serialize_ms = 0.0;
+        loop {
+            let start = std::time::Instant::now();
+            let page = journal_page(&db,"codex","large",&cached.parsed,&processes,Some(20),before).unwrap();
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            let serial = std::time::Instant::now();
+            let value = serde_json::to_value(&page).unwrap();
+            serialize_ms += serial.elapsed().as_secs_f64() * 1000.0;
+            if before.is_none() { assert_eq!(value["messages"][18]["result"]["text"], "完整结果🙂\n```js\nconst x = 1;\n```"); }
+            count += page.messages.len(); before = page.next_before;
+            if before.is_none() { break; }
+        }
+        assert_eq!(count,603);
+        samples.sort_by(f64::total_cmp);
+        println!("local journal benchmark: bytes={bytes}, cold_parse_ms={parse_ms:.2}, pages={}, hot_page_p50_ms={:.2}, hot_page_p95_ms={:.2}, page_serialization_total_ms={serialize_ms:.2}",
+            samples.len(), samples[samples.len()/2], samples[(samples.len()*95/100).min(samples.len()-1)]);
     }
 
     /// One omp rollout whose assistant turn carries two look-alike frames.
@@ -1838,6 +2123,7 @@ mod tests {
             provider: Some("provider".into()),
             remote: None,
             remote_path: None,
+            origin: "local".into(),
         }
     }
 
@@ -1852,6 +2138,19 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn archive_catalog_uses_canonical_origin_instead_of_a_stale_snapshot() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let session = archived_fixture();
+        archive_session_in(&db, &session).unwrap();
+        assert_eq!(list_archived_sessions_from(&db).unwrap()[0].origin, "local");
+        super::super::journal::set_origin(&db, &session.engine, &session.session_id, "hub").unwrap();
+        assert_eq!(list_archived_sessions_from(&db).unwrap()[0].origin, "hub");
+        super::super::journal::set_origin(&db, &session.engine, &session.session_id, "local").unwrap();
+        assert_eq!(list_archived_sessions_from(&db).unwrap()[0].origin, "local");
     }
 
     #[test]
@@ -2036,6 +2335,7 @@ mod tests {
             effort: None,
             duration_ms: None,
             images: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -2411,12 +2711,14 @@ mod tests {
             effort: None,
             duration_ms: None,
             images: Vec::new(),
+            ..Default::default()
         };
         let full = ParsedSession {
             messages: vec![row(
                 Some(json!({ "command": big_args })),
                 Some(json!({ "details": { "log": big_result } })),
             )],
+            ..Default::default()
         };
         // 40k of args+result dwarfs the 2-char text; a threshold above either
         // payload alone fails if args OR result accounting is dropped.
@@ -2428,6 +2730,7 @@ mod tests {
         // smaller: the footprint tracks retained bytes, not the row count.
         let bare = ParsedSession {
             messages: vec![row(None, None)],
+            ..Default::default()
         };
         assert!(
             parsed_footprint(&full) > parsed_footprint(&bare) + 39_000,

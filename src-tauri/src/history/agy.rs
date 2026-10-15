@@ -84,7 +84,7 @@ pub(super) fn parse_agy_session(
         messages.push(plain_message(seq, "user", visible.to_string(), turn.ts_ms));
     }
 
-    ParsedSession { messages }
+    ParsedSession { messages, ..Default::default() }
 }
 
 pub(super) fn scan_agy_summary(
@@ -228,6 +228,7 @@ fn plain_message(seq: i64, role: &str, text: String, ts_ms: Option<i64>) -> Mess
         effort: None,
         duration_ms: None,
         images: Vec::new(),
+        ..Default::default()
     }
 }
 

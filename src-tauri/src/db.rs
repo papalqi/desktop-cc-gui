@@ -56,6 +56,8 @@ impl Db {
         // FK, so enabling enforcement changes nothing else.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
+        crate::history::journal::migrate(&conn)?;
+        crate::history::log::migrate(&conn)?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -231,7 +233,7 @@ impl Db {
         conn.execute(
             "INSERT INTO session_models(engine, session_id, model, updated_at)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(engine, session_id) DO UPDATE SET model=excluded.model, updated_at=excluded.updated_at",
+             ON CONFLICT(engine, session_id) DO UPDATE SET model=excluded.model, updated_at=excluded.updated_at WHERE excluded.updated_at >= session_models.updated_at",
             rusqlite::params![engine, session_id, model, now],
         )
         .map_err(|e| e.to_string())?;
@@ -253,7 +255,7 @@ impl Db {
         conn.execute(
             "INSERT INTO session_efforts(engine, session_id, effort, updated_at)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(engine, session_id) DO UPDATE SET effort=excluded.effort, updated_at=excluded.updated_at",
+             ON CONFLICT(engine, session_id) DO UPDATE SET effort=excluded.effort, updated_at=excluded.updated_at WHERE excluded.updated_at >= session_efforts.updated_at",
             rusqlite::params![engine, session_id, effort, now],
         )
         .map_err(|e| e.to_string())?;
@@ -275,7 +277,7 @@ impl Db {
         conn.execute(
             "INSERT INTO session_providers(engine, session_id, provider_id, updated_at)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(engine, session_id) DO UPDATE SET provider_id=excluded.provider_id, updated_at=excluded.updated_at",
+             ON CONFLICT(engine, session_id) DO UPDATE SET provider_id=excluded.provider_id, updated_at=excluded.updated_at WHERE excluded.updated_at >= session_providers.updated_at",
             rusqlite::params![engine, session_id, provider_id, now],
         )
         .map_err(|e| e.to_string())?;
@@ -771,6 +773,21 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY(engine, session_id)
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_path);
+        -- Pins can be saved before the transcript is indexed in sessions.
+        CREATE TABLE IF NOT EXISTS session_pins(
+            engine TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            pinned INTEGER NOT NULL,
+            PRIMARY KEY(engine, session_id)
+        );
+        CREATE TABLE IF NOT EXISTS session_metadata_clocks(
+            engine TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            field TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY(engine,session_id,field)
+        );
         -- App-owned archive markers. CLI transcripts remain untouched; the
         -- independent marker survives scanner upserts and workspace re-adds.
         -- The snapshot also covers plugin-fed remote sessions, which have no

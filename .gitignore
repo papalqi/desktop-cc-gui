@@ -5,6 +5,7 @@ node_modules
 dist
 src-tauri/target
 src-tauri/gen
+/tsconfig.tsbuildinfo
 
 # Secrets — never commit
 .env
@@ -39,3 +40,4 @@ CLAUDE.md
 # Local verification artifacts (CI bundles, screenshots) — distribute via
 # CI artifact attachments or release assets, never the git history.
 artifacts/
+scripts/deploy-windows.local.json

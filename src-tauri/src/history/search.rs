@@ -58,6 +58,7 @@ pub struct SnippetPart {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageSearchHit {
+    pub origin: String,
     pub engine: String,
     pub session_id: String,
     pub workspace_path: String,
@@ -97,10 +98,10 @@ pub struct MessageSearchPage {
 const PENDING_FROM: &str = "
     FROM sessions s
     LEFT JOIN fts_state f ON f.engine = s.engine AND f.session_id = s.session_id
-    WHERE f.version IS NULL
+    WHERE (f.version IS NULL
        OR (f.version != ?1 AND f.version != ?2)
        OR f.file_size != s.file_size
-       OR f.file_mtime_ms != s.file_mtime_ms";
+       OR f.file_mtime_ms != s.file_mtime_ms)";
 
 struct PendingSession {
     engine: String,
@@ -137,10 +138,12 @@ fn pending_batch(db: &crate::db::Db) -> Result<Vec<PendingSession>, String> {
     Ok(rows)
 }
 
-fn pending_count(db: &crate::db::Db) -> Result<i64, String> {
+fn pending_count(db: &crate::db::Db, remote_only: bool) -> Result<i64, String> {
     let conn = db.0.lock();
     conn.query_row(
-        &format!("SELECT COUNT(*) {PENDING_FROM}"),
+        &format!("SELECT COUNT(*) {PENDING_FROM} {}", if remote_only {
+            "AND EXISTS(SELECT 1 FROM session_origins o WHERE o.engine=s.engine AND o.session_id=s.session_id AND o.origin='hub')"
+        } else { "" }),
         rusqlite::params![INDEX_VERSION, failed_version()],
         |r| r.get(0),
     )
@@ -149,9 +152,9 @@ fn pending_count(db: &crate::db::Db) -> Result<i64, String> {
 
 /// Messages currently in the content index: the corpus a query runs
 /// against, reported next to the search duration.
-fn message_count(db: &crate::db::Db) -> Result<i64, String> {
+fn message_count(db: &crate::db::Db, remote_only: bool) -> Result<i64, String> {
     let conn = db.0.lock();
-    conn.query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0))
+    conn.query_row(if remote_only { "SELECT COUNT(*) FROM session_messages m JOIN session_origins o ON o.engine=m.engine AND o.session_id=m.session_id WHERE o.origin='hub'" } else { "SELECT COUNT(*) FROM session_messages" }, [], |r| r.get(0))
         .map_err(|e| e.to_string())
 }
 
@@ -240,7 +243,7 @@ fn index_one(db: &crate::db::Db, row: &PendingSession) -> Result<bool, String> {
             }
         }
     } else {
-        super::ParsedSession { messages: vec![] }
+        super::ParsedSession::default()
     };
 
     write_index(db, row, &parsed, &accepted_signature)
@@ -535,6 +538,7 @@ fn like_snippet(text: &str, needles: &[Vec<char>]) -> Vec<SnippetPart> {
 }
 
 struct RawHit {
+    origin: String,
     engine: String,
     session_id: String,
     role: String,
@@ -552,7 +556,9 @@ fn fts_search(
     tokens: &[&str],
     limit: u32,
     offset: u32,
+    remote_only: bool,
 ) -> Result<Vec<RawHit>, String> {
+    let scope_filter = if remote_only { "AND o.origin='hub'" } else { "" };
     let sql = format!(
         "WITH matched AS (
              SELECT rowid, bm25(messages_fts) AS rank
@@ -568,12 +574,13 @@ fn fts_search(
          )
          SELECT b.engine, b.session_id, b.role,
                 snippet(messages_fts, 0, char(1), char(2), '…', 24),
-                s.workspace_path, w.name, s.title, s.custom_title, s.updated_at
+                s.workspace_path, w.name, s.title, s.custom_title, s.updated_at, COALESCE(o.origin,'local')
          FROM best b
          JOIN messages_fts ON messages_fts.rowid = b.id AND messages_fts MATCH ?1
          JOIN sessions s ON s.engine = b.engine AND s.session_id = b.session_id
          LEFT JOIN workspaces w ON w.path = s.workspace_path
-         WHERE b.rn = 1
+         LEFT JOIN session_origins o ON o.engine=s.engine AND o.session_id=s.session_id
+         WHERE b.rn = 1 {scope_filter}
          ORDER BY b.rank ASC, s.updated_at DESC, b.engine, b.session_id
          LIMIT ?2 OFFSET ?3"
     );
@@ -584,6 +591,7 @@ fn fts_search(
             rusqlite::params![fts_query(tokens), limit as i64 + 1, offset as i64],
             |r| {
                 Ok(RawHit {
+                    origin: r.get(9)?,
                     engine: r.get(0)?,
                     session_id: r.get(1)?,
                     role: r.get(2)?,
@@ -608,14 +616,16 @@ fn like_search(
     tokens: &[&str],
     limit: u32,
     offset: u32,
+    remote_only: bool,
 ) -> Result<Vec<RawHit>, String> {
+    let scope_filter = if remote_only { "AND o.origin='hub'" } else { "" };
     let likes = (0..tokens.len())
         .map(|i| format!("m2.text LIKE ?{} ESCAPE '\\'", i + 1))
         .collect::<Vec<_>>()
         .join(" AND ");
     let sql = format!(
         "SELECT m.engine, m.session_id, m.role, m.text,
-                s.workspace_path, w.name, s.title, s.custom_title, s.updated_at
+                s.workspace_path, w.name, s.title, s.custom_title, s.updated_at, COALESCE(o.origin,'local')
          FROM (
              SELECT m2.*, ROW_NUMBER() OVER (
                  PARTITION BY m2.engine, m2.session_id ORDER BY m2.seq
@@ -625,7 +635,8 @@ fn like_search(
          ) m
          JOIN sessions s ON s.engine = m.engine AND s.session_id = m.session_id
          LEFT JOIN workspaces w ON w.path = s.workspace_path
-         WHERE m.rn = 1
+         LEFT JOIN session_origins o ON o.engine=s.engine AND o.session_id=s.session_id
+         WHERE m.rn = 1 {scope_filter}
          ORDER BY s.updated_at DESC, m.engine, m.session_id
          LIMIT ?{} OFFSET ?{}",
         tokens.len() + 1,
@@ -640,6 +651,7 @@ fn like_search(
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params), |r| {
             Ok(RawHit {
+                origin: r.get(9)?,
                 engine: r.get(0)?,
                 session_id: r.get(1)?,
                 role: r.get(2)?,
@@ -668,17 +680,32 @@ pub fn search(
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> Result<MessageSearchPage, String> {
+    search_in_scope(db, query, limit, offset, None)
+}
+
+pub fn search_in_scope(
+    db: &crate::db::Db,
+    query: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    scope: Option<&str>,
+) -> Result<MessageSearchPage, String> {
+    let remote_only = match scope {
+        None | Some("all") => false,
+        Some("remote") => true,
+        _ => return Err("invalid session scope".into()),
+    };
     let trimmed = query.trim();
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = offset.unwrap_or(0);
     // Reporting, not searching: the corpus count happens before the elapsed
     // clock starts (same for the pending count after it stops).
-    let total_messages = message_count(db)?;
+    let total_messages = message_count(db, remote_only)?;
     if trimmed.is_empty() {
         return Ok(MessageSearchPage {
             hits: vec![],
             has_more: false,
-            pending: pending_count(db)?,
+            pending: pending_count(db, remote_only)?,
             elapsed_us: 0,
             total_messages,
         });
@@ -687,10 +714,10 @@ pub fn search(
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     let needles: Vec<Vec<char>> = tokens.iter().map(|t| lower_chars(t)).collect();
     let raw = if fts_safe(&tokens) {
-        fts_search(db, &tokens, limit, offset)?
+        fts_search(db, &tokens, limit, offset, remote_only)?
     } else {
         // Short tokens have no ranking signal; recency is the honest order.
-        like_search(db, &tokens, limit, offset)?
+        like_search(db, &tokens, limit, offset, remote_only)?
     };
     let has_more = raw.len() as u32 > limit;
     let hits = raw
@@ -703,6 +730,7 @@ pub fn search(
                 (None, None) => vec![],
             };
             MessageSearchHit {
+                origin: hit.origin,
                 engine: hit.engine,
                 session_id: hit.session_id,
                 workspace_path: hit.workspace_path,
@@ -719,7 +747,7 @@ pub fn search(
     Ok(MessageSearchPage {
         hits,
         has_more,
-        pending: pending_count(db)?,
+        pending: pending_count(db, remote_only)?,
         elapsed_us,
         total_messages,
     })
@@ -731,9 +759,10 @@ pub async fn search_messages(
     query: String,
     limit: Option<u32>,
     offset: Option<u32>,
+    scope: Option<String>,
 ) -> Result<MessageSearchPage, String> {
     let db = Arc::clone(&state.db);
-    tauri::async_runtime::spawn_blocking(move || search(&db, &query, limit, offset))
+    tauri::async_runtime::spawn_blocking(move || search_in_scope(&db, &query, limit, offset, scope.as_deref()))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -783,6 +812,36 @@ mod tests {
             .filter(|p| p.marked)
             .map(|p| p.text.as_str())
             .collect()
+    }
+
+    #[test]
+    fn remote_scope_filters_before_paging_for_both_search_paths() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        insert_session(&db, "local", 300);
+        insert_session(&db, "remote-first", 200);
+        insert_session(&db, "remote-next", 100);
+        for id in ["local", "remote-first", "remote-next"] {
+            insert_message(&db, id, 1, "assistant", "hello 中文🙂");
+        }
+        for id in ["remote-first", "remote-next"] {
+            db.0.lock().execute("INSERT INTO session_origins(engine,session_id,origin,adopted_at) VALUES('claude',?1,'hub',1)", [id]).unwrap();
+        }
+        for query in ["hello", "中文"] {
+            let first = search_in_scope(&db, query, Some(1), Some(0), Some("remote")).unwrap();
+            assert_eq!(first.hits[0].session_id, "remote-first");
+            assert_eq!(first.hits[0].origin, "hub");
+            assert!(first.has_more);
+            assert_eq!(first.total_messages, 2);
+            assert_eq!(first.pending, 2);
+            let next = search_in_scope(&db, query, Some(1), Some(1), Some("remote")).unwrap();
+            assert_eq!(next.hits[0].session_id, "remote-next");
+            assert!(!next.has_more);
+        }
+        let all = search_in_scope(&db, "中文", Some(10), None, Some("all")).unwrap();
+        assert_eq!(all.hits.len(), 3);
+        assert_eq!(all.hits[0].origin, "local");
+        assert!(search_in_scope(&db, "hello", None, None, Some("unknown")).is_err());
     }
 
     #[test]
@@ -920,7 +979,7 @@ mod tests {
         register_file_session(&db, "s1", &path);
 
         assert_eq!(index_pending(&db).unwrap(), 1);
-        assert_eq!(pending_count(&db).unwrap(), 0);
+        assert_eq!(pending_count(&db, false).unwrap(), 0);
         let page = search(&db, "索引管道", None, None).unwrap();
         assert_eq!(page.hits.len(), 1);
         assert!(page.pending == 0);
@@ -994,11 +1053,11 @@ mod tests {
             .unwrap()
             .hits
             .is_empty());
-        assert_eq!(pending_count(&db).unwrap(), 1, "the session stays pending");
+        assert_eq!(pending_count(&db, false).unwrap(), 1, "the session stays pending");
 
         // The fresh pass reads the enlarged identity set and hides the frame.
         assert_eq!(index_pending(&db).unwrap(), 1);
-        assert_eq!(pending_count(&db).unwrap(), 0);
+        assert_eq!(pending_count(&db, false).unwrap(), 0);
         assert!(search(&db, "racehidden", None, None)
             .unwrap()
             .hits
@@ -1026,14 +1085,14 @@ mod tests {
         register(10, 10);
         // Parse fails → failure stamp: nothing indexed, nothing left pending.
         assert_eq!(index_pending(&db).unwrap(), 0);
-        assert_eq!(pending_count(&db).unwrap(), 0);
+        assert_eq!(pending_count(&db, false).unwrap(), 0);
         // A stable stat never retries…
         assert_eq!(index_pending(&db).unwrap(), 0);
         // …but a changed file re-pends the session for one fresh attempt.
         register(11, 11);
-        assert_eq!(pending_count(&db).unwrap(), 1);
+        assert_eq!(pending_count(&db, false).unwrap(), 1);
         assert_eq!(index_pending(&db).unwrap(), 0);
-        assert_eq!(pending_count(&db).unwrap(), 0);
+        assert_eq!(pending_count(&db, false).unwrap(), 0);
     }
 
     #[test]
@@ -1062,7 +1121,7 @@ mod tests {
             register_file_session(&db, &format!("good-{i}"), &path);
         }
         assert_eq!(index_pending(&db).unwrap(), 4);
-        assert_eq!(pending_count(&db).unwrap(), 0);
+        assert_eq!(pending_count(&db, false).unwrap(), 0);
         let page = search(&db, "可索引的正常内容", None, None).unwrap();
         assert_eq!(page.hits.len(), 4);
     }

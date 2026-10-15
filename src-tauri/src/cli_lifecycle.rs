@@ -100,20 +100,41 @@ fn platform_name() -> &'static str {
     }
 }
 
-/// Claude Code is distributed both as an npm package and as a native
-/// installer build; pushing an npm global install onto a native install
-/// would shadow it with a second binary. The npm copy lives inside a
-/// node_modules tree, so the resolved binary path decides the channel.
+/// Claude Code and Codex ship both as an npm package and as a native
+/// installer. The channel has to be the tree the probe actually runs:
+/// the official installer updates `%LOCALAPPDATA%\Programs\OpenAI\Codex`
+/// (or `~/.local/bin`) and exits 0 even when an older npm shim is what
+/// the app launches. Windows `npm -g` shims live in `%APPDATA%\npm\*.cmd`
+/// and do not contain `node_modules` in their own path.
 /// Not installed → "native" (the official installer is the default path).
 fn claude_update_kind(bin: &str) -> &'static str {
-    let resolved = std::fs::canonicalize(bin)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| bin.to_string());
-    if resolved.contains("node_modules") {
+    if is_npm_managed_binary(bin) {
         "npm"
     } else {
         "native"
     }
+}
+
+fn is_npm_managed_binary(bin: &str) -> bool {
+    let resolved = std::fs::canonicalize(bin)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| bin.to_string());
+    if resolved.to_ascii_lowercase().contains("node_modules") {
+        return true;
+    }
+    let path = std::path::Path::new(&resolved);
+    // `%APPDATA%\npm\codex.cmd` — the package is beside the shim.
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name) if name.eq_ignore_ascii_case("npm")
+        )
+    }) {
+        return true;
+    }
+    // nvm / fnm / Volta: the global shim sits next to that prefix's node_modules.
+    path.parent()
+        .is_some_and(|dir| dir.join("node_modules").is_dir())
 }
 
 fn update_kind(engine: &str, bin: &str) -> Option<&'static str> {
@@ -750,6 +771,24 @@ mod tests {
                 "/usr/local/lib/node_modules/@openai/codex/bin/codex.js"
             ),
             Some("npm")
+        );
+        // Windows npm -g shims are not inside node_modules. Treating them as
+        // native ran the official installer against a different tree, reported
+        // success, and left the probed shim on the old version.
+        assert_eq!(
+            update_kind("codex", r"C:\Users\demo\AppData\Roaming\npm\codex.cmd"),
+            Some("npm")
+        );
+        assert_eq!(
+            update_kind("claude", r"C:\Users\demo\AppData\Roaming\npm\claude.cmd"),
+            Some("npm")
+        );
+        assert_eq!(
+            update_kind(
+                "codex",
+                r"C:\Users\demo\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe"
+            ),
+            Some("native")
         );
     }
 }

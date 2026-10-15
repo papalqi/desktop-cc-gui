@@ -134,6 +134,7 @@ pub(super) fn redact_secrets(text: &str) -> String {
 /// Mutable per-run streaming state shared by the reader loop's dispatch.
 pub(crate) struct TurnState {
     seq: u64,
+    started_at: Option<u64>,
     pub(crate) native_session_id: Option<String>,
     pub(crate) saw_done: bool,
     pub(crate) saw_error: bool,
@@ -159,6 +160,7 @@ impl TurnState {
     pub(crate) fn new(preassigned: Option<String>) -> Self {
         Self {
             seq: 0,
+            started_at: None,
             native_session_id: preassigned,
             saw_done: false,
             saw_error: false,
@@ -228,6 +230,9 @@ impl TurnState {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
         });
+        if let Some(started_at) = self.started_at {
+            payload["startedAt"] = Value::from(started_at);
+        }
         if let Some(gen_ms) = gen_ms {
             // Measured generation window (stream open → close, tool execution
             // excluded) for the report that just landed. Absent on every
@@ -320,6 +325,7 @@ impl TurnCore {
         }
         state.native_session_id = Some(id.to_string());
         self.registry.rekey(&self.run_id, id.to_string());
+        self.registry.note_session(&self.run_id, id);
         if announce {
             state.push(
                 &self.sink,
@@ -332,6 +338,11 @@ impl TurnCore {
     }
 
     pub(crate) fn dispatch_event(&self, state: &mut TurnState, event: EngineEvent) {
+        // Cache the reservation time once: every observer, including one that
+        // missed launch, gets the same origin as list_active_runs.
+        if state.started_at.is_none() {
+            state.started_at = self.registry.run_started_at(&self.run_id);
+        }
         // Terminal state is monotonic, even if a CLI or its usage tail emits
         // more data before exiting: no late retry/content/warn event may
         // revive a settled run. The one exception is SessionId — a done that
@@ -752,12 +763,16 @@ impl TurnCore {
                 // The turn is over: EOF the interactive stdin so the CLI
                 // exits instead of waiting for a next message forever.
                 self.registry.close_stdin(&self.run_id);
+                let mut data = serde_json::json!({ "usage": usage });
+                if self.registry.get(&self.run_id).is_some_and(|entry| entry.killed.load(std::sync::atomic::Ordering::SeqCst)) {
+                    data["cancelled"] = true.into();
+                }
                 state.push_with_gen_ms(
                     &self.sink,
                     &self.run_id,
                     &self.engine_id,
                     "done",
-                    serde_json::json!({ "usage": usage }),
+                    data,
                     gen_ms,
                 );
             }
@@ -1279,6 +1294,8 @@ mod staging_tests {
             db: None,
         };
         let mut state = TurnState::new(None);
+        core.registry.note_run("test", "claude", None, "/workspace");
+        let started_at = core.registry.run_started_at("test").unwrap();
         for model in [Some("claude-opus-5-5".to_string()), None] {
             core.dispatch_event(
                 &mut state,
@@ -1303,6 +1320,9 @@ mod staging_tests {
             events[1]["data"],
             serde_json::json!({"model":"opus", "effort":"high", "comparisonModel":null})
         );
+        assert_eq!(events[0]["startedAt"], started_at);
+        assert_eq!(events[1]["startedAt"], started_at);
+        assert!(events[1]["ts"].as_u64().unwrap() >= started_at);
     }
 
     struct Noop;

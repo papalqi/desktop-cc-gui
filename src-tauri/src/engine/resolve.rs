@@ -295,8 +295,11 @@ fn build_windows_extra_search_paths(
             paths.push(programs_root.join("nodejs"));
             // Official OpenAI Codex Windows installer layout:
             // %LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe. The installer
-            // only appends to User PATH, which a stale-PATH GUI process misses.
-            paths.push(programs_root.join("OpenAI\\Codex\\bin"));
+            // prepends this directory on the user PATH and updates this tree.
+            // It has to be searched before %APPDATA%\npm: otherwise a stale
+            // npm global `codex.cmd` shadows the binary the installer just
+            // replaced, and the settings refresh still shows the old version.
+            paths.insert(0, programs_root.join("OpenAI\\Codex\\bin"));
             if let Ok(entries) = std::fs::read_dir(&programs_root) {
                 for entry in entries.flatten() {
                     let candidate = entry.path();
@@ -932,7 +935,7 @@ mod tests {
         let elapsed = started.elapsed();
         std::fs::write(
             &binary,
-            "@echo off\r\n:output\r\necho repeated-prefix-output\r\ngoto output\r\n",
+            format!("@echo off\r\n:output\r\necho {}\r\ngoto output\r\n", "x".repeat(1024)),
         )
         .unwrap();
         let output_started = Instant::now();
@@ -1101,6 +1104,29 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn windows_codex_installer_is_searched_before_npm_global() {
+        let temp = std::env::temp_dir().join(format!(
+            "ccgui-codex-before-npm-{}",
+            std::process::id()
+        ));
+        let programs = temp.join("Programs");
+        let appdata = temp.join("Roaming");
+        std::fs::create_dir_all(&programs).expect("create Programs dir");
+
+        let paths =
+            build_windows_extra_search_paths(Some(&appdata), None, Some(&temp), None, None);
+        let codex = programs.join("OpenAI\\Codex\\bin");
+        let npm = appdata.join("npm");
+        let codex_at = paths.iter().position(|path| path == &codex);
+        let npm_at = paths.iter().position(|path| path == &npm);
+        let _ = std::fs::remove_dir_all(temp);
+        assert!(
+            codex_at.is_some() && npm_at.is_some() && codex_at < npm_at,
+            "codex installer {codex_at:?} must precede npm {npm_at:?}"
+        );
     }
 
     #[test]

@@ -6,8 +6,11 @@ use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
+#[derive(Default)]
 pub struct ParsedSession {
     pub messages: Vec<Message>,
+    /// A native turn started without a matching completion or interruption.
+    pub unfinished_turn: bool,
 }
 
 /// Parse a native session file into the minimal message list. Bad lines are
@@ -228,6 +231,7 @@ fn collect_session(
 /// instead of an NDJSON line reader.
 fn fold_rows(rows: Vec<LineRow>) -> ParsedSession {
     let mut messages = Vec::<Message>::new();
+    let mut unfinished_turn: Option<String> = None;
     let mut seq = 0i64;
     let mut last_user_ts: Option<i64> = None;
     // tool call id -> index in `messages`. Results arrive in completion order,
@@ -235,6 +239,16 @@ fn fold_rows(rows: Vec<LineRow>) -> ParsedSession {
     // parallel calls; the id is what actually names the call.
     let mut call_rows: HashMap<String, usize> = HashMap::new();
     for row in rows {
+        if row.role == "__turn_started" {
+            unfinished_turn = Some(row.text);
+            continue;
+        }
+        if row.role == "__turn_finished" {
+            if row.text.is_empty() || unfinished_turn.as_deref() == Some(row.text.as_str()) {
+                unfinished_turn = None;
+            }
+            continue;
+        }
         // Usage-only marker (codex token_count or claude compact_boundary): fold
         // onto the last assistant message instead of creating an empty row.
         if row.role == "__usage__" {
@@ -309,12 +323,14 @@ fn fold_rows(rows: Vec<LineRow>) -> ParsedSession {
             effort: row.effort,
             duration_ms,
             images: row.images,
+            tool_call_id: call_id.clone(),
+            ..Default::default()
         });
         if let Some(id) = call_id {
             call_rows.insert(id, messages.len() - 1);
         }
     }
-    ParsedSession { messages }
+    ParsedSession { messages, unfinished_turn: unfinished_turn.is_some() }
 }
 
 /// Bounded scan accumulator: keeps only what the sessions table stores.
@@ -330,7 +346,7 @@ struct ScanAcc {
 
 impl ScanAcc {
     fn accept(&mut self, row: LineRow) {
-        if row.role == "__usage__" {
+        if matches!(row.role.as_str(), "__usage__" | "__turn_started" | "__turn_finished") {
             return;
         }
         if row.text.trim().is_empty() && row.images.is_empty() {
@@ -866,8 +882,8 @@ fn minimax_usage(usage: Option<&Value>) -> Option<Value> {
 
 // ==================== OpenCode ====================
 
-/// Codex rollout lines: {timestamp, type, payload}. Messages are
-/// response_item payloads of type "message".
+/// Codex rollout lines: {timestamp, type, payload}. Text lives in
+/// response_item; completed tool executions live in event_msg.
 fn extract_codex_line(value: &Value, images: ImageMode) -> LineRows {
     let line_type = type_str(value);
     let ts = ts_string(value, &["timestamp"]);
@@ -925,6 +941,82 @@ fn extract_codex_line(value: &Value, images: ImageMode) -> LineRows {
             let Some(payload) = value.get("payload") else {
                 return Vec::new();
             };
+            let boundary = match type_str(payload) {
+                "task_started" => Some("__turn_started"),
+                "task_complete" | "turn_aborted" => Some("__turn_finished"),
+                _ => None,
+            };
+            if let Some(role) = boundary {
+                return vec![LineRow::new(role, payload.get("turn_id").and_then(Value::as_str).unwrap_or("").to_string(), ts)];
+            }
+            if type_str(payload) == "item_completed" {
+                let Some(item) = payload.get("item") else {
+                    return Vec::new();
+                };
+                if type_str(item) == "CommandExecution" {
+                    let command = match item.get("command") {
+                        Some(Value::String(command)) => command.clone(),
+                        Some(Value::Array(argv)) => argv
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        _ => return Vec::new(),
+                    };
+                    return vec![LineRow {
+                        // Keep argv and working directory intact even though
+                        // the timeline label is shortened like the live one.
+                        args: Some(serde_json::json!({
+                            "command": item.get("command"), "cwd": item.get("cwd"),
+                        })),
+                        result: Some(serde_json::json!({
+                            "text": item.get("aggregated_output"),
+                            "exit_code": item.get("exit_code"),
+                            "status": item.get("status"),
+                            "isError": item.get("exit_code").and_then(Value::as_i64)
+                                .is_some_and(|code| code != 0)
+                                || item.get("status").and_then(Value::as_str) == Some("failed"),
+                        })),
+                        ..LineRow::new("tool", command.chars().take(120).collect(), ts)
+                    }];
+                }
+                if type_str(item) == "McpToolCall" {
+                    return vec![LineRow {
+                        args: Some(serde_json::json!({
+                            "server": item.get("server"), "tool": item.get("tool"),
+                            "arguments": item.get("arguments"),
+                        })),
+                        result: Some(serde_json::json!({
+                            "result": item.get("result"), "error": item.get("error"),
+                            "status": item.get("status"),
+                            "isError": item.get("error").is_some_and(|error| !error.is_null())
+                                || item.pointer("/result/isError").and_then(Value::as_bool) == Some(true),
+                        })),
+                        ..LineRow::new("tool", item.get("tool").and_then(Value::as_str).unwrap_or("mcp").to_string(), ts)
+                    }];
+                }
+                if type_str(item) == "FileChange" {
+                    let Some(changes) = item.get("changes").and_then(Value::as_object) else {
+                        return Vec::new();
+                    };
+                    // The rollout stores a path -> change map; the live
+                    // app-server opens one apply_patch row per changed file.
+                    return changes.iter().map(|(path, change)| LineRow {
+                        path: Some(path.clone()),
+                        args: Some(serde_json::json!({
+                            "path": path, "kind": change.get("type"),
+                            "diff": change.get("unified_diff"), "content": change.get("content"),
+                            "move_path": change.get("move_path"),
+                        })),
+                        result: Some(serde_json::json!({
+                            "status": item.get("status"), "stdout": item.get("stdout"),
+                            "stderr": item.get("stderr"),
+                            "isError": item.get("status").and_then(Value::as_str) == Some("failed"),
+                        })),
+                        ..LineRow::new("tool", "apply_patch".to_string(), ts.clone())
+                    }).collect();
+                }
+            }
             if payload.get("type").and_then(Value::as_str) == Some("token_count") {
                 if let Some(usage) = usage_from_codex_token_info(payload.get("info")) {
                     return vec![LineRow {
@@ -2310,6 +2402,125 @@ mod tests {
             "payload": {"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "hidden"}]}
         });
         assert!(extract_codex_line(&encrypted, ImageMode::Collect).is_empty());
+    }
+
+    #[test]
+    fn codex_history_recovers_completed_commands_after_reopening() {
+        let mut lines = vec![serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "检查这些分支"}
+            ]}
+        })];
+        // Three identical commands are distinct executions in different
+        // workspaces, followed by the two git-show calls from the same turn.
+        let commands = [
+            "git status --short --branch",
+            "git status --short --branch",
+            "git status --short --branch",
+            "git show origin/grok/player-detail:src/player.py",
+            "git show origin/fix/safe-storage-compaction:tools/verify.py",
+        ];
+        for (index, command) in commands.iter().enumerate() {
+            lines.push(serde_json::json!({
+                "type": "event_msg", "timestamp": "2026-10-12T08:49:36.158Z",
+                "payload": {"type": "item_completed", "item": {
+                    "type": "CommandExecution", "id": format!("exec-{index}"),
+                    "command": ["C:\\Program Files\\PowerShell\\pwsh.exe", "-Command", command],
+                    "cwd": format!("file:///E:/review-{index}"),
+                    "status": "completed", "exit_code": 0,
+                    "aggregated_output": format!("输出 {index} 中文 🧪\n")
+                }}
+            }));
+        }
+        // The transcript also contains a completion for the user message;
+        // it must not duplicate the response_item above.
+        lines.push(serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "item": {
+                "type": "UserMessage", "content": [{"type": "input_text", "text": "检查这些分支"}]
+            }}
+        }));
+        let input = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for _ in 0..2 {
+            let parsed = collect_session(
+                std::io::Cursor::new(&input),
+                &extractor_for("codex", ImageMode::Collect),
+                &HashSet::new(),
+            );
+            assert_eq!(parsed.messages.len(), 6);
+            assert_eq!(parsed.messages[0].role, "user");
+            for (index, message) in parsed.messages[1..].iter().enumerate() {
+                assert_eq!(message.role, "tool");
+                assert!(message.text.contains(commands[index]));
+                assert_eq!(message.seq, index as i64 + 2);
+                assert_eq!(message.args.as_ref().unwrap()["command"][2], commands[index]);
+                assert_eq!(message.args.as_ref().unwrap()["cwd"], format!("file:///E:/review-{index}"));
+                assert_eq!(message.result.as_ref().unwrap()["text"], format!("输出 {index} 中文 🧪\n"));
+                assert_eq!(message.result.as_ref().unwrap()["exit_code"], 0);
+                assert_eq!(message.result.as_ref().unwrap()["isError"], false);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_history_keeps_full_command_and_failure_output() {
+        let command = format!("echo {}", "中文 🧪".repeat(60));
+        let rows = extract_codex_line(&serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "item": {
+                "type": "CommandExecution", "id": "failed-command",
+                "command": command, "status": "failed", "exit_code": 1,
+                "aggregated_output": "  错误 🧪\n"
+            }}
+        }), ImageMode::Collect);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text.chars().count(), 120);
+        assert_eq!(rows[0].args.as_ref().unwrap()["command"], command);
+        assert_eq!(rows[0].result.as_ref().unwrap()["text"], "  错误 🧪\n");
+        assert_eq!(rows[0].result.as_ref().unwrap()["status"], "failed");
+        assert_eq!(rows[0].result.as_ref().unwrap()["exit_code"], 1);
+        assert_eq!(rows[0].result.as_ref().unwrap()["isError"], true);
+    }
+
+    #[test]
+    fn codex_history_recovers_mcp_results_and_each_changed_file() {
+        let rows = extract_codex_line(&serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "item": {
+                "type": "McpToolCall", "id": "mcp-1", "server": "files", "tool": "read",
+                "arguments": {"path": "missing.rs"}, "status": "completed",
+                "result": {"content": [{"type": "text", "text": "文件不存在"}], "isError": true}
+            }}
+        }), ImageMode::Collect);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "read");
+        assert_eq!(rows[0].args.as_ref().unwrap()["arguments"]["path"], "missing.rs");
+        assert_eq!(rows[0].result.as_ref().unwrap()["result"]["content"][0]["text"], "文件不存在");
+        assert_eq!(rows[0].result.as_ref().unwrap()["isError"], true);
+
+        let rows = extract_codex_line(&serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "item": {
+                "type": "FileChange", "id": "patch-1", "status": "completed",
+                "stdout": "Success", "stderr": "", "changes": {
+                    "src/a.rs": {"type": "update", "unified_diff": "-old\n+新 🧪\n", "move_path": "src/renamed.rs"},
+                    "src/b.rs": {"type": "add", "content": "new file\n"}
+                }
+            }}
+        }), ImageMode::Collect);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "apply_patch");
+        assert_eq!(rows[0].path.as_deref(), Some("src/a.rs"));
+        assert_eq!(rows[0].args.as_ref().unwrap()["diff"], "-old\n+新 🧪\n");
+        assert_eq!(rows[0].args.as_ref().unwrap()["move_path"], "src/renamed.rs");
+        assert_eq!(rows[1].path.as_deref(), Some("src/b.rs"));
+        assert_eq!(rows[1].args.as_ref().unwrap()["content"], "new file\n");
+        assert_eq!(rows[1].result.as_ref().unwrap()["status"], "completed");
     }
     #[test]
     fn kimi_prompt_row_recovers_image_paths() {

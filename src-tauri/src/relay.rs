@@ -55,7 +55,7 @@ pub const VIA_HEADER: &str = "x-ccgui-via";
 /// Headers that must never survive the hop: hop-by-hop ones have no meaning
 /// across the relay, and `VIA_HEADER` is ours — a phone that sent its own copy
 /// would otherwise decide how the bridge classifies the request.
-const HOP_HEADERS: [&str; 9] = [
+pub(crate) const HOP_HEADERS: [&str; 9] = [
     "host",
     "connection",
     "keep-alive",
@@ -70,6 +70,7 @@ const HOP_HEADERS: [&str; 9] = [
 #[derive(Default)]
 pub struct RelayState {
     inner: Mutex<Option<Running>>,
+    pub update: Arc<crate::relay_update::UpdateState>,
 }
 
 struct Running {
@@ -163,6 +164,7 @@ struct PendingHttp {
     path: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    _activity: Option<crate::relay_update::Activity>,
 }
 
 /// A live socket stream, with the handle needed to drop it on `close`.
@@ -272,6 +274,7 @@ pub async fn web_relay_start(
 ) -> Result<RelayInfo, String> {
     let url = url.trim().to_string();
     let key = key.trim().to_string();
+    crate::diagnostics::register_secret(&key);
     let agent = agent_url(&url, &key)?;
     let state = app.state::<crate::AppState>();
     let bridge_transition = state.web.lock_transition().await;
@@ -866,58 +869,80 @@ where
 /// dial that never comes up is retried on a capped backoff. Nothing but
 /// switching the relay off stops it: unattended machines are expected to be
 /// reachable when the Worker comes back, however long that takes.
-async fn run_agent(
+enum RelayConnection {
+    Legacy(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>),
+    Dedicated(crate::agent_link::Connection),
+}
+
+// Dispatch can start the relay itself; erase this future to break that Send-type cycle.
+fn run_agent(
     app: tauri::AppHandle,
     agent: String,
     port: u16,
     mut stop: watch::Receiver<bool>,
     generation: u64,
-) {
-    loop {
-        if *stop.borrow() {
-            return;
-        }
-        let connected = redial_until_connected(
-            &mut stop,
-            || {
-                let agent = agent.clone();
-                async move {
-                    // A bad address used to end the session; it is a
-                    // configuration error the user sees in the switch's tooltip,
-                    // not a reason to stop watching for a fix.
-                    let request = agent
-                        .into_client_request()
-                        .map_err(|e| format!("中继地址无效：{e}"))?;
-                    tokio_tungstenite::connect_async(request)
-                        .await
-                        .map_err(|e| e.to_string())
+) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let db = app.state::<crate::AppState>().db.clone();
+        loop {
+            if *stop.borrow() {
+                return;
+            }
+            let connected = redial_until_connected(
+                &mut stop,
+                || {
+                    let agent = agent.clone();
+                    let db = db.clone();
+                    async move {
+                        if let Some(connection) = crate::agent_link::connect(&db, &agent, port).await? {
+                            return Ok(RelayConnection::Dedicated(connection));
+                        }
+                        // Invalid configuration remains visible while the
+                        // unattended connection keeps retrying.
+                        let request = agent
+                            .into_client_request()
+                            .map_err(|e| format!("中继地址无效：{e}"))?;
+                        tokio_tungstenite::connect_async(request)
+                            .await
+                            .map(|(socket, _)| RelayConnection::Legacy(socket))
+                            .map_err(|e| e.to_string())
+                    }
+                },
+                |attempt, error| {
+                    set_connected(&app, generation, false);
+                    set_error(
+                        &app,
+                        generation,
+                        format!("连接中继失败，第 {attempt} 次重试：{error}"),
+                    );
+                },
+            )
+            .await;
+            let Some(connection) = connected else {
+                return;
+            };
+            set_error(&app, generation, String::new());
+            set_connected(&app, generation, true);
+            match connection {
+                RelayConnection::Legacy(socket) => {
+                    serve_with_update(socket, port, &mut stop, Some(app.state::<crate::AppState>().relay.update.clone())).await;
                 }
-            },
-            |attempt, error| {
-                set_connected(&app, generation, false);
-                set_error(
-                    &app,
-                    generation,
-                    format!("连接中继失败，第 {attempt} 次重试：{error}"),
-                );
-            },
-        )
-        .await;
-        let Some((socket, _)) = connected else {
-            return;
-        };
-        set_error(&app, generation, String::new());
-        set_connected(&app, generation, true);
-        serve(socket, port, &mut stop).await;
-        set_connected(&app, generation, false);
-        if *stop.borrow() {
-            return;
+                RelayConnection::Dedicated(connection) => {
+                    if let Err(error) = crate::agent_link::serve(connection, &app, port, &mut stop).await {
+                        set_error(&app, generation, error);
+                    }
+                }
+            }
+            set_connected(&app, generation, false);
+            if *stop.borrow() {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(REDIAL_DELAY_MS)) => {}
+                _ = stop.changed() => return,
+            }
         }
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(REDIAL_DELAY_MS)) => {}
-            _ = stop.changed() => return,
-        }
-    }
+    })
 }
 
 /// One connected agent socket: dispatch streams, pump frames until it dies.
@@ -937,12 +962,22 @@ fn queue_heartbeat(
     }
 }
 
+#[cfg(test)]
 async fn serve(
     socket: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     port: u16,
     stop: &mut watch::Receiver<bool>,
+) {
+    serve_with_update(socket, port, stop, None).await;
+}
+
+async fn serve_with_update(
+    socket: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    port: u16,
+    stop: &mut watch::Receiver<bool>,
+    update: Option<Arc<crate::relay_update::UpdateState>>,
 ) {
     let (mut tx, mut rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(256);
@@ -959,6 +994,7 @@ async fn serve(
     });
 
     let http: Arc<Mutex<HashMap<u64, PendingHttp>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut requests: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
     let sockets: Arc<Mutex<HashMap<u64, LiveSocket>>> = Arc::new(Mutex::new(HashMap::new()));
     // One client: keep-alive to the local bridge is worth reusing, and the
     // pool dies with the connection.
@@ -1009,6 +1045,7 @@ async fn serve(
         let Ok(frame) = serde_json::from_str::<AgentFrame>(&frame) else {
             continue;
         };
+        requests.retain(|_, task| !task.is_finished());
         match frame {
             AgentFrame::Open {
                 id,
@@ -1021,6 +1058,10 @@ async fn serve(
                     let live = spawn_socket(id, path, headers, port, out_tx.clone());
                     sockets.lock().insert(id, live);
                 } else {
+                    let activity = match update.as_ref().map(|state| state.activity(true)).transpose() {
+                        Ok(activity) => activity,
+                        Err(message) => { let _ = send(&out_tx, &ClientFrame::Error { id, message }).await; continue; }
+                    };
                     http.lock().insert(
                         id,
                         PendingHttp {
@@ -1028,6 +1069,7 @@ async fn serve(
                             path,
                             headers,
                             body: Vec::new(),
+                            _activity: activity,
                         },
                     );
                 }
@@ -1040,7 +1082,10 @@ async fn serve(
             AgentFrame::End { id } => {
                 let pending = http.lock().remove(&id);
                 if let Some(pending) = pending {
-                    spawn_http(id, pending, port, out_tx.clone(), client.clone());
+                    let task = spawn_http(id, pending, port, out_tx.clone(), client.clone());
+                    if let Some(previous) = requests.insert(id, task) {
+                        previous.abort();
+                    }
                 }
             }
             AgentFrame::Data { id, b64, text } => {
@@ -1078,6 +1123,9 @@ async fn serve(
                     live.task.abort();
                 }
                 http.lock().remove(&id);
+                if let Some(task) = requests.remove(&id) {
+                    task.abort();
+                }
             }
         }
     }
@@ -1086,7 +1134,12 @@ async fn serve(
         live.task.abort();
     }
     http.lock().clear();
+    for (_, task) in requests {
+        task.abort();
+    }
     drop(out_tx);
+    // A stalled local hop or remote writer must never prevent the next dial.
+    writer.abort();
     let _ = writer.await;
 }
 
@@ -1097,8 +1150,9 @@ fn spawn_http(
     port: u16,
     out: mpsc::Sender<OutFrame>,
     client: reqwest::Client,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let _activity = pending._activity;
         // The path comes from a remote Open frame; only a real path keeps the
         // 127.0.0.1 authority — `@host/…` would be parsed as userinfo and the
         // request would leave the machine for a host of the caller's choice.
@@ -1195,7 +1249,7 @@ fn spawn_http(
             }
         }
         let _ = send(&out, &ClientFrame::Close { id }).await;
-    });
+    })
 }
 
 /// Dial the bridge's socket route and pipe payloads both ways.
@@ -1650,6 +1704,7 @@ mod tests {
             PendingHttp {
                 method: "GET".into(),
                 path: "@169.254.169.254/latest/meta-data".into(),
+                _activity: None,
                 headers: HashMap::new(),
                 body: Vec::new(),
             },
@@ -1785,6 +1840,7 @@ mod tests {
             PendingHttp {
                 method: "POST".into(),
                 path: "/echo".into(),
+                _activity: None,
                 headers,
                 body: b"hello relay".to_vec(),
             },
@@ -1934,5 +1990,49 @@ mod tests {
 
         let _ = stop_tx.send(true);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), served).await;
+    }
+
+    #[tokio::test]
+    async fn serve_cancels_dispatched_http_on_close_and_stops_without_waiting_for_a_head() {
+        use tokio::io::AsyncReadExt;
+        let local = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let local_port = local.local_addr().unwrap().port();
+        let relay = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        let (client, mut peer) = tokio::join!(
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{relay_port}/agent")),
+            async {
+                let (socket, _) = relay.accept().await.unwrap();
+                tokio_tungstenite::accept_async(socket).await.unwrap()
+            }
+        );
+        let (socket, _) = client.unwrap();
+        let (stop_tx, mut stop) = watch::channel(false);
+        let served = tokio::spawn(async move { serve(socket, local_port, &mut stop).await });
+        for id in [1, 2] {
+            for frame in [
+                serde_json::json!({"t":"open","id":id,"method":"GET","path":"/stall","headers":{}}),
+                serde_json::json!({"t":"end","id":id}),
+            ] {
+                peer.send(Message::Text(frame.to_string().into())).await.unwrap();
+            }
+            let (mut request, _) = tokio::time::timeout(std::time::Duration::from_secs(2), local.accept()).await.unwrap().unwrap();
+            let mut headers = Vec::new();
+            let mut bytes = [0; 4096];
+            while !headers.ends_with(b"\r\n\r\n") {
+                let size = tokio::time::timeout(std::time::Duration::from_secs(2), request.read(&mut bytes)).await.unwrap().unwrap();
+                assert!(size > 0);
+                headers.extend_from_slice(&bytes[..size]);
+            }
+            // The local server deliberately never produces a response head.
+            if id == 1 {
+                peer.send(Message::Text(serde_json::json!({"t":"close","id":id}).to_string().into())).await.unwrap();
+            } else {
+                stop_tx.send(true).unwrap();
+            }
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), request.read(&mut bytes)).await.unwrap().unwrap(), 0,
+                "cancellation must drop the dispatched local HTTP request");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), served).await.expect("a stalled HTTP task must not block relay shutdown").unwrap();
     }
 }

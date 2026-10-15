@@ -51,8 +51,32 @@ pub struct ChildEntry {
     pub plans: Arc<Mutex<HashMap<String, Value>>>,
 }
 
+/// Identity of one live turn, for a page that loaded after the send.
+/// The process map itself is keyed by run id and session id only; the
+/// browser needs the engine and workspace to light the same session row.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveRun {
+    pub run_id: String,
+    pub engine: String,
+    pub session_id: Option<String>,
+    pub workspace_path: String,
+    pub started_at: u64,
+}
+
+#[derive(Clone)]
+struct RunMeta {
+    engine: String,
+    session_id: Option<String>,
+    workspace_path: String,
+    started_at: u64,
+}
+
 #[derive(Default)]
-pub struct ProcessRegistry(pub Mutex<HashMap<String, ChildEntry>>);
+pub struct ProcessRegistry(
+    pub Mutex<HashMap<String, ChildEntry>>,
+    Mutex<HashMap<String, RunMeta>>,
+);
 /// Count in-flight runs, not map entries: one run is keyed twice (run id +
 /// session alias), so `map.len()` would halve the real concurrency limit.
 /// Reservations (pid 0, pre-spawn) count too — a spawn storm must not slip
@@ -214,10 +238,108 @@ impl ProcessRegistry {
         }
     }
 
+    /// Remember which conversation a reserved or live run belongs to. A
+    /// later session announcement fills `session_id` without wiping the
+    /// engine or workspace already recorded at send time. Empty engine is
+    /// ignored: the page cannot place that row.
+    pub(crate) fn note_run(
+        &self,
+        run_id: &str,
+        engine: &str,
+        session_id: Option<&str>,
+        workspace: &str,
+    ) {
+        if run_id.is_empty() || engine.is_empty() {
+            return;
+        }
+        let announced = session_id.map(str::trim).filter(|id| !id.is_empty());
+        if let Ok(mut meta) = self.1.lock() {
+            let entry = meta.entry(run_id.to_string()).or_insert_with(|| RunMeta {
+                engine: engine.to_string(),
+                session_id: None,
+                workspace_path: workspace.to_string(),
+                started_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0),
+            });
+            if entry.engine.is_empty() {
+                entry.engine = engine.to_string();
+            }
+            if entry.workspace_path.is_empty() {
+                entry.workspace_path = workspace.to_string();
+            }
+            if let Some(id) = announced {
+                entry.session_id = Some(id.to_string());
+            }
+        }
+    }
+
+    /// The CLI announced its native session id after launch. No-op when
+    /// this run was never noted (tests and non-chat entries).
+    pub(crate) fn note_session(&self, run_id: &str, session_id: &str) {
+        let id = session_id.trim();
+        if run_id.is_empty() || id.is_empty() {
+            return;
+        }
+        if let Ok(mut meta) = self.1.lock() {
+            if let Some(info) = meta.get_mut(run_id) {
+                info.session_id = Some(id.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn run_started_at(&self, run_id: &str) -> Option<u64> {
+        self.1.lock().ok()?.get(run_id).map(|info| info.started_at)
+    }
+
+    fn forget_meta(&self, run_id: &str) {
+        if let Ok(mut meta) = self.1.lock() {
+            meta.remove(run_id);
+        }
+    }
+
+    /// Runs the page should still paint as streaming. Killed turns are
+    /// omitted: Stop already happened, and the settle event is what clears
+    /// the indicator. A run with no noted identity is omitted too.
+    pub fn active_runs(&self) -> Vec<ActiveRun> {
+        let Ok(map) = self.0.lock() else {
+            return Vec::new();
+        };
+        let Ok(meta) = self.1.lock() else {
+            return Vec::new();
+        };
+        let mut live_ids: Vec<String> = map
+            .values()
+            .filter(|entry| !entry.killed.load(std::sync::atomic::Ordering::SeqCst))
+            .map(|entry| entry.run_id.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        live_ids.sort();
+        live_ids
+            .into_iter()
+            .filter_map(|run_id| {
+                let info = meta.get(&run_id)?;
+                if info.engine.is_empty() {
+                    return None;
+                }
+                Some(ActiveRun {
+                    run_id,
+                    engine: info.engine.clone(),
+                    session_id: info.session_id.clone(),
+                    workspace_path: info.workspace_path.clone(),
+                    started_at: info.started_at,
+                })
+            })
+            .collect()
+    }
+
     /// Drop a pre-spawn run-id reservation after a failed launch. Only the
     /// placeholder (no child, pid 0) is removed — a registered run, real or
     /// virtual, is never touched.
     pub(crate) fn remove_reservation(&self, key: &str) {
+        let mut removed = false;
         if let Ok(mut map) = self.0.lock() {
             let reserved = map
                 .get(key)
@@ -225,7 +347,11 @@ impl ProcessRegistry {
                 .unwrap_or(false);
             if reserved {
                 map.remove(key);
+                removed = true;
             }
+        }
+        if removed {
+            self.forget_meta(key);
         }
     }
 
@@ -233,10 +359,19 @@ impl ProcessRegistry {
     /// that lost its session key to nothing must not evict another run's
     /// entry that now lives under that key.
     pub(crate) fn remove_if_pid(&self, key: &str, pid: u32) {
+        let mut finished = None;
         if let Ok(mut map) = self.0.lock() {
             if map.get(key).map(|entry| entry.pid) == Some(pid) {
-                map.remove(key);
+                if let Some(entry) = map.remove(key) {
+                    let run_id = entry.run_id;
+                    if !map.values().any(|other| other.run_id == run_id) {
+                        finished = Some(run_id);
+                    }
+                }
             }
+        }
+        if let Some(run_id) = finished {
+            self.forget_meta(&run_id);
         }
     }
     /// Backstop for the abort path in `kill`: an aborted reader never
@@ -246,8 +381,13 @@ impl ProcessRegistry {
     /// retry that reused the run id, or an OS-recycled pid, must not evict
     /// the live successor.
     pub(crate) fn remove_run_if_pid(&self, run_id: &str, pid: u32) {
+        let mut forget = false;
         if let Ok(mut map) = self.0.lock() {
             map.retain(|_, entry| entry.run_id != run_id || entry.pid != pid);
+            forget = !map.values().any(|entry| entry.run_id == run_id);
+        }
+        if forget {
+            self.forget_meta(run_id);
         }
     }
 
@@ -358,6 +498,9 @@ impl ProcessRegistry {
             Ok(mut map) => map.drain().map(|(_, e)| e).collect(),
             Err(poisoned) => poisoned.into_inner().drain().map(|(_, e)| e).collect(),
         };
+        if let Ok(mut meta) = self.1.lock() {
+            meta.clear();
+        }
         // rekey keys one child under BOTH its session id and run id:
         // de-duplicate by pid or the sweep signals the same process group
         // twice (a second, doomed taskkill on Windows).
@@ -691,5 +834,61 @@ mod registry_tests {
         registry.insert("run-1".to_string(), stub_entry("run-1", 101));
         registry.remove_run_if_pid("run-1", 999);
         assert!(registry.get("run-1").is_some());
+    }
+
+    /// A reloaded page asks who is still running. The answer follows the
+    /// process table: a live run keeps its engine and the session id it
+    /// learned later; removing the last key drops it; a killed turn does
+    /// not come back as running.
+    #[test]
+    fn active_runs_follow_the_live_process_table() {
+        let registry = ProcessRegistry::default();
+        registry.insert("run-1".to_string(), stub_entry("run-1", 101));
+        registry.insert_alias("session-1".to_string(), stub_entry("run-1", 101));
+        registry.note_run("run-1", "codex", None, "D:\\ws");
+        registry.note_session("run-1", "session-1");
+        registry.insert("run-2".to_string(), stub_entry("run-2", 102));
+        registry.note_run("run-2", "claude", Some("s-2"), "E:\\other");
+
+        let runs = registry.active_runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_id, "run-1");
+        assert_eq!(runs[0].engine, "codex");
+        assert_eq!(runs[0].session_id.as_deref(), Some("session-1"));
+        assert_eq!(runs[0].workspace_path, "D:\\ws");
+        assert_eq!(runs[1].session_id.as_deref(), Some("s-2"));
+
+        registry.remove_if_pid("run-1", 101);
+        assert_eq!(registry.active_runs().len(), 2, "alias still live");
+        registry.remove_if_pid("session-1", 101);
+        let left = registry.active_runs();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].run_id, "run-2");
+
+        registry.get("run-2").unwrap().killed.store(
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        assert!(registry.active_runs().is_empty());
+    }
+
+    #[test]
+    fn active_run_start_survives_metadata_updates_and_session_aliases() {
+        let registry = ProcessRegistry::default();
+        registry.insert("run-1".to_string(), stub_entry("run-1", 101));
+        registry.note_run("run-1", "codex", None, "D:\\ws");
+        // A fixed, old origin makes a reset-to-now regression deterministic.
+        registry.1.lock().unwrap().get_mut("run-1").unwrap().started_at = 1_700_000_000_000;
+        registry.note_run("run-1", "codex", Some("session-1"), "D:\\ws");
+        registry.note_session("run-1", "session-1");
+        registry.insert_alias("session-1".to_string(), stub_entry("run-1", 101));
+        registry.remove_if_pid("run-1", 101);
+        let runs = registry.active_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].started_at, 1_700_000_000_000);
+        assert_eq!(serde_json::to_value(&runs[0]).unwrap()["startedAt"], 1_700_000_000_000u64);
+        assert_eq!(registry.run_started_at("run-1"), Some(runs[0].started_at));
+        registry.remove_if_pid("session-1", 101);
+        assert!(registry.run_started_at("run-1").is_none());
     }
 }

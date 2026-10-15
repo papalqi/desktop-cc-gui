@@ -3,6 +3,9 @@ mod codex_titles;
 pub(crate) mod discovery;
 mod extract;
 pub mod reader;
+pub mod journal;
+pub mod log;
+pub mod metadata;
 pub mod scanner;
 pub mod search;
 
@@ -16,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub seq: i64,
@@ -50,6 +54,14 @@ pub struct Message {
     /// absolute paths (kimi/codex). Empty for every other row.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,7 +100,11 @@ pub struct SessionMeta {
     pub remote: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_path: Option<String>,
+    #[serde(default = "local_origin")]
+    pub origin: String,
 }
+
+fn local_origin() -> String { "local".into() }
 
 /// A native session file discovered on disk, matched to a workspace.
 pub struct SessionFile {

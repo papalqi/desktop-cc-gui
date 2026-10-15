@@ -29,8 +29,13 @@ use uuid::Uuid;
 use crate::event_sink::Emit;
 
 mod dispatch;
+mod debug;
 
 use self::dispatch::dispatch;
+
+// Agent Link enters only after its Hub device passed the normal /ws gate.
+// Keeping dispatch here preserves the same command/activity/error contract.
+pub(crate) async fn dispatch_relay(app:&tauri::AppHandle,cmd:&str,args:Value) -> Result<Value,String> { dispatch(app,cmd,args).await }
 
 /// Managed inside AppState; holds the running server, if any.
 #[derive(Default)]
@@ -266,6 +271,7 @@ async fn ensure_web_access_locked(app: tauri::AppHandle) -> Result<(WebAccessInf
         generated
     };
 
+    crate::diagnostics::register_secret(&token);
     // Lagging receivers drop events rather than back-pressuring the app.
     let (events_tx, _) = broadcast::channel::<String>(512);
     let emit_id = state.emitters.add(Arc::new(WsEmit {
@@ -685,6 +691,11 @@ fn build_router(ctx: WebCtx) -> Router {
     Router::new()
         .route("/unlock", post(unlock_handler).get(unlock_get))
         .route("/ws", get(ws_handler))
+        .route("/api/debug", get(debug::handler))
+        .route("/api/debug/snapshot", get(debug::handler))
+        .route("/api/debug/performance", get(debug::handler))
+        .route("/api/debug/logs", get(debug::handler))
+        .route("/api/debug/logs/export", get(debug::handler))
         .route("/file", get(file_handler))
         .route("/plugin-asset/{*asset_path}", get(plugin_asset_handler).options(plugin_asset_handler))
         .fallback(get(static_handler))
@@ -725,21 +736,29 @@ struct TokenQuery {
     token: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SocketQuery {
+    #[serde(flatten)]
+    auth:TokenQuery,
+    #[serde(default)]
+    events: Option<u8>,
+}
+
 async fn ws_handler(
     AxumState(ctx): AxumState<WebCtx>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(q): Query<TokenQuery>,
+    Query(q): Query<SocketQuery>,
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
     match gate(&ctx, &headers, peer) {
         Gate::Waiting(page) => return page,
         Gate::Allowed(device) => {
-            let supplied = q.token.as_deref().unwrap_or_default();
+            let supplied = q.auth.token.as_deref().unwrap_or_default();
             if token_required(&headers, peer) && supplied != &*ctx.token {
                 return StatusCode::FORBIDDEN.into_response();
             }
-            ws.on_upgrade(move |socket| handle_socket(ctx, socket, device, relayed(&headers, peer)))
+            ws.on_upgrade(move |socket| handle_socket(ctx, socket, device, relayed(&headers, peer),q.events != Some(0)))
         }
     }
 }
@@ -754,11 +773,13 @@ struct InvokeReq {
     args: Value,
 }
 
-async fn handle_socket(ctx: WebCtx, socket: WebSocket, device: String, remote: bool) {
+async fn handle_socket(ctx: WebCtx, socket: WebSocket, device: String, remote: bool, events:bool) {
     // Counted for as long as this socket lives, however it ends.
     let _remote_session = RemoteSession::enter(&ctx.app, remote);
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let hello = json!({"type": "hello", "version": env!("CARGO_PKG_VERSION")}).to_string();
+    let mut capabilities = vec!["debug_snapshot", "debug_logs", "journal", "session_origin", "run_status", "session_log", "session_metadata"];
+    if cfg!(windows) { capabilities.push("self_update"); }
+    let hello = json!({"type": "hello", "version": env!("CARGO_PKG_VERSION"), "capabilities": capabilities}).to_string();
     if ws_tx.send(Message::Text(hello.into())).await.is_err() {
         return;
     }
@@ -767,16 +788,18 @@ async fn handle_socket(ctx: WebCtx, socket: WebSocket, device: String, remote: b
     let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
     let mut events_rx = ctx.events.subscribe();
     let mut stop_writer = ctx.stop.clone();
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         loop {
             tokio::select! {
                 msg = out_rx.recv() => match msg {
                     Some(m) => if ws_tx.send(Message::Text(m.into())).await.is_err() { break },
                     None => break,
                 },
-                ev = events_rx.recv() => match ev {
+                ev = events_rx.recv(), if events => match ev {
                     Ok(m) => if ws_tx.send(Message::Text(m.into())).await.is_err() { break },
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if ws_tx.send(Message::Text("{\"type\":\"event\",\"name\":\"engine://resync\",\"payload\":null}".into())).await.is_err() { break; }
+                    },
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 _ = stop_writer.changed() => break,
@@ -836,6 +859,9 @@ async fn handle_socket(ctx: WebCtx, socket: WebSocket, device: String, remote: b
             }
         }
     }
+    // Revocation/bridge shutdown closes the transport immediately. Commands
+    // already dispatched keep their own lifecycle and cannot pin this socket.
+    writer.abort();
 }
 
 // ==================== Static frontend ====================

@@ -56,7 +56,7 @@ pub use events::{EngineEvent, TodoItem, TodosPayload};
 pub use plan_review::{PlanApproval, PlanReview, PlanReviewKind};
 // Live child-process registry (registry.rs).
 pub(crate) use registry::{kill_process_group, next_virtual_pid};
-pub use registry::{ChildEntry, ProcessRegistry};
+pub use registry::{ActiveRun, ChildEntry, ProcessRegistry};
 // Stdout reader / per-turn streaming plumbing (reader.rs).
 pub use reader::sweep_staging_dirs;
 pub(crate) use reader::{
@@ -703,9 +703,11 @@ pub async fn send_message(
     run_id: Option<String>,
     computer_use: Option<bool>,
     memory_bot: Option<String>,
+    origin: Option<String>,
 ) -> Result<SendResult, String> {
-    send_message_inner(
+    send_message_inner_with_sink(
         &state,
+        Arc::clone(&state.sink),
         engine,
         workspace_path,
         session_id,
@@ -720,6 +722,8 @@ pub async fn send_message(
         run_id,
         computer_use,
         memory_bot,
+        None,
+        origin,
     )
     .await
 }
@@ -766,6 +770,7 @@ pub(crate) async fn plugin_agent_send(
         None,
         None,
         allowed_tools,
+        None,
     )
     .await
 }
@@ -828,6 +833,7 @@ pub(crate) async fn mission_agent_send(
         None,
         None,
         allowed_tools,
+        None,
     )
     .await
 }
@@ -868,6 +874,7 @@ pub async fn send_message_inner(
         computer_use,
         memory_bot,
         None,
+        None,
     )
     .await
 }
@@ -891,7 +898,9 @@ async fn send_message_inner_with_sink(
     computer_use: Option<bool>,
     memory_bot: Option<String>,
     allowed_tools: Option<Vec<String>>,
+    origin: Option<String>,
 ) -> Result<SendResult, String> {
+    if origin.as_deref().is_some_and(|value| value != "hub") { return Err("send origin must be hub".into()); }
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if run_id.is_empty()
         || run_id.len() > 128
@@ -913,6 +922,7 @@ async fn send_message_inner_with_sink(
     let reader_abort = Arc::new(std::sync::OnceLock::new());
     {
         let mut map = state.processes.0.lock().map_err(|e| e.to_string())?;
+        state.relay.update.allow_run()?;
         if map.contains_key(&run_id) {
             return Err("run id already active".into());
         }
@@ -935,7 +945,56 @@ async fn send_message_inner_with_sink(
             },
         );
     }
+    // The page that sent this turn may reload before the child exits.
+    // Identity lives beside the process entry so that reload can paint the
+    // session as still running. A failed launch drops it with the reservation.
+    state.processes.note_run(
+        &run_id,
+        &engine,
+        session_id.as_deref(),
+        &workspace_path,
+    );
+    if sink.journals_chat() {
+        let started_at = state.processes.run_started_at(&run_id).unwrap_or(0);
+        let source = if origin.as_deref() == Some("hub") { Ok("hub".to_string()) }
+            else { session_id.as_deref().map(|session| crate::history::journal::session_origin(&state.db, &engine, session))
+                .unwrap_or_else(|| Ok("local".to_string())) };
+        let recorded = source.and_then(|source| crate::history::journal::begin_with_origin(
+            &state.db, &run_id, &engine, session_id.as_deref(), &workspace_path, started_at, None, &source,
+        ));
+        if let Err(error) = recorded {
+            state.processes.remove_reservation(&run_id);
+            return Err(format!("could not save chat turn: {error}"));
+        }
+        let db = state.db.clone();
+        let anchor_engine = engine.clone();
+        let anchor_session = session_id.clone();
+        let anchor = tauri::async_runtime::spawn_blocking(move || {
+            anchor_session.as_deref().and_then(|session| {
+                crate::history::reader::journal_anchor(&db, &anchor_engine, session).ok().flatten()
+            })
+        }).await.map_err(|e| e.to_string());
+        let recorded = anchor.and_then(|anchor| {
+            let native_before = anchor.map(|m| serde_json::json!({"seq":m.seq,"role":m.role,"text":m.text,"ts":m.ts}).to_string());
+            state.db.0.lock().execute("UPDATE chat_runs SET native_before=?2 WHERE run_id=?1",
+                rusqlite::params![run_id,native_before]).map(|_| ()).map_err(|e| e.to_string())
+        });
+        if let Err(error) = recorded {
+            crate::history::journal::launch_result(&state.db, &run_id, None, Some(&error))?;
+            state.processes.remove_reservation(&run_id);
+            return Err(format!("could not save chat turn: {error}"));
+        }
+        sink.push(serde_json::json!({
+            "runId": run_id, "engine": engine, "sessionId": session_id,
+            "workspacePath": workspace_path, "seq": 0, "ts": started_at, "startedAt": started_at,
+            "kind": "message", "data": {"role": "user", "text": prompt, "images": image_paths.clone().unwrap_or_default()}
+        }));
+        sink.flush();
+    }
     let reserved = run_id.clone();
+    let event_engine = engine.clone();
+    let event_session = session_id.clone();
+    let chat_sink = sink.clone();
     let result = send_reserved(
         state,
         sink,
@@ -958,8 +1017,21 @@ async fn send_message_inner_with_sink(
         allowed_tools,
     )
     .await;
-    if result.is_err() {
+    if let Err(error) = &result {
+        if chat_sink.journals_chat() {
+            chat_sink.flush();
+            crate::history::journal::launch_result(&state.db, &reserved, None, Some(error))?;
+            let seq: i64 = state.db.0.lock().query_row(
+                "SELECT COALESCE(MAX(seq),0)+1 FROM chat_events WHERE run_id=?1", [&reserved], |r| r.get(0),
+            ).unwrap_or(1);
+            chat_sink.push(serde_json::json!({"runId": reserved, "engine": event_engine,
+                "sessionId": event_session, "seq": seq, "kind": "error", "data": error}));
+            chat_sink.flush();
+        }
         state.processes.remove_reservation(&reserved);
+    } else if chat_sink.journals_chat() {
+        crate::history::journal::launch_result(&state.db, &reserved,
+            result.as_ref().ok().and_then(|r| r.session_id.as_deref()), None)?;
     }
     result
 }
@@ -1328,6 +1400,14 @@ async fn send_host_stream(
         session_id: resume_session_id,
     })
 }
+/// Turns whose child is still in the process table. A reloaded page calls
+/// this on startup and paints those sessions as running; the table is the
+/// source of truth, not the page that sent the message.
+#[tauri::command]
+pub fn list_active_runs(state: tauri::State<'_, crate::AppState>) -> Vec<ActiveRun> {
+    state.processes.active_runs()
+}
+
 /// Async + spawn_blocking: the kill waits for the Windows tree walk to
 /// finish (see `kill_process_group`), and a synchronous command would hold
 /// that wait on the UI thread — the app would visibly hitch on every Stop.
@@ -2959,7 +3039,7 @@ mod plan_respond_tests {
         );
     }
 
-    /// cat 子进程把收到的帧落进文件,返回 (child, stdin, 输出路径)。
+    /// 子进程把收到的原始帧落进文件,返回 (child, stdin, 输出路径)。
     fn spawn_frame_sink(
         tag: &str,
     ) -> (
@@ -2972,7 +3052,15 @@ mod plan_respond_tests {
             std::process::id()
         ));
         let out_file = std::fs::File::create(&out_path).unwrap();
-        let mut child = tokio::process::Command::new("cat")
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("node");
+            command.args(["-e", "process.stdin.pipe(process.stdout)"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = tokio::process::Command::new("cat");
+        let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::from(out_file))
             .spawn()
@@ -2992,7 +3080,9 @@ mod plan_respond_tests {
             *stdin.lock().await = None;
         }
         child.wait().await.unwrap();
-        std::fs::read_to_string(out_path).unwrap()
+        let frames = std::fs::read_to_string(out_path).unwrap();
+        std::fs::remove_file(out_path).unwrap();
+        frames
     }
 
     #[tokio::test]

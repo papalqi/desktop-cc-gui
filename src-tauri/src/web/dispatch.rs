@@ -157,6 +157,7 @@ struct UpdateSettingsArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendMessageArgs {
+    origin: Option<String>,
     run_id: Option<String>,
     engine: String,
     workspace_path: String,
@@ -198,6 +199,17 @@ struct AnswerQuestionArgs {
 struct EngineArgs {
     engine: String,
     workspace: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliEngineArgs {
+    engine: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliUpdateArgs {
+    engine: String,
+    run_id: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -243,6 +255,14 @@ struct LoadSessionPageArgs {
     session_id: String,
     limit: Option<usize>,
     before_seq: Option<i64>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadSessionEventsArgs {
+    engine: String,
+    session_id: String,
+    after_cursor: i64,
+    until_cursor: Option<i64>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -500,6 +520,7 @@ struct SearchMessagesArgs {
     query: String,
     limit: Option<u32>,
     offset: Option<u32>,
+    scope: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -587,7 +608,34 @@ pub(super) async fn dispatch(
     cmd: &str,
     raw: Value,
 ) -> Result<Value, String> {
+    if cmd == "relay_update_check" { return crate::relay_update::relay_update_check(app.clone()); }
+    if cmd == "relay_update_complete" {
+        let version = raw["version"].as_str().ok_or("missing update version")?.to_string();
+        let token = raw["token"].as_str().ok_or("missing update receipt")?.to_string();
+        return ser(crate::relay_update::relay_update_complete(app.clone(), version, token));
+    }
+    if cmd == "relay_update_abort" {
+        return ser(crate::relay_update::abort(&app.state::<crate::AppState>(), raw["token"].as_str().ok_or("missing update receipt")?, raw["version"].as_str().ok_or("missing update version")?));
+    }
+    let _activity = if cmd == "list_active_runs" { app.state::<crate::AppState>().relay.update.idle_query() } else { Some(app.state::<crate::AppState>().relay.update.activity(false)?) };
+    if cmd == "debug_logs" { return dispatch_inner(app, cmd, raw).await; }
+    let started = std::time::Instant::now();
+    let secrets = crate::diagnostics::private_values(&raw);
+    let identity = (raw["engine"].as_str().map(str::to_owned), raw["sessionId"].as_str().map(str::to_owned), raw["runId"].as_str().map(str::to_owned));
+    let result = dispatch_inner(app, cmd, raw).await;
+    crate::diagnostics::record(crate::diagnostics::Entry {
+        category: if result.is_ok() { "performance" } else { "error" }, level: if result.is_ok() { "info" } else { "error" },
+        source: "rpc", operation: Some(cmd), message: result.as_ref().err().map(String::as_str),
+        engine: identity.0.as_deref(), session_id: identity.1.as_deref(), run_id: identity.2.as_deref(),
+        duration_ms: Some(started.elapsed().as_millis() as u64), ..crate::diagnostics::Entry::default()
+    }, &secrets);
+    result
+}
+
+async fn dispatch_inner(app: &tauri::AppHandle, cmd: &str, raw: Value) -> Result<Value, String> {
     match cmd {
+        "relay_update_status" => ser(Ok::<_, String>(crate::relay_update::relay_update_status(app.state()))),
+        "relay_update_defer" => ser(crate::relay_update::relay_update_defer(app.state())),
         // config
         "get_cli_config" => ser(crate::config::get_cli_config()),
         "upsert_provider" => {
@@ -695,12 +743,31 @@ pub(super) async fn dispatch(
                 a.run_id,
                 a.computer_use,
                 a.memory_bot,
+                a.origin,
             )
             .await)
         }
         "interrupt_session" => {
             let a: SessionIdArgs = parse_args(&raw)?;
             ser(crate::engine::interrupt_session(app.state(), a.session_id).await)
+        }
+        // A browser refresh or a machine switch loads a new page. The turn
+        // keeps running on this desktop; the page asks who is still live
+        // and paints that session as running again.
+        "list_active_runs" => ser(Ok(app.state::<crate::AppState>().processes.active_runs())),
+        "run_status" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args { run_ids: Vec<String> }
+            let a: Args = parse_args(&raw)?;
+            ser(crate::history::journal::run_status(app.state(), a.run_ids))
+        }
+        "set_session_origin" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args { engine: String, session_id: String, origin: String }
+            let a: Args = parse_args(&raw)?;
+            ser(crate::history::journal::set_session_origin(app.state(), a.engine, a.session_id, a.origin))
         }
         // The remote UI renders the same AskUserQuestion card as the desktop
         // (events already reach it); without this case its 提交/忽略 buttons
@@ -713,6 +780,21 @@ pub(super) async fn dispatch(
             )
         }
         "list_engines" => ser(crate::engine::list_engines().await),
+        // Settings → CLI 管理 is the same page on the remote web UI. The
+        // install runs on this desktop (the machine the browser selected),
+        // and cli://update-progress already rides the web event broadcast.
+        "cli_version_status" => {
+            let a: CliEngineArgs = parse_args(&raw)?;
+            ser(crate::cli_lifecycle::cli_version_status(a.engine).await)
+        }
+        "cli_update_plan" => {
+            let a: CliEngineArgs = parse_args(&raw)?;
+            ser(crate::cli_lifecycle::cli_update_plan(a.engine).await)
+        }
+        "cli_update" => {
+            let a: CliUpdateArgs = parse_args(&raw)?;
+            ser(crate::cli_lifecycle::cli_update(a.engine, a.run_id, app.state()).await)
+        }
         "list_engine_models" => {
             let a: EngineArgs = parse_args(&raw)?;
             ser(crate::engine::models::list_engine_models(app.state(), a.engine, a.workspace).await)
@@ -756,6 +838,10 @@ pub(super) async fn dispatch(
             ser(crate::engine::images::import_attachments(a.paths))
         }
         // history
+        "write_session_field" => {
+            let args: crate::history::metadata::FieldWrite = parse_args(&raw)?;
+            ser(crate::history::metadata::apply(&app.state(), args))
+        }
         "list_sessions" => ser(crate::history::reader::list_sessions(app.state())),
         "list_archived_sessions" => {
             ser(crate::history::reader::list_archived_sessions(app.state()))
@@ -794,6 +880,17 @@ pub(super) async fn dispatch(
             ))
         }
         "usage_clear" => ser(crate::usage::usage_clear(app.state())),
+        "load_session_events" => {
+            let a: LoadSessionEventsArgs = parse_args(&raw)?;
+            ser(crate::history::journal::load_session_events(app.state(), a.engine, a.session_id, a.after_cursor, a.until_cursor).await)
+        }
+        "session_log_since" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args { engine:String, session_id:String, after_rev:i64, epoch:Option<i64>, until_rev:Option<i64>, limit:Option<usize>, workspace_path:Option<String>, remote_path:Option<String> }
+            let a: Args = parse_args(&raw)?;
+            ser(crate::history::log::session_log_since(app.state(),a.engine,a.session_id,a.after_rev,a.epoch,a.until_rev,a.limit,a.workspace_path,a.remote_path).await)
+        }
         "load_session_page" => {
             let a: LoadSessionPageArgs = parse_args(&raw)?;
             ser(crate::history::reader::load_session_page(
@@ -978,7 +1075,7 @@ pub(super) async fn dispatch(
         "search_messages" => {
             let a: SearchMessagesArgs = parse_args(&raw)?;
             ser(
-                crate::history::search::search_messages(app.state(), a.query, a.limit, a.offset)
+                crate::history::search::search_messages(app.state(), a.query, a.limit, a.offset, a.scope)
                     .await,
             )
         }
@@ -1219,6 +1316,8 @@ pub(super) async fn dispatch(
             ser(crate::terminal::terminal_close(a.id, app.state()).await)
         }
         // metrics
+        "debug_snapshot" => Ok(super::debug::snapshot(app)),
+        "debug_logs" => crate::diagnostics::query(&parse_args::<crate::diagnostics::LogQuery>(&raw)?),
         "app_metrics" => ser(crate::metrics::app_metrics(app.state())),
         "performance_diagnostics" => ser(crate::metrics::performance_diagnostics(app.state())),
         "performance_diagnostics_enabled" => {

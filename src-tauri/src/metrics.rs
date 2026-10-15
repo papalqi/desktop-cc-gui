@@ -336,6 +336,17 @@ impl MetricsState {
                 let mut measurement =
                     result.unwrap_or_else(|_| Sample::unavailable("samplerPanicked"));
                 measurement.sample_duration_ms = started.elapsed().as_millis() as u64;
+                crate::diagnostics::record(crate::diagnostics::Entry {
+                    category: "performance", level: if failed || measurement.error.is_some() { "warn" } else { "info" },
+                    source: "metrics", operation: Some("sample"), message: measurement.error,
+                    duration_ms: Some(measurement.sample_duration_ms),
+                    metrics: Some(serde_json::json!({ "mainMemoryBytes": measurement.main_memory_bytes,
+                        "mainCpuPercent": measurement.main_cpu_percent, "systemCpuPercent": measurement.system_cpu_percent,
+                        "systemMemoryTotalBytes": measurement.system_memory_total_bytes, "systemMemoryAvailableBytes": measurement.system_memory_available_bytes,
+                        "swapUsedBytes": measurement.swap_used_bytes, "logicalCpuCount": measurement.logical_cpu_count,
+                        "observedProcessCount": measurement.processes.len() })),
+                    ..crate::diagnostics::Entry::default()
+                }, &[]);
                 match cache.lock() {
                     Ok(mut cache) => cache.push(Instant::now(), measurement),
                     Err(_) => break,
