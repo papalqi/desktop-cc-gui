@@ -189,6 +189,8 @@ pnpm build:mac:skip-notarize   # 同上，但跳过公证
 
 Windows 与 Linux 安装包由 `.github/workflows/` 下的 CI 工作流产出（`release.yml`、`build-windows-artifact.yml`）。
 
+Windows 中转客户端可用 `pnpm build:win` 构建更新包，`pnpm deploy:win PC6` 一键构建、备份、安装并检查上线；连接配置与回滚说明见 [Windows 中转客户端更新](docs/windows-relay-update.zh-CN.md)。
+
 ---
 
 ## 怎么改代码（开发教程）

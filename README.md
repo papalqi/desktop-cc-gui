@@ -189,6 +189,8 @@ pnpm build:mac                 # macOS signed build (scripts/build-signed-macos.
 pnpm build:mac:skip-notarize   # same, skipping notarization
 ```
 
+For Windows relay clients, `pnpm build:win` creates an update package and `pnpm deploy:win PC6` builds, backs up, installs, and verifies the target. See the [Windows relay update guide](docs/windows-relay-update.zh-CN.md) for local connection settings and rollback.
+
 Windows and Linux installers are produced by the CI workflows under `.github/workflows/` (`release.yml`, `build-windows-artifact.yml`).
 
 ---
