@@ -126,7 +126,7 @@ function Invoke-AutoUpdate {
     $rolledBack = $false
     $rollbackCredential = $null
     try {
-        $tasks = @(Get-ScheduledTask | Where-Object { @($_.Actions).Count -eq 1 -and $_.Actions[0].Execute.Trim('"') -eq $installed -and $_.State.ToString() -eq 'Running' })
+        $tasks = @(Get-ScheduledTask | Where-Object { @($_.Actions).Count -eq 1 -and $_.Actions[0].Execute -is [string] -and $_.Actions[0].Execute.Trim('"') -eq $installed -and $_.State.ToString() -eq 'Running' })
         if ($tasks.Count -ne 1 -or $tasks[0].TaskPath -ne '\') { throw 'Expected one root scheduled task for this installation' }
         $taskName = $tasks[0].TaskName
         Add-Type -AssemblyName System.IO.Compression.FileSystem

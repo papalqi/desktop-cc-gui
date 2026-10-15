@@ -3,7 +3,13 @@ $ProgressPreference = 'SilentlyContinue'
 $helper = Join-Path $PSScriptRoot 'install-self-update.ps1'
 $utf8 = [Text.UTF8Encoding]::new($false)
 function Assert([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
-function Get-ScheduledTask { [pscustomobject]@{ TaskPath='\'; TaskName='CCGUIRelay'; State='Running'; Actions=@([pscustomobject]@{Execute=$installed}) } }
+function Get-ScheduledTask {
+    if ($scenario -eq 'non-executable-task') {
+        [pscustomobject]@{ TaskPath='\'; TaskName='ComHandler'; State='Ready'; Actions=@([pscustomobject]@{ClassId='test'}) }
+        [pscustomobject]@{ TaskPath='\'; TaskName='NoActions'; State='Ready'; Actions=@() }
+    }
+    [pscustomobject]@{ TaskPath='\'; TaskName='CCGUIRelay'; State='Running'; Actions=@([pscustomobject]@{Execute=$installed}) }
+}
 function Invoke-WebRequest { param([switch]$UseBasicParsing,$Uri,$Method,$Headers,$ContentType,$Body,$TimeoutSec)
     if ($Uri.EndsWith('/health')) { return @{Content=(@{ready=$true;version=$testVersion;capabilities=@('self_update')} | ConvertTo-Json -Compress)} }
     if ($Uri.EndsWith('/recovery')) {
@@ -14,7 +20,7 @@ function Invoke-WebRequest { param([switch]$UseBasicParsing,$Uri,$Method,$Header
     $state.reportKey = $Headers.Authorization
 }
 
-foreach ($scenario in @('success','self-check-failure','legacy-rollback','delayed-relay','apply-restored','apply-failure','busy','tampered','handoff-mismatch')) {
+foreach ($scenario in @('success','non-executable-task','self-check-failure','legacy-rollback','delayed-relay','apply-restored','apply-failure','busy','tampered','handoff-mismatch')) {
     $testVersion = $(if ($scenario -in @('legacy-rollback','delayed-relay','apply-restored')) {'1.3.0'} else {'1.2.1'})
     $fixture = [IO.Path]::GetFullPath((Join-Path $env:TEMP ('ccgui-self-update-test-' + [Guid]::NewGuid().ToString('N'))))
     $unicodeName = [string][char]0x4E2D + [char]0x6587
@@ -81,7 +87,7 @@ if ($Action -eq 'prepare') {
             function Start-Sleep { param($Seconds,$Milliseconds) if ($Seconds) { throw 'simulated self-check deadline' } }
             Invoke-AutoUpdate
         } catch { $failure = $_ }
-        if ($scenario -eq 'success') {
+        if ($scenario -in @('success','non-executable-task')) {
             Assert ($null -eq $failure) ('success failed: ' + $failure)
             Assert ($state.completes -eq 1 -and $state.rollbacks -eq 0) 'healthy update rolled back or failed to complete'
             Assert ((Get-Content -LiteralPath $installed -Raw) -eq 'new-exe') 'new executable was lost'
@@ -93,9 +99,9 @@ if ($Action -eq 'prepare') {
         }
         if ($scenario -notin @('tampered','handoff-mismatch')) {
             $receipt = Get-Content -LiteralPath (Join-Path $stage 'receipt.json') -Raw | ConvertFrom-Json
-            Assert ($receipt.status -eq $(if ($scenario -eq 'success') {'installed'} else {'failed'})) 'receipt status differs'
+            Assert ($receipt.status -eq $(if ($scenario -in @('success','non-executable-task')) {'installed'} else {'failed'})) 'receipt status differs'
             Assert ($state.report.status -eq $receipt.status) 'Hub result was not reported'
-            if ($scenario -ne 'success') {
+            if ($scenario -notin @('success','non-executable-task')) {
                 $info = Get-Content -LiteralPath (Join-Path $appHome 'updates\state.json') -Raw | ConvertFrom-Json
                 Assert ($info.failedVersion -eq $testVersion) 'failed version would be retried'
             }
