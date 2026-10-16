@@ -76,7 +76,11 @@ AI 首先读取 `/commands` 和 `/machines`，取得参数契约与机器名，�
 
 同一机器重复提交已有 runId 返回 **409 already_submitted**，附带已有投递状态和查询路径，不再发送提示词。超时或断连可能已经送达，返回的 `delivery=indeterminate` 必须通过回合查询核对，不能换一个 runId 自动重试。在线前置检查失败为 `delivery=not_sent`，不会创建回合；执行端明确拒绝为 `failed`。`in-flight` 表示 RPC 尚未响应，`acknowledged` 表示收到启动响应，null 表示该回合来自执行端观察而非 Hub 发起，`abandoned` 表示网页断线后查询该 runId 时 Hub 从未收到，已作废且不会启动；这些值描述命令投递，真实执行结果以事件为依据。
 
-回合查询支持 `afterCursor>=0`、`limit=1..100`（默认 100）、`waitMs=0..25000`。返回 `{machine,online,run,events,head,hasMore,nextCursor}`；从 0 读取，后续传 `nextCursor`，有 `hasMore` 时继续取页。没有可读事件且回合仍运行时，最多等待指定时间，新事件、投递状态变化或断开连接可提前结束。读取/等待/取消 HTTP 请求均不发送或中断任务。事件包含增量、思考、工具、提问与结束信息，正文保留 Unicode 和完整工具结果；单页按事件条数限制，大工具结果仍可能很大。
+回合查询支持 `afterCursor>=0`、`limit=1..100`（默认 100）、`waitMs=0..25000`。返回 `{machine,online,run,events,head,hasMore,nextCursor}`；从 0 读取，后续传 `nextCursor`，有 `hasMore` 时继续取页。没有可读事件且回合仍运行时，最多等待指定时间，新事件、投递状态变化或断开连接可提前结束。读取/等待/取消 HTTP 请求均不发送或中断任务。
+
+事件信封字段为 `{runId,engine,seq,kind,data,ts,startedAt,cursor,sessionId,workspacePath}`，类型字段名是 `kind` 而不是 `type`。常见 kind：`message`（完整消息，`data.role` 为 user/assistant/tool）、`delta`/`text`（回复增量，拼接 `data` 即正文）、`thinking`（思考片段）、`session`（会话身份）、`question`/`question_settled`（提问与落定）、`usage`（token 用量）、`done`、`error`。`/_relay/api` 发现响应的 `events` 字段包含同样的说明，供 AI 自查。
+
+已结束回合的事件被完整快照覆盖后会从回合查询中清除：此时 `events` 为空且响应附带 `eventsCleared:true` 与 `readVia`（指向 `load_session_page` 的 engine/sessionId 参数），持久回复应从消息页读取。`send_message` 的 `engine` 会在 Hub 端按缓存的引擎目录校验，未知或不可用的引擎直接返回 400 并附 `engines` 列表，不会消耗 runId。`load_session_events` 的 `afterCursor` 可省略，默认 0。事件包含增量、思考、工具、提问与结束信息，正文保留 Unicode 和完整工具结果；单页按事件条数限制，大工具结果仍可能很大。
 
 `run` 提供引擎、工作区、会话 ID、启动时间、投递状态、最近观察的 `active` 和 `terminal=done|error|null`。done 表示观察到结束事件，也可能来自用户中断，不能单凭它推断执行成功；无终止事件不能因为 `active=false` 就认定回复完整。离线时 `online=false`，`active` 仅为最后保存的状态；已保存回复继续可读。`journalContinuous` 和 `missingEventCount` 表示从 seq 0 到已观察到最大 seq 的连续性；缺口或历史版本失效时用消息页与显式同步恢复。事件的 `seq` 是回合内顺序，`cursor` 是 Hub 到达顺序，迟到事件仍会得到新游标，合并时以 runId/seq 去重并按 seq 排序。
 
