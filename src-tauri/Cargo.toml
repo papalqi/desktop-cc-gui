@@ -105,3 +105,10 @@ codegen-units = 1
 lto = "thin"
 opt-level = "z"
 strip = true
+
+# tao 0.35.3 keeps the Windows event-loop runner in an `Rc`. wry clones that
+# handle from WebView2 threads during IPC, and the non-atomic refcount aborts
+# the process (`0xC000001D`). patches/tao is upstream 0.35.3 with that handle
+# changed to `Arc`. Drop this patch once upstream ships the same change.
+[patch.crates-io]
+tao = { path = "patches/tao" }
