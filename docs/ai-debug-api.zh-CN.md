@@ -7,7 +7,7 @@ Hub 提供供 AI 调用的 HTTP 查询、会话操作、回复读取和运行诊
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | GET | `/_relay/api` | 接口发现、鉴权方式、容量与错误码 |
-| GET | `/_relay/api/commands` | 22 个操作的参数 JSON Schema、默认值、执行位置、读写性质与调用说明 |
+| GET | `/_relay/api/commands` | 23 个操作的参数 JSON Schema、默认值、执行位置、读写性质与调用说明 |
 | POST | `/_relay/api/machines/{machine}/invoke` | JSON `{command,args}`：查询内容、开始/继续会话、回答提问或中断回合 |
 | GET | `/_relay/api/machines/{machine}/runs/{runId}` | 投递状态、会话绑定、结束状态、持久化回复事件与有界等待 |
 | GET | `/_relay/api/status` | Hub 启动时间、运行时内存、存储数量、机器总览 |
@@ -57,6 +57,7 @@ AI 首先读取 `/commands` 和 `/machines`，取得参数契约与机器名，�
 | Hub 发送送达核对 | `get_run_delivery` | `runId`，可选 `waitMs=0..5000` |
 | 会话来源 | `set_session_origin` | `engine`、`sessionId`、`origin=hub|local`；执行端须声明 `session_origin` |
 | 开始或继续对话 | `send_message` | `runId`、`engine`、`workspacePath`、`prompt`，继续对话另传 `sessionId` |
+| 恢复归档会话 | `restore_session` | `engine`、`sessionId`；复用已有恢复命令，不发送提示词 |
 | 回答执行中的提问 | `answer_question` | `sessionId`（也可用 runId）、`requestId`、`answers` |
 | 中断指定回合 | `interrupt_session` | 在 `sessionId` 字段中传 runId，可定位尚未分配会话 ID 的回合 |
 | 文件查询 | `list_dir`、`read_file`、`search_text` | `path`；文本搜索还需要 `query` |
@@ -72,19 +73,40 @@ AI 首先读取 `/commands` 和 `/machines`，取得参数契约与机器名，�
 
 消息页与事件页的 `source=hub|executor` 标识游标来源，实时事件使用同名含义的 `historySource`。请求增量时传上次来源；来源变化会返回 `reset:true`，必须丢弃旧游标、重读快照再接续。两个来源的游标与 epoch 不能互相比较大小。Hub 保存新版执行端规范页的原文，不再二次归并；被完整快照覆盖的已结束回合事件会清理，运行投递台账继续保留。
 
-发送前生成并保存唯一 runId（1..128 个 ASCII 字母、数字、`-` 或 `_`）。`send_message` 省略或传 null 的 `sessionId` 开始新会话，传已有 ID 则继续；可选 `model`、`effort`、`permission`、`providerId` 和执行端本机路径 `imagePaths`，具体参数见发现接口。成功返回 **HTTP 202**，`data.result={runId,sessionId}` 和 `data.runPath` 仅确认启动命令已响应，不代表 AI 已回复或完成。会话 ID 可能暂时为 null，随后从回合查询中的 `run.sessionId` 获取。`runPath` 是相对于站点域名的路径，已包含 `/CCGUI` 前缀。
+发送前生成并保存唯一 runId（1..128 个 ASCII 字母、数字、`-` 或 `_`）。`send_message` 省略或传 null 的 `sessionId` 开始新会话，传已有 ID 则继续；可选 `model`、`effort`、`permission`、`providerId` 和执行端本机路径 `imagePaths`，具体参数见发现接口。成功返回 **HTTP 202**，`data.result={runId,sessionId}` 和 `data.runPath` 确认启动命令已响应。默认不等待回复；可选 `waitMs=0..25000`（默认 0）由 Hub 消费，不传给执行端。正数表示启动确认后最多等待该时长，遇到终态、未答提问、离线、请求取消或运行状态不再活跃时提前返回；响应仍为 202，并在 `data` 内附与回合 GET 相同的页面字段。`waitReason` 说明返回原因，等待超时不会停止或重发任务。会话 ID 可能暂时为 null，随后从回合查询中的 `run.sessionId` 获取。`runPath` 是相对于站点域名的路径，已包含 `/CCGUI` 前缀。
+
+归档会话先调用 `restore_session`，再用同一 `sessionId` 和新 runId 继续。支持管理字段同步的执行端可能返回 `result.queued=true`，须等待目录中的 `metadataSyncPending` 清除并核对归档状态；恢复和提示词发送不会组合重放。此入口复用 Hub/执行端已有的生命周期能力，无需增加执行端命令。
 
 同一机器重复提交已有 runId 返回 **409 already_submitted**，附带已有投递状态和查询路径，不再发送提示词。超时或断连可能已经送达，返回的 `delivery=indeterminate` 必须通过回合查询核对，不能换一个 runId 自动重试。在线前置检查失败为 `delivery=not_sent`，不会创建回合；执行端明确拒绝为 `failed`。`in-flight` 表示 RPC 尚未响应，`acknowledged` 表示收到启动响应，null 表示该回合来自执行端观察而非 Hub 发起，`abandoned` 表示网页断线后查询该 runId 时 Hub 从未收到，已作废且不会启动；这些值描述命令投递，真实执行结果以事件为依据。
 
-回合查询支持 `afterCursor>=0`、`limit=1..100`（默认 100）、`waitMs=0..25000`。返回 `{machine,online,run,events,head,hasMore,nextCursor}`；从 0 读取，后续传 `nextCursor`，有 `hasMore` 时继续取页。没有可读事件且回合仍运行时，最多等待指定时间，新事件、投递状态变化或断开连接可提前结束。读取/等待/取消 HTTP 请求均不发送或中断任务。
+回合查询支持 `afterCursor>=0`、`limit=1..100`（默认 100）、`waitMs=0..25000` 和 `waitFor=events|terminal|question`（默认 events）。返回 `{machine,online,run,events,head,hasMore,nextCursor,pendingQuestions,waitReason}`；从 0 读取，后续传 `nextCursor`，有 `hasMore` 时继续取页。默认等待新事件或状态重新核对；terminal 等待终态，question 等待未答提问或终态。后两者会忽略普通增量，所有唤醒共用同一个截止时间。`pendingQuestions` 合并快照中仍待答的提问及未落定的提问事件，独立于本次事件游标；终态不再返回待答提问。`waitReason=events|state|terminal|question|timeout|offline|inactive|aborted|stopped`；state 表示投递、目录或快照重新核对唤醒，可能没有新事件。离线、非活跃、取消请求和 Hub 停止均提前返回。非活跃或离线不等于任务成功；读取/等待/取消 HTTP 请求均不发送或中断任务。
 
 事件信封字段为 `{runId,engine,seq,kind,data,ts,startedAt,cursor,sessionId,workspacePath}`，类型字段名是 `kind` 而不是 `type`。常见 kind：`message`（完整消息，`data.role` 为 user/assistant/tool）、`delta`/`text`（回复增量，拼接 `data` 即正文）、`thinking`（思考片段）、`session`（会话身份）、`question`/`question_settled`（提问与落定）、`usage`（token 用量）、`done`、`error`。`/_relay/api` 发现响应的 `events` 字段包含同样的说明，供 AI 自查。
 
-已结束回合的事件被完整快照覆盖后会从回合查询中清除：此时 `events` 为空且响应附带 `eventsCleared:true` 与 `readVia`（指向 `load_session_page` 的 engine/sessionId 参数），持久回复应从消息页读取。`send_message` 的 `engine` 会在 Hub 端按缓存的引擎目录校验，未知或不可用的引擎直接返回 400 并附 `engines` 列表，不会消耗 runId。`load_session_events` 的 `afterCursor` 可省略，默认 0。事件包含增量、思考、工具、提问与结束信息，正文保留 Unicode 和完整工具结果；单页按事件条数限制，大工具结果仍可能很大。
+终态页面附 `replyText`（该 run 最后一条 assistant 正文的原文摘录，最多 4096 个 UTF-8 字节）、`replyTruncated` 和 `readVia`（指向 `load_session_page` 的 engine/sessionId 参数）。截断保留完整 Unicode 字符，不生成模型摘要。优先使用覆盖该回合的完整快照，否则只从连续完整事件投影正文；存在缺口、部分前缀已清理或没有可确认正文时为 `replyText:null`，使用 `readVia` 读取消息页。指针从会话最新页开始，旧回合需按 `nextBefore` 翻页并匹配消息的 runId；后续回合不会覆盖旧 run 的摘录。
 
-`run` 提供引擎、工作区、会话 ID、启动时间、投递状态、最近观察的 `active` 和 `terminal=done|error|null`。done 表示观察到结束事件，也可能来自用户中断，不能单凭它推断执行成功；无终止事件不能因为 `active=false` 就认定回复完整。离线时 `online=false`，`active` 仅为最后保存的状态；已保存回复继续可读。`journalContinuous` 和 `missingEventCount` 表示从 seq 0 到已观察到最大 seq 的连续性；缺口或历史版本失效时用消息页与显式同步恢复。事件的 `seq` 是回合内顺序，`cursor` 是 Hub 到达顺序，迟到事件仍会得到新游标，合并时以 runId/seq 去重并按 seq 排序。
+已结束回合被完整快照覆盖且没有保留事件时附 `eventsCleared:true`；仅仅将游标读到末尾不会标成已清理。`send_message` 的 `engine` 会在 Hub 端按缓存的引擎目录校验，未知或不可用的引擎直接返回 400 并附 `engines` 列表，不会消耗 runId。`load_session_events` 的 `afterCursor` 可省略，默认 0。事件包含增量、思考、工具、提问与结束信息，正文保留 Unicode 和完整工具结果；单页按事件条数限制，大工具结果仍可能很大。
+
+`run` 提供引擎、工作区、会话 ID、启动时间、投递状态、最近观察的 `active`、`terminal=done|error|null` 和 `outcome=completed|interrupted|error|null`。outcome 使用明确的结束事件或执行端台账：正常结束为 completed，`done.data.cancelled=true` 或台账 cancelled 为 interrupted，error/spawn_failed 为 error。仅有结束快照、缺少结果证据的旧记录为 null；中断请求收到确认也不会提前标为 interrupted。结果字段独立持久保存，清理事件和重启后保留。completed 表示引擎正常结束，不是对任务目标的独立验收。done 本身仍兼容正常结束和中断；无终止事件不能因为 `active=false` 就认定回复完整。离线时 `online=false`，`active` 仅为最后保存的状态；已保存回复继续可读。`journalContinuous` 和 `missingEventCount` 表示从 seq 0 到已观察到最大 seq 的连续性；缺口或历史版本失效时用消息页与显式同步恢复。事件的 `seq` 是回合内顺序，`cursor` 是 Hub 到达顺序，迟到事件仍会得到新游标，合并时以 runId/seq 去重并按 seq 排序。
 
 `question` 事件的 `data.requestId` 用于回答提问；`data.input.questions` 提供问题正文与选项。`answers` 为问题正文到选项标签的映射，多选值为标签数组，null 表示跳过。继续已完成会话时使用同一个 `sessionId`，为新回合生成新的 runId。
+
+最小跟进循环（`get`、`invoke` 返回解包后的 `data`）：
+
+```js
+let afterCursor = 0;
+for (;;) {
+  const page = await get(`${runPath}?afterCursor=${afterCursor}&waitMs=25000`);
+  for (const event of page.events) handle(event.kind, event.data); // 按 runId/seq 去重与排序
+  afterCursor = page.nextCursor;
+  if (page.hasMore) continue;
+  if (page.run.terminal) { consume(page.replyText, page.run.outcome, page.readVia); break; }
+  if (page.pendingQuestions.length) { answerOrPause(page.pendingQuestions); break; }
+  if (!page.online || !page.run.active) await backoff(); // 不将断线/非活跃当作完成
+}
+```
+
+会话增量的游标还要保留 `source` 和 `historyEpoch`。遇到 `reset:true`，先 `load_session_page` 重读快照，再用该页的 `eventCursor`、`source` 和 `historyEpoch` 初始化下一次请求；`hasMore` 为 true 时持续取页，否则由调用方退避（此命令没有长轮询参数）。`/commands` 的 notes 和发现响应中也提供跟进伪代码。
 
 新版执行端的 `run_status` 返回 `[{runId,known,state,sessionId,startedAt,error,origin}]`，状态为 `reserved|spawned|done|error|cancelled|spawn_failed`；未知 ID 的字段为 null。`known=false` 的明确回执会在执行端关闭这个 ID，避免旧连接上迟到的发送随后启动，用户有意重发须创建新 ID。已接收回合的 ID 持久去重；执行端重启将未收敛的台账记为 error，保留已保存历史及其完整性信息。
 
@@ -196,3 +218,5 @@ Invoke-RestMethod -Uri "$relayOrigin/_relay/api/machines/PC6/sync" -Method Post 
 ```
 
 本地源码验证：Hub 仓库运行 `bun test`，涵盖真实 HTTP/WebSocket 查询、启动/续接/回复读取、重复 runId、超时与离线；本项目日志能力运行 `cargo test --lib -- diagnostics:: web:: event_sink:: metrics:: relay::tests`。操作接口只需更新 Hub 源码，包含新增的 `ccgui-api-commands.mjs`；已有执行端命令和网页协议保持兼容。执行端持久化日志和新快照另需升级执行程序。Hub 更新不要求重启执行机器或正在运行的 AI 任务。
+
+Hub 的五项 HTTP 冒烟固化在 `scripts/smoke-ai-api.mjs`：发现契约、非法参数、机器目录与搜索、发送等待与摘录、续接与重复投递。默认只读，后两项明确记为 skipped；`--exercise --engine <引擎> --workspace <执行端工作区>` 创建独立的两回合测试会话，仅要求回复标记，不使用现有会话。失败时只尝试中断该脚本创建且仍运行的测试回合。通过 SSH 在服务器执行，例如 `node scripts/smoke-ai-api.mjs --url http://127.0.0.1:8787/_relay/api --sessions sessions.json --machine PC0 --exercise --engine codex --workspace <工作区> --receipt <新回执.json>`；脚本不会输出登录票或对话正文。真实 HTTP/WS 集成测试复用同一个冒烟入口。
