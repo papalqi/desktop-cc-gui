@@ -29,6 +29,16 @@ export function changelogEntryFor(version: string): ChangelogEntry | undefined {
 
 export const CHANGELOG_DATA: ChangelogEntry[] = [
   {
+    version: "1.3.1",
+    date: "2026-10-16",
+    content: {
+      zh: `🐛 修复
+- **Windows 客户端意外退出**：为 tao 事件循环句柄改用原子引用计数，修复 WebView2 处理 IPC 时跨线程克隆句柄导致的进程中止。`,
+      en: `🐛 Fixes
+- **Unexpected Windows client exits**: use an atomic reference count for tao's event-loop handle to fix process aborts when WebView2 clones the handle across threads during IPC.`,
+    },
+  },
+  {
     version: "1.1.2",
     date: "2026-10-08",
     content: {

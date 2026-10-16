@@ -34,6 +34,39 @@ pnpm test:deploy                 # 活动任务、失败恢复、成功更新的
 
 发布命令为 `pnpm release:win`，或 `pnpm release:win --artifact artifacts/windows/<包目录>`。版本文件先上传到 `releases/windows/<版本>/`，全部成功后才替换频道 `manifest.json`。同一版本目录不覆盖。发布不会打开任何机器的开关。
 
+### 从 main 发布 Windows 新版
+
+在 Windows 上使用干净的 `main` 工作区。先合入并推送待发布的提交；原工作区存在未完成改动时，使用独立 Git worktree，保留原改动。发布脚本会检查整个工作区，未跟踪文件也会使检查失败。
+
+1. 核对 `git status --short --branch`、`git rev-parse HEAD` 和 `git ls-remote origin refs/heads/main`，确认本地 `main` 与远端一致。检查 tao 补丁仍由 `src-tauri/Cargo.toml` 的 `[patch.crates-io]` 指向 `patches/tao`。
+2. 选择高于线上频道的新版本，同步修改 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 和 `src-tauri/Cargo.lock` 中 `ccgui-next` 的版本，并在 `src/version/changelog.ts` 顶部追加双语说明。版本编译进 exe，必须重新构建；旧的 1.3.0 包不能通过改清单发布成 1.3.1。客户端会忽略同版本，安装自检也会拒绝清单与 exe 版本不一致的包。
+3. 运行以下检查，通过后提交版本和文档到 `main` 并推送。确认 `git status --porcelain` 无输出。
+
+   ```powershell
+   node --test scripts/check-relay.test.mjs scripts/deploy-windows.test.mjs scripts/relay-release-signing.test.mjs scripts/release-windows.test.mjs
+   pnpm build
+   ```
+
+4. 配置忽略的 `scripts/deploy-windows.local.json`，参考同目录的 example。PC5 现有 Hub 为 `root@21.6.69.126:36000`，目录 `/data/workspace/ccgui-relay`，`relay.releaseUrl` 为 `http://21.6.69.126:8787/`，SSH 身份文件为 `$env:USERPROFILE/.ssh/codev_sk-1co0qqfv1dps-653620f7`。独立 worktree 需另行复制这份本机配置，并安装依赖。
+5. 设置原离线签名私钥的路径。PC5 于 2026-10-16 核实的保存位置如下；环境变量只在当前 PowerShell 会话生效。私钥公钥必须匹配 `src-tauri/resources/relay-update-public-key.txt`。已有客户端使用这个公钥，不要重新生成密钥来绕过缺失配置。
+
+   ```powershell
+   $env:CCGUI_RELEASE_PRIVATE_KEY = Join-Path $env:USERPROFILE '.codex/keys/ccgui-relay-release/private.pem'
+   if (!(Test-Path -LiteralPath $env:CCGUI_RELEASE_PRIVATE_KEY -PathType Leaf)) {
+     throw '找不到原离线签名私钥，请从原保管位置恢复。'
+   }
+   pnpm build:win
+   ```
+
+6. 记录构建输出的完整 `artifacts/windows/<包目录>`，核对其中 `manifest.json` 的版本，再发布同一份包：
+
+   ```powershell
+   pnpm release:win --artifact artifacts/windows/<包目录>
+   ```
+
+7. 成功时包目录中生成 `release-receipt.json`，其 `version` 必须等于新版本。通过 SSH 读取 Hub 的 `/data/workspace/ccgui-relay/releases/windows/manifest.json`，核对版本、签名和三个文件的 SHA256 与本地 `signed-manifest.json` 一致，并确认版本目录中的三个文件完整。只有频道核验通过才算发布完成；保留包、签名清单和发布回执。
+8. 发布后通过 `/_relay/updates` 查看逐机开关和安装结果，通过 `/_relay/api/status` 查看执行端 observer 版本。开启机器前确认目标支持 `self_update`，先验收一台，再扩展到其余目标。发布成功只表示频道可用，机器是否安装完成以对应版本的成功回执和在线自检为准。
+
 登录后的 `/_relay/updates` GET 返回机器开关、能力与结果；POST `{ machine: "PC6", enabled: true }` 打开指定机器，第一次只启用 PC6。1.1.3 或 macOS 不声明 `self_update`，不能打开此开关。执行端每 30 秒检查清单，先校验应用内公钥签名，再下载同源文件并验证签名尺寸和 SHA256。
 
 执行端检查所有聊天、插件、任务预约和进行中的桥请求/HTTP 传输；同时要求 Windows 系统最近 10 分钟没有输入（覆盖桌面窗口，条件更保守）、没有推迟或禁止时段。桌面提示后台下载及空闲安装，提供推迟一小时和本地时间的每日禁止时段；跨午夜时段有效，两个时间均为空或相等表示不禁止。安装与运行预约共享互斥边界，安装开始后暂缓新任务，已有任务不会被停止。
