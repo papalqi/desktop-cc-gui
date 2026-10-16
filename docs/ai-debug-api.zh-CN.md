@@ -83,7 +83,7 @@ AI 首先读取 `/commands` 和 `/machines`，取得参数契约与机器名，�
 
 事件信封字段为 `{runId,engine,seq,kind,data,ts,startedAt,cursor,sessionId,workspacePath}`，类型字段名是 `kind` 而不是 `type`。常见 kind：`message`（完整消息，`data.role` 为 user/assistant/tool）、`delta`/`text`（回复增量，拼接 `data` 即正文）、`thinking`（思考片段）、`session`（会话身份）、`question`/`question_settled`（提问与落定）、`usage`（token 用量）、`done`、`error`。`/_relay/api` 发现响应的 `events` 字段包含同样的说明，供 AI 自查。
 
-终态页面附 `replyText`（该 run 最后一条 assistant 正文的原文摘录，最多 4096 个 UTF-8 字节）、`replyTruncated` 和 `readVia`（指向 `load_session_page` 的 engine/sessionId 参数）。截断保留完整 Unicode 字符，不生成模型摘要。优先使用覆盖该回合的完整快照，否则只从连续完整事件投影正文；存在缺口、部分前缀已清理或没有可确认正文时为 `replyText:null`，使用 `readVia` 读取消息页。指针从会话最新页开始，旧回合需按 `nextBefore` 翻页并匹配消息的 runId；后续回合不会覆盖旧 run 的摘录。
+终态页面附 `replyText`（该 run 最后一条 assistant 正文的原文摘录，最多 4096 个 UTF-8 字节）、`replyTruncated` 和 `readVia`（指向 `load_session_page` 的 engine/sessionId 参数）。截断保留完整 Unicode 字符，不生成模型摘要。优先使用覆盖该回合的完整快照，否则只从连续完整事件投影正文；存在缺口、部分前缀已清理或没有可确认正文时为 `replyText:null`，使用 `readVia` 读取消息页。结束事件可能先于完整快照到达，此时已缓存消息页也可能仍旧；需要完整回复时，先 `POST /machines/{machine}/sync`，传相同 engine/sessionId，等待同步后再读回合或消息页，不将缓存页视为同步已完成。指针从会话最新页开始，旧回合需按 `nextBefore` 翻页并匹配消息的 runId；后续回合不会覆盖旧 run 的摘录。
 
 已结束回合被完整快照覆盖且没有保留事件时附 `eventsCleared:true`；仅仅将游标读到末尾不会标成已清理。`send_message` 的 `engine` 会在 Hub 端按缓存的引擎目录校验，未知或不可用的引擎直接返回 400 并附 `engines` 列表，不会消耗 runId。`load_session_events` 的 `afterCursor` 可省略，默认 0。事件包含增量、思考、工具、提问与结束信息，正文保留 Unicode 和完整工具结果；单页按事件条数限制，大工具结果仍可能很大。
 
