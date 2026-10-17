@@ -38,6 +38,7 @@ import { rememberContextWindow, resolveContextMax } from "../context-window-memo
 import { useWorkspaceUIHooks, workspaceAllowedEngines } from "../workspace-ui-bridge";
 import { ConversationModePane, ConversationModePicker } from "@/features/plugins/conversation/ConversationModeHost";
 import { SessionScope } from "../split/session-scope";
+import { useSidebarHold } from "../relay-machines";
 import { usePlanReviewGateActive } from "./PlanReviewDock";
 import { useConversationMode } from "@/features/plugins/conversation/use-conversation-mode";
 
@@ -285,6 +286,7 @@ export const ChatConversation = memo(function ChatConversation({
   composerInputRef: React.RefObject<ComposerInputHandle | null>;
 }) {
   const { t, i18n } = useTranslation();
+  const sidebarHold = useSidebarHold();
   const engines = useChatStore((s) => active?.machine ? s.enginesByMachine[active.machine] ?? EMPTY_ENGINES : fallbackEngines);
   const conversationMode = useConversationMode(active);
   // 互斥:计划等待中且 run 活跃时不得切入插件会话模式(会搁置原生等待点);
@@ -518,6 +520,11 @@ export const ChatConversation = memo(function ChatConversation({
 
   return (
     <SessionScope session={active}>
+      {sidebarHold && active?.machine && (
+        <p className="px-4 pt-2 text-caption-1-medium text-text-tertiary" role="status">
+          {t("chat.chatOnMachine", { machine: active.machine })}
+        </p>
+      )}
       <ConversationBody
         active={active}
         hasSession={hasSession}

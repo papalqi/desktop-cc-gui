@@ -213,6 +213,7 @@ export const en: Messages = {
     pin: "Pin",
     unpin: "Unpin",
     sessionActions: "Session actions",
+    chatOnMachine: "This chat is on {{machine}}. The sidebar stays on the previous machine.",
     deleteSession: "Delete session",
     archiveSession: "Archive session",
     archiveWeek: "Archive older than a week",

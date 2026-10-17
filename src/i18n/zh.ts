@@ -209,6 +209,7 @@ export const zh = {
     pin: "置顶",
     unpin: "取消置顶",
     sessionActions: "会话操作",
+    chatOnMachine: "当前对话在 {{machine}}。侧栏仍停在上一台机器。",
     deleteSession: "删除会话",
     archiveSession: "归档会话",
     archiveWeek: "归档一周前",
