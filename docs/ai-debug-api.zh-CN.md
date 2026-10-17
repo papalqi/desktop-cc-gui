@@ -54,12 +54,15 @@ AI 首先读取 `/commands` 和 `/machines`，取得参数契约与机器名，�
 | 会话增量 | `load_session_events` | `engine`、`sessionId`、`afterCursor`，可选 `untilCursor`、`historyEpoch`、`historySource=hub|executor` |
 | 运行任务 | `list_active_runs` | `{}` |
 | 持久运行台账 | `run_status` | `runIds`，最多 256 个；执行端须声明 `run_status` |
-| Hub 发送送达核对 | `get_run_delivery` | `runId`，可选 `waitMs=0..5000` |
+| Hub 发送送达核对 | `get_run_delivery` | `runId`，可选 `waitMs=0..5000`。只查询，不关闭 ID |
+| 关闭未收到的发送 ID | `close_unreceived_run` | `runId`。仅当没有记录时记为作废；已有记录原样返回 |
+| 会话管理 | `pin_session`、`rename_session`、`archive_session`、`delete_session` | 置顶要 `pinned`；改名要 `title`（null 清除）；归档传 `{session}` 或 `{engine,sessionId}`；删除要执行端在线 |
+| 记住会话选择 | `remember_session_model`、`remember_session_effort`、`remember_session_provider` | 分别传 `model`、`effort`、`providerId` |
 | 会话来源 | `set_session_origin` | `engine`、`sessionId`、`origin=hub|local`；执行端须声明 `session_origin` |
 | 开始或继续对话 | `send_message` | `runId`、`engine`、`workspacePath`、`prompt`，继续对话另传 `sessionId` |
 | 恢复归档会话 | `restore_session` | `engine`、`sessionId`；复用已有恢复命令，不发送提示词 |
-| 回答执行中的提问 | `answer_question` | `sessionId`（也可用 runId）、`requestId`、`answers` |
-| 中断指定回合 | `interrupt_session` | 在 `sessionId` 字段中传 runId，可定位尚未分配会话 ID 的回合 |
+| 回答执行中的提问 | `answer_question` | `sessionId` 或 `runId` 至少其一、`requestId`、`answers`。`answers` 的键是 `questions[].question` 提问原文，不是标题或问题 id |
+| 中断指定回合 | `interrupt_session` | `sessionId` 或 `runId` 至少其一。只传 `runId` 时 Hub 写入执行端已有的 `sessionId` 字段 |
 | 文件查询 | `list_dir`、`read_file`、`search_text` | `path`；文本搜索还需要 `query` |
 | Git 查询 | `git_status`、`git_diff`、`git_branches` | `path`；diff 还需要 `file`、`staged` |
 
@@ -77,7 +80,7 @@ AI 首先读取 `/commands` 和 `/machines`，取得参数契约与机器名，�
 
 归档会话先调用 `restore_session`，再用同一 `sessionId` 和新 runId 继续。支持管理字段同步的执行端可能返回 `result.queued=true`，须等待目录中的 `metadataSyncPending` 清除并核对归档状态；恢复和提示词发送不会组合重放。此入口复用 Hub/执行端已有的生命周期能力，无需增加执行端命令。
 
-同一机器重复提交已有 runId 返回 **409 already_submitted**，附带已有投递状态和查询路径，不再发送提示词。超时或断连可能已经送达，返回的 `delivery=indeterminate` 必须通过回合查询核对，不能换一个 runId 自动重试。在线前置检查失败为 `delivery=not_sent`，不会创建回合；执行端明确拒绝为 `failed`。`in-flight` 表示 RPC 尚未响应，`acknowledged` 表示收到启动响应，null 表示该回合来自执行端观察而非 Hub 发起，`abandoned` 表示网页断线后查询该 runId 时 Hub 从未收到，已作废且不会启动；这些值描述命令投递，真实执行结果以事件为依据。
+同一机器重复提交已有 runId 返回 **409 already_submitted**，附带已有投递状态和查询路径，不再发送提示词。超时或断连可能已经送达，返回的 `delivery=indeterminate` 必须通过回合查询核对，不能换一个 runId 自动重试。在线前置检查失败为 `delivery=not_sent`，不会创建回合；执行端明确拒绝为 `failed`，HTTP 502 的 `executor_rejected` 另附去掉凭据样式片段后的简短 `reason`。`in-flight` 表示 RPC 尚未响应，`acknowledged` 表示收到启动响应，null 表示该回合来自执行端观察而非 Hub 发起。`get_run_delivery` 对从未见过的 runId 返回 `not-received` 且不写库。网页确认未送达后调用 `close_unreceived_run`，才把没有记录的 ID 记为 `abandoned`（查询时显示为 `not-received`）并阻止迟到启动；已有的 in-flight、acknowledged 或 failed 不会被降级。这些值描述命令投递，真实执行结果以事件为依据。参数校验失败时，`message` 在 `Invalid`、`Missing` 或 `Unknown argument` 之后写明期望的类型、枚举、模式或范围。Hub 已保存待答提问时，对不上的回答键返回 400，`unmatched` 是用错的文本，`expected` 是提问原文。
 
 回合查询支持 `afterCursor>=0`、`limit=1..100`（默认 100）、`waitMs=0..25000` 和 `waitFor=events|terminal|question`（默认 events）。返回 `{machine,online,run,events,head,hasMore,nextCursor,pendingQuestions,waitReason}`；从 0 读取，后续传 `nextCursor`，有 `hasMore` 时继续取页。默认等待新事件或状态重新核对；terminal 等待终态，question 等待未答提问或终态。后两者会忽略普通增量，所有唤醒共用同一个截止时间。`pendingQuestions` 合并快照中仍待答的提问及未落定的提问事件，独立于本次事件游标；终态不再返回待答提问。`waitReason=events|state|terminal|question|timeout|offline|inactive|aborted|stopped`；state 表示投递、目录或快照重新核对唤醒，可能没有新事件。离线、非活跃、取消请求和 Hub 停止均提前返回。非活跃或离线不等于任务成功；读取/等待/取消 HTTP 请求均不发送或中断任务。
 

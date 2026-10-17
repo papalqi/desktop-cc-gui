@@ -87,23 +87,50 @@ it("a send the hub never received or the machine rejected may be sent again", as
   for (const [delivery, text] of [["not-received", "chat.sendNotDelivered"], ["failed", "chat.sendRejected"]] as const) {
     const { recovery, socket, send } = await connected();
     const query = vi.fn().mockResolvedValue(answer(delivery));
-    const result = recovery.sendWithDeliveryRecovery(args, send, query);
+    const close = vi.fn(async () => answer(delivery));
+    const result = recovery.sendWithDeliveryRecovery(args, send, query, undefined, close);
     const settled = result.catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     socket.fireClose();
     const error = await settled;
     expect(error).not.toBeInstanceOf(recovery.SendDeliveryUnknownError);
     expect((error as Error).message).toBe(i18n.t(text));
+    if (delivery === "not-received") expect(close).toHaveBeenCalledWith("PC6", "run-1");
+    else expect(close).not.toHaveBeenCalled();
     vi.resetModules();
     Socket.instances = [];
   }
+});
+
+it("closing an unseen run that actually landed keeps the send", async () => {
+  const { recovery, socket, send } = await connected();
+  const query = vi.fn().mockResolvedValue(answer("not-received"));
+  const close = vi.fn(async () => answer("acknowledged", "native"));
+  const result = recovery.sendWithDeliveryRecovery(args, send, query, undefined, close);
+  await vi.advanceTimersByTimeAsync(0);
+  socket.fireClose();
+  await expect(result).resolves.toEqual({ runId: "run-1", sessionId: "native" });
+  expect(close).toHaveBeenCalledOnce();
+});
+
+it("a close that cannot be confirmed does not say the prompt is safe to resend", async () => {
+  const { recovery, socket, send } = await connected();
+  const query = vi.fn().mockResolvedValue(answer("not-received"));
+  const close = vi.fn().mockRejectedValue(new Error("bridge closed"));
+  const pending = recovery.sendWithDeliveryRecovery(args, send, query, undefined, close).catch((error: unknown) => error);
+  await vi.advanceTimersByTimeAsync(0);
+  socket.fireClose();
+  const error = await pending;
+  expect(error).toBeInstanceOf(recovery.SendDeliveryUnknownError);
+  expect((error as Error).message).toBe(i18n.t("chat.sendDeliveryUnknown"));
 });
 
 it("a request that never left the page is not sent and needs no hub query", async () => {
   const transport = await import("./transport");
   const recovery = await import("./web-send-recovery");
   const query = vi.fn();
-  const result = recovery.sendWithDeliveryRecovery(args, () => transport.invoke("send_message", args), query);
+  const close = vi.fn();
+  const result = recovery.sendWithDeliveryRecovery(args, () => transport.invoke("send_message", args), query, undefined, close);
   const settled = result.catch((error: unknown) => error);
   await vi.advanceTimersByTimeAsync(0);
   Socket.instances[0].fireClose();
@@ -111,6 +138,7 @@ it("a request that never left the page is not sent and needs no hub query", asyn
   expect((error as Error).message).toBe(i18n.t("chat.sendNotDelivered"));
   expect(error).not.toBeInstanceOf(recovery.SendDeliveryUnknownError);
   expect(query).not.toHaveBeenCalled();
+  expect(close).not.toHaveBeenCalled();
 });
 
 it("an unreachable hub or an uncertain record never reports the prompt as unsent", async () => {
