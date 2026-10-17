@@ -26,8 +26,16 @@ vi.mock("@/features/plugins/runtime/loader", () => ({
   unloadPlugin: vi.fn(),
 }));
 vi.mock("@/features/plugins/builtin", () => ({ BUILTIN_PLUGINS: [] }));
-vi.mock("@/features/open-app/HeaderOpenActions", () => ({ HeaderOpenActions: () => null }));
-vi.mock("@/features/launch-script/LaunchScriptActions", () => ({ LaunchScriptActions: () => null }));
+vi.mock("@/features/open-app/HeaderOpenActions", () => ({
+  HeaderOpenActions: ({ workspacePath, machine }: { workspacePath: string; machine?: string }) => (
+    <button data-testid="open-actions" data-workspace={workspacePath} data-machine={machine} />
+  ),
+}));
+vi.mock("@/features/launch-script/LaunchScriptActions", () => ({
+  LaunchScriptActions: ({ workspacePath, machine }: { workspacePath: string; machine?: string }) => (
+    <button data-testid="launch-actions" data-workspace={workspacePath} data-machine={machine} />
+  ),
+}));
 vi.mock("@/features/files/FilesPanel", () => ({ FilesPanel: () => null }));
 vi.mock("@/features/git/ChangesPanel", () => ({ ChangesPanel: () => null }));
 
@@ -79,10 +87,11 @@ describe("ChatPanelHeader plugin pills", () => {
   let disposers: Array<() => void>;
   const onPanelTabChange = vi.fn();
 
-  function header(panelTab = "files"): ReactNode {
+  function header(panelTab = "files", workspacePath = "/tmp/ws", machine?: string): ReactNode {
     return (
       <ChatPanelHeader
-        workspacePath="/tmp/ws"
+        workspacePath={workspacePath}
+        machine={machine}
         panelTab={panelTab}
         onPanelTabChange={onPanelTabChange}
         panelCollapsed={false}
@@ -130,6 +139,26 @@ describe("ChatPanelHeader plugin pills", () => {
       ) ?? null
     );
   }
+
+  it("keeps only the current workspace actions when switching workspaces and machines", async () => {
+    const targets = [
+      { workspacePath: "/tmp/ws" },
+      { workspacePath: "/tmp/other" },
+      { workspacePath: "/tmp/ws" },
+      { workspacePath: "/tmp/ws", machine: "PC0" },
+      { workspacePath: "/tmp/ws", machine: "PC6" },
+      { workspacePath: "/tmp/ws", machine: "PC0" },
+    ];
+    for (const { workspacePath, machine } of targets) {
+      await render(header("files", workspacePath, machine));
+      for (const testId of ["launch-actions", "open-actions"]) {
+        const actions = container.querySelectorAll(`[data-testid="${testId}"]`);
+        expect(actions).toHaveLength(1);
+        expect(actions[0].getAttribute("data-workspace")).toBe(workspacePath);
+        expect(actions[0].getAttribute("data-machine")).toBe(machine ?? null);
+      }
+    }
+  });
 
   it("keeps icon + label for builtin tabs", () => {
     act(() => {

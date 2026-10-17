@@ -46,8 +46,8 @@ export function ChatPanelHeader({
   );
   return (
     <div className="flex h-full items-center">
-      <LaunchScriptActions key={machineResourceKey(workspacePath, machine)} workspacePath={workspacePath} machine={machine} />
-      <HeaderOpenActions key={machineResourceKey(workspacePath, machine)} workspacePath={workspacePath} machine={machine} />
+      <LaunchScriptActions key={`launch:${machineResourceKey(workspacePath, machine)}`} workspacePath={workspacePath} machine={machine} />
+      <HeaderOpenActions key={`open:${machineResourceKey(workspacePath, machine)}`} workspacePath={workspacePath} machine={machine} />
       {
         // Deliberately outside the xl-gated chrome below: that wrapper is
         // display:none on narrow windows, and the toggle used to vanish with
