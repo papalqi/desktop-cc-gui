@@ -26,6 +26,7 @@ import {
 import { cx } from "@/utils/cx";
 import { webMultiMachine } from "@/lib/web-machine";
 import { useChatStore as multiMachineChatStore, sessionKey as chatSessionKey } from "@/features/chat/store";
+import { contextTitle, projectNameForSession, sessionDisplayName } from "@/features/chat/session-display-name";
 
 /** Pinned sessions from every relay desktop, in one list. */
 export function PinnedMachinesSection({
@@ -43,12 +44,14 @@ export function PinnedMachinesSection({
   const watched = useWatchedRunningMap();
   const activities = useWatchedSessionActivities();
   const sessions = multiMachineChatStore((state) => state.sessions);
+  const workspaces = multiMachineChatStore((state) => state.workspaces);
+  const aliases = multiMachineChatStore((state) => state.workspaceAliases);
   const scope = multiMachineChatStore((state) => state.sessionScope);
   const unseen = multiMachineChatStore((state) => state.unseen);
   const visibleMachines = relayMachineNames(list);
   const rows = webMultiMachine()
     ? sessions.filter((session) => session.pinned && session.machine && visibleMachines.includes(session.machine) && (scope === "all" || session.origin === "hub"))
-      .map((session) => ({ session, machine:session.machine!, workspaceName:session.workspacePath }))
+      .map((session) => ({ session, machine: session.machine!, workspaceName: projectNameForSession(session, workspaces, aliases) }))
     : collectPinnedRows(Object.fromEntries(Object.entries(catalogs).filter(([machine]) => visibleMachines.includes(machine))), visibleMachines)
       .filter((row) => scope === "all" || row.session.origin === "hub");
   const [failed, setFailed] = useState<string | null>(null);
@@ -63,7 +66,15 @@ export function PinnedMachinesSection({
           const sessionKey = `${row.session.engine}/${row.session.sessionId}`;
           const key = `${row.machine}/${sessionKey}`;
           const globalKey = chatSessionKey(row.session.engine, row.session.sessionId, row.session.workspacePath, row.machine);
-          const title = row.session.customTitle || row.session.title || row.session.sessionId.slice(0, 8);
+          const display = sessionDisplayName({
+            customTitle: row.session.customTitle,
+            title: row.session.title,
+            sessionId: row.session.sessionId,
+            localName: row.workspaceName,
+          });
+          const title = display.nestedLabel;
+          const place = [row.machine, row.workspaceName && row.workspaceName !== title ? row.workspaceName : ""].filter(Boolean).join(" · ");
+          const fullName = contextTitle({ machine: row.machine, localName: row.workspaceName, headline: title });
           const heard = watched[row.machine];
           const activity = activities[row.machine]?.[sessionKey]?.state;
           const liveHere = webMultiMachine() ? liveRunning.has(globalKey) : row.machine === connected && liveRunning.has(sessionKey);
@@ -82,15 +93,15 @@ export function PinnedMachinesSection({
             <li key={key}>
               <div
                 className={cx(
-                  "flex w-full items-center gap-2 rounded-2lg p-2 text-left",
+                  "flex w-full items-start gap-2 rounded-2lg p-2 text-left",
                   "hover:bg-background-secondary-hover",
                   openHere && "bg-background-secondary-hover",
                 )}
               >
                 <button
                   type="button"
-                  className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-                  title={failed === key ? t("chat.myMachinesSwitchFailed", { name: row.machine }) : title}
+                  className="flex min-w-0 flex-1 cursor-pointer flex-col items-stretch gap-0.5 text-left"
+                  title={failed === key ? t("chat.myMachinesSwitchFailed", { name: row.machine }) : fullName}
                   aria-current={openHere ? "page" : undefined}
                   onClick={() => {
                     setFailed(null);
@@ -99,23 +110,27 @@ export function PinnedMachinesSection({
                     });
                   }}
                 >
-                  <Pin className="size-4 shrink-0 text-foreground-icon-secondary" aria-hidden />
-                  <span className="min-w-0 flex-1 truncate text-body-2-medium text-text-secondary">
-                    {title}
-                    {row.session.metadataSyncPending && <span role="status" className="ml-1 text-caption-2-medium text-text-tertiary">{t(row.session.metadataSyncError ? "chat.metadataSyncFailed" : "chat.metadataSyncPending")}</span>}
+                  <span className="flex min-w-0 items-center gap-2">
+                    <Pin className="size-4 shrink-0 text-foreground-icon-secondary" aria-hidden />
+                    <span className="min-w-0 flex-1 truncate text-body-2-medium text-text-secondary">
+                      {title}
+                      {row.session.metadataSyncPending && <span role="status" className="ml-1 text-caption-2-medium text-text-tertiary">{t(row.session.metadataSyncError ? "chat.metadataSyncFailed" : "chat.metadataSyncPending")}</span>}
+                    </span>
+                    <span className="inline-flex shrink-0 items-center gap-1 text-caption-1-medium text-text-tertiary">
+                      {running && (
+                        <span
+                          className="sidebar-thread-status sidebar-thread-status-processing"
+                          aria-hidden
+                        />
+                      )}
+                      {activity === "awaiting-approval" ? t("chat.sessionAwaitingApproval") : activity === "awaiting-input" ? t("chat.sessionAwaitingInput")
+                        : running ? t("chat.sessionRunning") : unseen[webMultiMachine() ? globalKey : sessionKey] ? t("chat.sessionUnseen") : t("chat.sessionStopped")}
+                    </span>
                   </span>
-                  <span className="inline-flex shrink-0 items-center gap-1 text-caption-1-medium text-text-tertiary">
-                    {running && (
-                      <span
-                        className="sidebar-thread-status sidebar-thread-status-processing"
-                        aria-hidden
-                      />
-                    )}
-                    {activity === "awaiting-approval" ? t("chat.sessionAwaitingApproval") : activity === "awaiting-input" ? t("chat.sessionAwaitingInput")
-                      : running ? t("chat.sessionRunning") : unseen[webMultiMachine() ? globalKey : sessionKey] ? t("chat.sessionUnseen") : t("chat.sessionStopped")}
-                  </span>
+                  {place ? (
+                    <span className="truncate pl-6 text-caption-1-medium text-text-tertiary">{place}</span>
+                  ) : null}
                 </button>
-                <span className="shrink-0 text-caption-1-medium text-text-tertiary">{row.machine}</span>
                 <button
                   type="button"
                   className="shrink-0 cursor-pointer text-caption-1-medium text-text-tertiary hover:text-text-secondary"
