@@ -8,7 +8,7 @@ import {
 } from "./persistence";
 import { patchSession } from "./stream";
 import { notifyCliConfigChanged } from "@/features/settings/providers";
-import { persistSettings } from "./settings-persist";
+import { commitPersisted } from "./settings-persist";
 import type { ChatStore } from "./types";
 import type { StoreGet, StoreSet } from "./context";
 
@@ -73,11 +73,20 @@ export function createPreferenceActions(
         void client.rememberSessionEffort(engine, active.sessionId, effort).catch(() => {});
         return;
       }
-      set({ efforts: { ...get().efforts, [engine]: effort } });
+      const previousEfforts = get().efforts;
+      const previousEffort = active?.effort;
+      set({ efforts: { ...previousEfforts, [engine]: effort } });
       if (active?.engine === engine) stampActiveTab({ effort });
-      await persistSettings((settings) => ({
-        defaultEfforts: { ...settings.defaultEfforts, [engine]: effort },
-      }));
+      try {
+        await commitPersisted(set, () => {
+          set({ efforts: previousEfforts });
+          if (active?.engine === engine) stampActiveTab({ effort: previousEffort });
+        }, (settings) => ({
+          defaultEfforts: { ...settings.defaultEfforts, [engine]: effort },
+        }));
+      } catch {
+        // The error bar already shows the failure. The composer does not await this.
+      }
     },
     setModel: async (engine, model) => {
       const active = get().active;
@@ -87,16 +96,22 @@ export function createPreferenceActions(
       // "new chat" tab (no session yet) edits the default — that tab is where
       // the next conversation's starting choice is made.
       if (!active || active.sessionId === null) {
-        const models = { ...get().models };
+        const previousModels = get().models;
+        const models = { ...previousModels };
         if (model) models[engine] = model;
         else delete models[engine];
         set({ models });
-        await persistSettings((settings) => {
-          const defaultModels = { ...settings.defaultModels };
-          if (model) defaultModels[engine] = model;
-          else delete defaultModels[engine];
-          return { defaultModels };
-        });
+        try {
+          await commitPersisted(set, () => set({ models: previousModels }), (settings) => {
+            const defaultModels = { ...settings.defaultModels };
+            if (model) defaultModels[engine] = model;
+            else delete defaultModels[engine];
+            return { defaultModels };
+          });
+        } catch {
+          // Shown on the chat error bar. Do not stamp a default the write rejected.
+          return;
+        }
       }
       if (get().active === active && active?.engine === engine) {
         // Empty = "CLI default": clear the tab override so the session falls
@@ -136,16 +151,21 @@ export function createPreferenceActions(
         model.trim(),
       );
       if (entries.length === 0) return;
-      const models = { ...get().models };
+      const previousModels = get().models;
+      const models = { ...previousModels };
       for (const [engine, model] of entries) models[engine] = model;
       set({ models });
       if (!persist) return;
-      await persistSettings((settings) => ({
-        defaultModels: {
-          ...settings.defaultModels,
-          ...Object.fromEntries(entries),
-        },
-      }));
+      try {
+        await commitPersisted(set, () => set({ models: previousModels }), (settings) => ({
+          defaultModels: {
+            ...settings.defaultModels,
+            ...Object.fromEntries(entries),
+          },
+        }));
+      } catch {
+        // Shown on the chat error bar.
+      }
     },
 
     setThreadLimit: (limit) => {

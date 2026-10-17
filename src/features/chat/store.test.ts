@@ -33,6 +33,7 @@ vi.mock("@/lib/ipc", () => ({
     deleteRemoteSession: vi.fn(async () => {}),
     getAppSettings: vi.fn(async () => ({})),
     updateAppSettings: vi.fn(async () => {}),
+    setWorkspaceGroup: vi.fn(async () => {}),
     rescanSessions: vi.fn(async () => {}),
   },
 }));
@@ -658,6 +659,49 @@ describe("compactContext and refreshSessionUsage", () => {
     expect(ipc.updateAppSettings).toHaveBeenCalledWith(
       expect.objectContaining({ defaultModels: expect.objectContaining({ omp: "m1" }) }),
     );
+  });
+
+  it("rolls back a pinned model, a new-chat default, and an effort when the settings write fails", async () => {
+    const tab = { engine: "codex", sessionId: null, workspacePath: WS, effort: "low" as const };
+    useChatStore.setState({
+      models: { omp: "old-pin", codex: "old-default" },
+      efforts: { codex: "low" },
+      active: tab,
+      openTabs: [tab],
+      actionError: "stale",
+    });
+    vi.mocked(ipc.updateAppSettings).mockRejectedValueOnce(new Error("disk full"));
+    await useChatStore.getState().pinModels({ omp: "new-pin" });
+    expect(useChatStore.getState().models.omp).toBe("old-pin");
+    expect(useChatStore.getState().actionError).toBe("disk full");
+
+    vi.mocked(ipc.updateAppSettings).mockRejectedValueOnce(new Error("disk full"));
+    await useChatStore.getState().setModel("codex", "new-default");
+    expect(useChatStore.getState().models.codex).toBe("old-default");
+    expect(useChatStore.getState().active?.model).toBeUndefined();
+
+    vi.mocked(ipc.updateAppSettings).mockRejectedValueOnce(new Error("disk full"));
+    await useChatStore.getState().setEffort("codex", "high");
+    expect(useChatStore.getState().efforts.codex).toBe("low");
+    expect(useChatStore.getState().active?.effort).toBe("low");
+
+    vi.mocked(ipc.updateAppSettings).mockResolvedValueOnce(undefined);
+    await useChatStore.getState().pinModels({ omp: "kept" });
+    expect(useChatStore.getState().models.omp).toBe("kept");
+    expect(useChatStore.getState().actionError).toBeNull();
+  });
+
+  it("restores a deleted workspace group and does not clear its members when the write fails", async () => {
+    const group = { id: "g1", name: "G", sortOrder: 0 };
+    const workspace = { id: "w1", path: WS, name: "ws", groupId: "g1", sortOrder: 0, lastOpenedAt: null };
+    useChatStore.setState({ workspaceGroups: [group], workspaces: [workspace] });
+    vi.mocked(ipc.setWorkspaceGroup).mockClear();
+    vi.mocked(ipc.updateAppSettings).mockRejectedValueOnce(new Error("disk full"));
+    await expect(useChatStore.getState().deleteWorkspaceGroup("g1")).rejects.toThrow("disk full");
+    expect(useChatStore.getState().workspaceGroups).toEqual([group]);
+    expect(useChatStore.getState().workspaces[0]?.groupId).toBe("g1");
+    expect(ipc.setWorkspaceGroup).not.toHaveBeenCalled();
+    expect(useChatStore.getState().actionError).toBe("disk full");
   });
 
   it("compactContext sends /compact and invokes refreshSessionUsage after compaction finishes", async () => {

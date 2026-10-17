@@ -358,7 +358,8 @@ export function useChatSidebar({
           setDialog({ kind: "archiveWorkspace", workspaceId });
           return;
         }
-        void state.setWorkspaceArchived(workspaceId, archived);
+        // Failure is already on the session error bar; don't leave a rejection.
+        void state.setWorkspaceArchived(workspaceId, archived).catch(() => {});
       });
     },
     [beginOnDisplayedMachine, setDialog],

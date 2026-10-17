@@ -87,7 +87,8 @@ export function ChatPageDialogs({
           initial={workspaceAliases[dialog.workspaceId] ?? ""}
           onSubmit={(alias) => {
             onClose();
-            void setWorkspaceAlias(dialog.workspaceId, alias);
+            // Failure is already on the session error bar; don't leave a rejection.
+            void setWorkspaceAlias(dialog.workspaceId, alias).catch(() => {});
           }}
           onCancel={onClose}
         />
@@ -184,8 +185,8 @@ export function ChatPageDialogs({
               })}
               onConfirm={() => {
                 onClose();
-                for (const child of children) void setWorkspaceArchived(child.id, true);
-                void setWorkspaceArchived(parent.id, true);
+                for (const child of children) void setWorkspaceArchived(child.id, true).catch(() => {});
+                void setWorkspaceArchived(parent.id, true).catch(() => {});
               }}
               onCancel={onClose}
             />

@@ -5,7 +5,7 @@ import { machineResourceKey } from "@/lib/web-machine";
 import { pruneMentionIndex } from "@/components/application/ai-chat/mention-files";
 import { pruneSlashCommands } from "@/components/application/ai-chat/slash-commands";
 import { parseDraftSessionKey, persistTabs, sessionKey, type ActiveSession } from "./persistence";
-import { persistSettings } from "./settings-persist";
+import { commitPersisted } from "./settings-persist";
 import type { ChatStore } from "./types";
 import type { StoreGet, StoreSet } from "./context";
 
@@ -149,7 +149,7 @@ export function createWorkspaceActions(
       };
       const workspaceGroups = [...current, group];
       set({ workspaceGroups });
-      await persistSettings((settings) => ({
+      await commitPersisted(set, () => set({ workspaceGroups: current }), (settings) => ({
         workspaceGroups: [...(settings.workspaceGroups ?? []), group],
       }));
       return group;
@@ -166,7 +166,7 @@ export function createWorkspaceActions(
           g.id === id ? { ...g, name: trimmed } : g,
         ),
       });
-      await persistSettings((settings) => ({
+      await commitPersisted(set, () => set({ workspaceGroups: current }), (settings) => ({
         workspaceGroups: (settings.workspaceGroups ?? []).map((g) =>
           g.id === id ? { ...g, name: trimmed } : g,
         ),
@@ -187,18 +187,20 @@ export function createWorkspaceActions(
         sortOrder: i,
       }));
       set({ workspaceGroups });
-      await persistSettings(() => ({ workspaceGroups }));
+      await commitPersisted(set, () => set({ workspaceGroups: current }), () => ({ workspaceGroups }));
     },
     deleteWorkspaceGroup: async (id) => {
       const affected = get().workspaces.filter((w) => w.groupId === id);
-      const workspaceGroups = get().workspaceGroups.filter((g) => g.id !== id);
+      const previousGroups = get().workspaceGroups;
+      const previousWorkspaces = get().workspaces;
+      const workspaceGroups = previousGroups.filter((g) => g.id !== id);
       set({
         workspaceGroups,
-        workspaces: get().workspaces.map((w) =>
+        workspaces: previousWorkspaces.map((w) =>
           w.groupId === id ? { ...w, groupId: null } : w,
         ),
       });
-      await persistSettings((settings) => ({
+      await commitPersisted(set, () => set({ workspaceGroups: previousGroups, workspaces: previousWorkspaces }), (settings) => ({
         workspaceGroups: (settings.workspaceGroups ?? []).filter(
           (g) => g.id !== id,
         ),
@@ -231,11 +233,12 @@ export function createWorkspaceActions(
       const name = get().workspaces.find((w) => w.id === workspaceId)?.name;
       const trimmed = alias?.trim() ?? "";
       const resolved = trimmed && trimmed !== name ? trimmed : null;
-      const workspaceAliases = { ...get().workspaceAliases };
+      const previousAliases = get().workspaceAliases;
+      const workspaceAliases = { ...previousAliases };
       if (resolved) workspaceAliases[workspaceId] = resolved;
       else delete workspaceAliases[workspaceId];
       set({ workspaceAliases });
-      await persistSettings((settings) => {
+      await commitPersisted(set, () => set({ workspaceAliases: previousAliases }), (settings) => {
         const next = { ...(settings.workspaceAliases ?? {}) };
         if (resolved) next[workspaceId] = resolved;
         else delete next[workspaceId];
@@ -251,7 +254,7 @@ export function createWorkspaceActions(
         : current.filter((id) => id !== workspaceId);
       if (archivedWorkspaces === current) return;
       set({ archivedWorkspaces });
-      await persistSettings((settings) => {
+      await commitPersisted(set, () => set({ archivedWorkspaces: current }), (settings) => {
         const next = (settings.archivedWorkspaces ?? []).filter(
           (id) => id !== workspaceId,
         );
