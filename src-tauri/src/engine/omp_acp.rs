@@ -1251,6 +1251,12 @@ mod tests {
 
     #[test]
     fn session_local_roots_scans_the_session_artifacts_dir() {
+        // session_dir_name reads the process-global HOME, and the temp dir is
+        // INSIDE the real user home on Windows: a parallel test steering HOME
+        // (e.g. pi_family's) between the fixture and the scan flips the
+        // encoding from `-AppData-…` to `-tmp-AppData-…` and the scan finds
+        // nothing. Hold the crate-wide HOME lock so the two reads agree.
+        let _guard = crate::paths::HOME_ENV_LOCK.lock();
         let base = temp_dir("roots");
         let sessions_root = base.join("sessions");
         // 工作区放临时目录里，编码名由同一函数算出（扫描逻辑与编码解耦测）。
