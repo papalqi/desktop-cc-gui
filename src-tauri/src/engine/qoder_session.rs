@@ -1578,7 +1578,9 @@ const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 require('node:readline').createInterface({input: process.stdin}).on('line', line => {
   const request = JSON.parse(line);
   const mode = request.params && request.params.mode;
-  if (mode === 'complete') {
+  if (request.method === 'test/handshake') {
+    send({jsonrpc: '2.0', id: request.id, result: {ready: true}});
+  } else if (mode === 'complete') {
     let count = 0;
     const timer = setInterval(() => {
       count += 1;
@@ -1609,9 +1611,29 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
         spawned
     }
 
+    /// The Node peer needs a moment to boot, and the parallel suite makes
+    /// that moment unpredictable. Answer a handshake first so the timed
+    /// prompt only starts once the peer provably processes lines.
+    async fn ready_streaming_acp_peer() -> SpawnedAcp {
+        let mut spawned = streaming_acp_peer().await;
+        spawned
+            .acp
+            .routed(
+                "test/handshake",
+                json!({}),
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+                None,
+                &mut |_| None,
+            )
+            .await
+            .expect("ACP test peer must answer the readiness handshake");
+        spawned
+    }
+
     #[tokio::test]
     async fn acp_prompt_stays_alive_while_session_output_is_active() {
-        let mut spawned = streaming_acp_peer().await;
+        let mut spawned = ready_streaming_acp_peer().await;
         let mut updates = 0;
         let mut permissions = 0;
         let result = timeout(
@@ -1619,7 +1641,10 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
             spawned.acp.routed(
                 "session/prompt",
                 json!({"mode": "complete"}),
-                Duration::from_millis(200),
+                // 300 ms idle budget: 3x the peer's 100 ms update cadence
+                // (a 200 ms margin = 20 kill-poll ticks of scheduler jitter),
+                // while the 800 ms stream only survives via renewal.
+                Duration::from_millis(300),
                 &AtomicBool::new(false),
                 Some("s"),
                 &mut |line| match line {
@@ -1650,7 +1675,10 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
     #[tokio::test]
     async fn acp_output_does_not_extend_rpc_or_cancel_settle_deadlines() {
         for interrupted in [false, true] {
-            let mut spawned = streaming_acp_peer().await;
+            // Handshake first: the peer must really be streaming while the
+            // fixed RPC / cancel-settle deadlines hold, otherwise the test
+            // would pass vacuously on a slow peer start.
+            let mut spawned = ready_streaming_acp_peer().await;
             let killed = AtomicBool::new(interrupted);
             let method = if interrupted {
                 "session/prompt"
