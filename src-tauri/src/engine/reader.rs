@@ -72,26 +72,50 @@ pub(crate) fn spawn_stdin_writer(
     }
     Some(keep)
 }
-/// Diagnostics ring: keeps the last 4KB for the error banner.
+const DIAGNOSTIC_RING_CAP: usize = 4096;
+const DIAGNOSTIC_RING_HEAD_CAP: usize = 2048;
+const DIAGNOSTIC_RING_TAIL_CAP: usize =
+    DIAGNOSTIC_RING_CAP - DIAGNOSTIC_RING_HEAD_CAP - DIAGNOSTIC_RING_MARKER.len();
+const DIAGNOSTIC_RING_MARKER: &str = "\n... [truncated] ...\n";
+
+/// Diagnostics ring: keeps the head and latest tail within 4KB so a long
+/// stack trace cannot hide its original failure message from the error banner.
 pub(crate) fn ring_push(buf: &Arc<Mutex<String>>, text: &str) {
-    const CAP: usize = 4096;
     let mut guard = match buf.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     guard.push_str(text);
-    if guard.len() > CAP {
-        // drain panics on a non-char-boundary start — snap forward. The old
-        // stderr ring could panic mid-CJK here, silently killing the
-        // capture task and starving the error banner of the failure text.
-        let mut keep = guard.len() - CAP;
+    if guard.len() <= DIAGNOSTIC_RING_CAP {
+        return;
+    }
+    if let Some(marker_at) = guard.find(DIAGNOSTIC_RING_MARKER) {
+        // The head is already settled; only slide the tail window forward.
+        let tail_at = marker_at + DIAGNOSTIC_RING_MARKER.len();
+        let mut keep = (guard.len() - DIAGNOSTIC_RING_TAIL_CAP).max(tail_at);
         while !guard.is_char_boundary(keep) {
             keep += 1;
         }
-        guard.drain(..keep);
+        guard.drain(tail_at..keep);
+        return;
     }
+    let mut head_at = DIAGNOSTIC_RING_HEAD_CAP;
+    while !guard.is_char_boundary(head_at) {
+        head_at -= 1;
+    }
+    // drain/slice panic on non-char-boundary starts — snap forward. The old
+    // stderr ring could panic mid-CJK here, silently killing the capture task
+    // and starving the error banner of the failure text.
+    let mut tail_at = guard.len() - DIAGNOSTIC_RING_TAIL_CAP;
+    while !guard.is_char_boundary(tail_at) {
+        tail_at += 1;
+    }
+    let tail = guard[tail_at..].to_string();
+    guard.truncate(head_at);
+    guard.push_str(DIAGNOSTIC_RING_MARKER);
+    guard.push_str(&tail);
 }
-/// Stderr capture ring: keeps the last 4KB for the error banner.
+/// Stderr capture ring: keeps the first failure and latest stack frames.
 pub(crate) fn spawn_stderr_capture(stderr: ChildStderr) -> Arc<Mutex<String>> {
     let buf = Arc::new(Mutex::new(String::new()));
     let target = Arc::clone(&buf);
@@ -111,7 +135,7 @@ pub(crate) fn spawn_stderr_capture(stderr: ChildStderr) -> Arc<Mutex<String>> {
 // ==================== stderr redaction ====================
 
 /// Engine stderr can echo the channel credentials from the CLI's own config files; redact credential
-/// shapes before the tail is shown to the user in an error banner.
+/// shapes before the captured excerpt is shown to the user in an error banner.
 pub(super) fn redact_secrets(text: &str) -> String {
     use std::sync::LazyLock;
     static PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
@@ -1251,8 +1275,25 @@ mod staging_tests {
         // std Mutex stays: ring buffers are deliberately poison-tolerant
         // (a panicked capture task must not take down error reporting).
         let kept = buf.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(kept.len() <= 4096);
+        assert!(kept.len() <= DIAGNOSTIC_RING_CAP);
         assert!(kept.ends_with("引擎错误"));
+    }
+
+    #[test]
+    fn ring_push_keeps_error_head_and_latest_tail() {
+        let buf = Arc::new(Mutex::new(String::new()));
+        ring_push(&buf, "java.net.BindException: model gateway failed\n");
+        ring_push(
+            &buf,
+            &"    at example.StackFrame.call(StackFrame.java:1)\n".repeat(100),
+        );
+        ring_push(&buf, "Caused by: final gateway context\n");
+
+        let kept = buf.lock().unwrap();
+        assert!(kept.starts_with("java.net.BindException: model gateway failed\n"));
+        assert!(kept.contains(DIAGNOSTIC_RING_MARKER));
+        assert!(kept.ends_with("Caused by: final gateway context\n"));
+        assert!(kept.len() <= DIAGNOSTIC_RING_CAP);
     }
 
     /// Absent sides stay absent: a sparse report must never read as an

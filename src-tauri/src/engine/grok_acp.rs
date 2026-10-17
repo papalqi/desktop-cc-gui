@@ -519,7 +519,7 @@ fn prompt_usage(result: &Value) -> Option<Value> {
 }
 
 /// Terminal message precedence (mirrors qoder): the rpc error's message part,
-/// then the CLI's stderr tail, then the raw error.
+/// then the CLI's captured stderr, then the raw error.
 fn terminal_message(raw: String, stderr_buf: &Arc<Mutex<String>>) -> String {
     let bare = raw
         .strip_prefix("rpc:")

@@ -941,7 +941,7 @@ fn prompt_usage(result: &Value, context_window: Option<i64>) -> Option<Value> {
 }
 
 /// Terminal message precedence（同 grok）：rpc error 的 message 部分 →
-/// CLI 的 stderr 尾巴 → 原始错误。
+/// CLI 捕获的 stderr 摘要 → 原始错误。
 fn terminal_message(raw: String, stderr_buf: &Arc<Mutex<String>>) -> String {
     let bare = raw
         .strip_prefix("rpc:")

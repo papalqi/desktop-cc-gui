@@ -1984,8 +1984,8 @@ async fn finish_decision_turn(
 }
 
 /// Reduce a failure to what the user should read: the CLI's own rpc message,
-/// else its stderr tail (a crash or a rejected launch speaks there), else the
-/// driver's own words.
+/// else its captured stderr (a crash or a rejected launch speaks there), else
+/// the driver's own words.
 fn terminal_message(raw: String, stderr_buf: &Mutex<String>) -> String {
     if let Some(rest) = raw.strip_prefix("rpc:") {
         if let Some((_, message)) = rest.split_once(':') {

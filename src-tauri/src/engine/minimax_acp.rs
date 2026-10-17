@@ -875,7 +875,7 @@ pub(super) fn answer_frame(parked: &Value, answers: Option<&Value>) -> Result<Va
 }
 
 /// Terminal message precedence (mirrors qoder/grok): the rpc error's message
-/// part, then the CLI's stderr tail, then the raw error.
+/// part, then the CLI's captured stderr, then the raw error.
 fn terminal_message(raw: String, stderr_buf: &Arc<Mutex<String>>) -> String {
     let bare = raw
         .strip_prefix("rpc:")
