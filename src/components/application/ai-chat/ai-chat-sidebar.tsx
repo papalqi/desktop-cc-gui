@@ -25,6 +25,7 @@ import { RelayMachinesSection } from "@/components/application/ai-chat/relay-mac
 import { SessionSearchPalette } from "@/components/application/ai-chat/session-search-palette";
 import type { AiChatRepo, AiChatRepoSection, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
 import { currentRelayMachine } from "@/features/chat/machine-catalog";
+import { contextTitle } from "@/features/chat/session-display-name";
 import { useMachineRunWatchers } from "@/features/chat/machine-run-watch";
 import {
   usePrefetchMachineCatalogs,
@@ -171,7 +172,7 @@ export function AiChatSidebar({
     return {
       ...thread,
       label,
-      description: [repo.machine, label !== repo.label ? repo.label : undefined, thread.summary].filter(Boolean).join(" · "),
+      description: contextTitle({ machine: repo.machine, localName: label !== repo.label ? repo.label : undefined }),
     };
   })).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)), [allRepos]);
   const { isRepoExpanded, toggleRepoExpanded } = useExpandedWorkspaces(allRepos, workspaceThreadId);

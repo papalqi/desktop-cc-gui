@@ -9,16 +9,16 @@ import {
 } from "./session-display-name";
 
 describe("sessionDisplayName", () => {
-  it("keeps the conversation summary under a project and uses the project as the standalone name", () => {
+  it("uses the engine title as the headline and keeps that summary on a nested row", () => {
     const named = sessionDisplayName({
       customTitle: null,
       title: "帮我看看登录",
       sessionId: "abcdef123456",
       localName: "支付后端",
     });
-    expect(named.headline).toBe("支付后端");
+    expect(named.headline).toBe("帮我看看登录");
     expect(named.nestedLabel).toBe("帮我看看登录");
-    expect(named.summary).toBe("帮我看看登录");
+    expect(named.summary).toBe("");
 
     const renamed = sessionDisplayName({
       customTitle: " 复盘 ",
@@ -32,6 +32,7 @@ describe("sessionDisplayName", () => {
   });
 
   it("falls back to the project, then a short id, when the summary is empty", () => {
+    expect(sessionDisplayName({ title: " ", sessionId: "abcdef123456", localName: "pay" }).headline).toBe("pay");
     expect(sessionDisplayName({ title: " ", sessionId: "abcdef123456", localName: "pay" }).nestedLabel).toBe("pay");
     expect(sessionDisplayName({ title: "", sessionId: "abcdef123456" }).headline).toBe("abcdef12");
     expect(pathLeaf("E:\\projects\\desktop-cc-gui\\")).toBe("desktop-cc-gui");
@@ -40,6 +41,9 @@ describe("sessionDisplayName", () => {
   it("builds a tab title without repeating the project", () => {
     expect(contextTitle({ machine: "PC5", localName: "pay", headline: "帮我看看" })).toBe("PC5 · pay · 帮我看看");
     expect(pageTitle({ machine: "PC5", localName: "pay", customTitle: "pay" })).toBe("PC5 · pay");
+    expect(pageTitle({ machine: "PC6", localName: "支付后端", title: "帮我看看登录" })).toBe("PC6 · 帮我看看登录 · 支付后端");
+    expect(pageTitle({ machine: "PC6", localName: "支付后端", customTitle: "复盘", title: "帮我看看登录" })).toBe("PC6 · 复盘 · 支付后端");
+    expect(pageTitle({ machine: "PC6", localName: "支付后端", fallback: "新对话" })).toBe("PC6 · 新对话 · 支付后端");
     expect(pageTitle({})).toBe("CC GUI");
     expect(projectNameForSession(
       { workspacePath: "E:/pay", machine: "PC6" },

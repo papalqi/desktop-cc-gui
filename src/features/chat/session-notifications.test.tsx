@@ -86,7 +86,7 @@ it("asks permission only on click and keeps notifications and unread state on th
   await act(async () => useChatStore.setState({
     active: { engine: "codex", sessionId: "same", workspacePath: "/repo/pay", machine: "PC6" },
   }));
-  expect(document.title).toBe("(1) PC6 · 支付后端 · 帮我看看登录");
+  expect(document.title).toBe("(1) PC6 · 帮我看看登录 · 支付后端");
   await act(async () => shown[0].onclick!());
   expect(env.select).toHaveBeenCalledWith("codex", "same", "/repo/pay", "PC6");
   expect(shown[0].closed).toBe(true);

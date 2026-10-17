@@ -3,9 +3,9 @@ export type ThreadAction = "pin" | "rename" | "archive" | "delete";
 export interface AiChatThread {
   id?: string;
   label: string;
-  /** Standalone row (recent sort): user name, else project, else summary. */
+  /** Standalone row (recent sort): user name, else engine title, else project. */
   standaloneLabel?: string;
-  /** Engine summary when the standalone label is the project or a user name. */
+  /** Engine summary when it is not already the standalone headline. */
   summary?: string;
   /** Hover text when the visible label omits the project or the summary. */
   tooltip?: string;

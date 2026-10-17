@@ -640,7 +640,7 @@ export interface MessageSearchHit {
   workspaceName: string | null;
   /** User alias when a hub search hit was annotated. Desktop search may omit it. */
   workspaceAlias?: string | null;
-  /** User rename, else the local project, else the engine title. */
+  /** User rename, else the engine title, else the local project, else a short id. */
   displayTitle?: string | null;
   title: string;
   customTitle: string | null;

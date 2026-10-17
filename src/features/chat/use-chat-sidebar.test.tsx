@@ -118,11 +118,11 @@ describe("useChatSidebar repo mapping", () => {
     expect(captured[0]?.threads.map((t) => t.id)).toEqual(["codex/s-1"]);
   });
 
-  it("keeps the engine summary on a nested row and the project name on the standalone label", () => {
+  it("keeps the engine summary on a nested row and uses it as the standalone headline", () => {
     expect(captured[0]?.threads[0]).toMatchObject({
       label: "local",
-      standaloneLabel: "a",
-      summary: "local",
+      standaloneLabel: "local",
+      summary: "",
       tooltip: "a · local",
     });
   });
