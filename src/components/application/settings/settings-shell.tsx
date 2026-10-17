@@ -167,6 +167,9 @@ export interface SettingsShellProps {
   /** Optional per-page action cluster rendered next to the title (e.g. the
    *  CLI 管理 docs/version/update controls). */
   renderHeaderActions?: (key: string) => ReactNode;
+  /** Shown under the page title. The web shell uses it to name which
+   *  settings are browser display and which machine a write will change. */
+  headerNote?: ReactNode;
   /** Declarative index of the rows inside the pages (`settings-search.ts`).
    *  The shell owns the matching and the rendering so the index stays plain
    *  data; a page without entries is searchable by title only. */
@@ -648,6 +651,7 @@ function SettingsContent({
   page,
   titles,
   renderHeaderActions,
+  headerNote,
   renderPage,
   anchorRequest,
   contentScrolled,
@@ -658,6 +662,7 @@ function SettingsContent({
   page: string;
   titles: Record<string, string>;
   renderHeaderActions?: (key: string) => ReactNode;
+  headerNote?: ReactNode;
   renderPage: (key: string) => ReactNode;
   /** Search hit to reveal: object identity is the request token, so choosing
    *  the same hit twice scrolls (and flashes) again. */
@@ -751,9 +756,12 @@ function SettingsContent({
             "col-start-1 row-start-1 flex min-w-0 items-center gap-3 pr-8",
           )}
         >
-          <h2 className="shrink-0 text-title-2-medium text-text-primary">
-            {titles[page] ?? page}
-          </h2>
+          <div className="flex min-w-0 flex-col">
+            <h2 className="shrink-0 text-title-2-medium text-text-primary">
+              {titles[page] ?? page}
+            </h2>
+            {headerNote}
+          </div>
           {renderHeaderActions?.(page)}
         </div>
         <button
@@ -804,6 +812,7 @@ export function SettingsShell({
   titles,
   renderPage,
   renderHeaderActions,
+  headerNote,
   searchEntries = NO_SEARCH_ENTRIES,
 }: SettingsShellProps) {
   // macOS Overlay titlebar: the system traffic lights float over the
@@ -975,6 +984,7 @@ export function SettingsShell({
         page={page}
         titles={titles}
         renderHeaderActions={renderHeaderActions}
+        headerNote={headerNote}
         renderPage={renderPage}
         anchorRequest={anchorRequest}
         contentScrolled={contentScrolled}

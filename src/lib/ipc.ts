@@ -1154,6 +1154,24 @@ export interface CliUpdatePlan {
 // and the chat store all read the same settings, so fetch once.
 let settingsPromise: Promise<AppSettings> | null = null;
 let settingsGeneration = 0;
+let settingsWriteMachine: string | null = null;
+const settingsWriteListeners = new Set<() => void>();
+
+function noteSettingsWriteMachine(machine: string | null): void {
+  if (settingsWriteMachine === machine) return;
+  settingsWriteMachine = machine;
+  for (const listener of settingsWriteListeners) listener();
+}
+
+/** Machine captured when web settings were read. Later sidebar switches do not retarget the write. */
+export function readSettingsWriteMachine(): string | null {
+  return settingsWriteMachine;
+}
+
+export function subscribeSettingsWriteMachine(listener: () => void): () => void {
+  settingsWriteListeners.add(listener);
+  return () => settingsWriteListeners.delete(listener);
+}
 // Object spread preserves this marker; JSON sent to the backend omits it.
 const settingsConnection = Symbol("settings connection");
 const settingsMachine = Symbol("settings machine");
@@ -1175,6 +1193,7 @@ function fetchAppSettings(): Promise<AppSettings> {
       .then((settings) => {
         if (!isWeb) return settings;
         if (generation !== webBridgeGeneration()) throw new Error("web bridge disconnected");
+        noteSettingsWriteMachine(webMultiMachine() ? machine : webMachine());
         return { ...settings, [settingsConnection]: generation, ...(webMultiMachine() ? { [settingsMachine]: machine } : {}) };
       })
       .catch((e) => {

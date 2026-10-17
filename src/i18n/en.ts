@@ -881,6 +881,8 @@ export const en: Messages = {
     socialTitle: "Follow Us",
     socialDocs: "Documentation",
     checkUpdates: "Check for Updates",
+    webDisplayOnly: "Browser display",
+    webDisplayScope: "Browser display · editing {{machine}}",
     updateChecking: "Checking for updates…",
     updateLatest: "You're up to date",
     updateLatestDetail: "You're up to date · latest is v{{version}} (released {{date}})",

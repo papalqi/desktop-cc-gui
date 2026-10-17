@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
@@ -21,6 +21,11 @@ import {
   writeCliNavOrder,
 } from "@/lib/cli-nav-order";
 import { settingsSearchEntries } from "./settings-search";
+import { isWeb } from "@/lib/platform";
+import {
+  readSettingsWriteMachine,
+  subscribeSettingsWriteMachine,
+} from "@/lib/ipc";
 // Side-effect import: registers all builtin sections into settingsRegistry
 // (and their page-internal search rows, see ./sections).
 import "./sections";
@@ -83,6 +88,11 @@ export default function SettingsPage() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const writeMachine = useSyncExternalStore(
+    subscribeSettingsWriteMachine,
+    readSettingsWriteMachine,
+    () => null,
+  );
   const sections = useRegistry(settingsRegistry);
   const cliNavOrder = useCliNavOrder();
   /** Engine enable states; the chat store refreshes them on every CLI config
@@ -267,6 +277,15 @@ export default function SettingsPage() {
       titles={titles}
       renderPage={renderPage}
       renderHeaderActions={renderHeaderActions}
+      headerNote={
+        isWeb ? (
+          <p className="text-caption-1-medium text-text-tertiary">
+            {writeMachine
+              ? t("settings.webDisplayScope", { machine: writeMachine })
+              : t("settings.webDisplayOnly")}
+          </p>
+        ) : undefined
+      }
       searchEntries={settingsSearchEntries()}
     />
   );

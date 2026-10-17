@@ -847,6 +847,8 @@ export const zh = {
     socialTitle: "关注我们",
     socialDocs: "官方文档",
     checkUpdates: "检查更新",
+    webDisplayOnly: "网页显示",
+    webDisplayScope: "网页显示 · 正在改 {{machine}}",
     updateChecking: "正在检查更新…",
     updateLatest: "已是最新版本",
     updateLatestDetail: "当前已是最新版本 · 最新版为 v{{version}}（{{date}} 发布）",

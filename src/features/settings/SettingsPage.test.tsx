@@ -23,6 +23,8 @@ vi.mock("@/lib/ipc", () => ({
         prop in target ? Reflect.get(target, prop) : async () => null,
     },
   ),
+  readSettingsWriteMachine: () => null,
+  subscribeSettingsWriteMachine: () => () => {},
 }));
 
 import { settingsRegistry } from "@ccgui/plugin-sdk";
