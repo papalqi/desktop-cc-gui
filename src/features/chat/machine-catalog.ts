@@ -4,6 +4,7 @@ import { queryMachine } from "@/lib/machine-bridge";
 import { isWeb } from "@/lib/platform";
 import { webMachine, webMultiMachine } from "@/lib/web-machine";
 import { sessionKey } from "./store/persistence";
+import { localProjectName } from "./session-display-name";
 
 /** Sessions older than this are offered to the batch archive. */
 export const ARCHIVE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -187,8 +188,13 @@ export function catalogSessionRunning(
   return Boolean(keys?.includes(`${engine}/${sessionId}`));
 }
 
-function workspaceName(workspaces: readonly Workspace[], path: string): string {
-  return workspaces.find((workspace) => workspace.path === path)?.name ?? path;
+function workspaceName(workspaces: readonly Workspace[], path: string, aliases: Record<string, string>): string {
+  const workspace = workspaces.find((item) => item.path === path);
+  return localProjectName({
+    alias: workspace ? aliases[workspace.id] : undefined,
+    workspaceName: workspace?.name,
+    workspacePath: path,
+  });
 }
 
 /** Pinned sessions from every machine that already has a catalog, newest first. */
@@ -206,7 +212,7 @@ export function collectPinnedRows(catalogs: CatalogFile, order: readonly string[
       rows.push({
         machine,
         session,
-        workspaceName: workspaceName(catalog.workspaces, session.workspacePath),
+        workspaceName: workspaceName(catalog.workspaces, session.workspacePath, catalog.workspaceAliases),
       });
     }
   }

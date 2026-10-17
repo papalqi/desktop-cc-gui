@@ -6,6 +6,13 @@ import { formatSearchDuration } from "./session-search-format";
 import type { AiChatRepo } from "./sidebar-types";
 import { ipc, type MessageSearchHit, type MessageSearchPage } from "@/lib/ipc";
 
+const catalog = vi.hoisted(() => ({
+  workspaces: [] as Array<{ id: string; path: string; name: string; machine?: string }>,
+  workspaceAliases: {} as Record<string, string>,
+}));
+vi.mock("@/features/chat/store", () => ({
+  useChatStore: (select: (state: typeof catalog) => unknown) => select(catalog),
+}));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string, opts?: unknown) => (opts ? `${key}:${JSON.stringify(opts)}` : key),
@@ -79,6 +86,8 @@ let root: Root;
 
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  catalog.workspaces = [];
+  catalog.workspaceAliases = {};
   vi.mocked(ipc.searchMessages).mockReset();
   vi.mocked(ipc.searchMessages).mockResolvedValue(page({}));
   node = document.createElement("div");
@@ -213,6 +222,26 @@ it("shows debounced message-content hits with highlighted snippets", async () =>
     vi.useRealTimers();
   }
 });
+
+it("shows the catalog project name on a content hit", async () => {
+  vi.useFakeTimers();
+  try {
+    catalog.workspaces = [{ id: "PC6/w", path: "/ws", name: "desktop-cc-gui", machine: "PC6" }];
+    catalog.workspaceAliases = { "PC6/w": "支付后端" };
+    vi.mocked(ipc.searchMessages).mockResolvedValue(page({
+      hits: [contentHit({ machine: "PC6", workspacePath: "/ws", workspaceName: "/ws" })],
+    }));
+    await render(true);
+    await type("命中");
+    await act(async () => { vi.advanceTimersByTime(350); });
+    const text = options()[0]?.textContent ?? "";
+    expect(text).toContain("支付后端");
+    expect(text).not.toContain("/ws");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("shows the remaining-index count while the indexer has pending sessions", async () => {
   vi.useFakeTimers();
   try {

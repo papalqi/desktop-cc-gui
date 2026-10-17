@@ -4,6 +4,7 @@ import { isWeb, listen, subscribeWebBridgeState, webBridgeFeature } from "@/lib/
 import { webMachine, webMultiMachine } from "@/lib/web-machine";
 import { errorText } from "@/lib/errors";
 import { useChatStore, sessionKey } from "./store";
+import { pageTitle, projectNameForSession } from "./session-display-name";
 import { switchRelayMachine } from "./relay-machines";
 import { dismissCenterSurfaces } from "./center-surfaces";
 
@@ -53,15 +54,40 @@ export function SessionNotificationControl() {
 export function useSessionNotifications() {
   const { t } = useTranslation();
   const unseen = useChatStore((state) => state.unseen);
+  const active = useChatStore((state) => state.active);
+  const sessions = useChatStore((state) => state.sessions);
+  const workspaces = useChatStore((state) => state.workspaces);
+  const aliases = useChatStore((state) => state.workspaceAliases);
   const unread = Object.values(unseen).filter(Boolean).length;
+  const current = active
+    ? (sessions ?? []).find((item) => item.engine === active.engine && item.sessionId === active.sessionId && item.workspacePath === active.workspacePath && (item.machine ?? "") === (active.machine ?? ""))
+    : undefined;
+  const title = active
+    ? pageTitle({
+        machine: active.machine,
+        localName: projectNameForSession(active, workspaces ?? [], aliases ?? {}),
+        customTitle: current?.customTitle,
+        title: current?.title,
+        sessionId: active.sessionId,
+        fallback: active.sessionId ? undefined : t("chat.newChat"),
+      })
+    : "CC GUI";
   useEffect(() => {
     if (!isWeb) return;
     const base = document.title;
     return () => { document.title = base.replace(/^\(\d+\) /, ""); };
   }, []);
   useEffect(() => {
-    if (isWeb) document.title = `${unread ? `(${unread}) ` : ""}${document.title.replace(/^\(\d+\) /, "")}`;
-  }, [unread]);
+    if (isWeb) document.title = `${unread ? `(${unread}) ` : ""}${title}`;
+  }, [unread, title]);
+  useEffect(() => {
+    if (isWeb) return;
+    let cancelled = false;
+    void import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
+      if (!cancelled) return getCurrentWindow().setTitle(title);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [title]);
 
   useEffect(() => {
     if (!isWeb) return;
@@ -81,7 +107,9 @@ export function useSessionNotifications() {
       if (sameMachine && key && !reading) useChatStore.setState({ unseen: { ...state.unseen, [key]: true } });
       if (!supported() || !enabled() || Notification.permission !== "granted" || reading) return;
       try {
-        const notice = new Notification(t(LABELS[item.state]), { body: `${item.machine} · ${item.engine}${item.sessionId ? ` · ${item.sessionId}` : ""}`, tag: `${item.machine}/${item.engine}/${item.sessionId ?? item.id}` });
+        const known = (state.sessions ?? []).find((row) => row.engine === item.engine && row.sessionId === item.sessionId && row.workspacePath === item.workspacePath && (row.machine ?? "") === item.machine);
+        const project = projectNameForSession(item, state.workspaces ?? [], state.workspaceAliases ?? {});
+        const notice = new Notification(t(LABELS[item.state]), { body: [item.machine, item.engine, known?.customTitle?.trim() || project || item.sessionId?.slice(0, 8)].filter(Boolean).join(" · "), tag: `${item.machine}/${item.engine}/${item.sessionId ?? item.id}` });
         notices.add(notice);
         notice.onclose = () => notices.delete(notice);
         notice.onclick = () => {

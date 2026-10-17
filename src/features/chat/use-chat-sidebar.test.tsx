@@ -118,6 +118,15 @@ describe("useChatSidebar repo mapping", () => {
     expect(captured[0]?.threads.map((t) => t.id)).toEqual(["codex/s-1"]);
   });
 
+  it("keeps the engine summary on a nested row and the project name on the standalone label", () => {
+    expect(captured[0]?.threads[0]).toMatchObject({
+      label: "local",
+      standaloneLabel: "a",
+      summary: "local",
+      tooltip: "a · local",
+    });
+  });
+
   it("keeps identical workspace paths and session IDs on their own machine rows", async () => {
     window.history.replaceState(null, "", "/CCGUI/?global=1&machine=PC0");
     await act(async () => useChatStore.setState({

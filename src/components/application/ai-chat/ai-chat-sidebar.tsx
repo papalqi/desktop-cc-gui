@@ -166,9 +166,14 @@ export function AiChatSidebar({
         ? t(scope === "all" ? "chat.machineLocalUnavailable" : "chat.machineRemoteOffline") : undefined,
     }));
   }, [machines, repos, sections, scope, t]);
-  const recentThreads = useMemo(() => allRepos.flatMap((repo) => repo.threads.map((thread) => ({ ...thread,
-    description: [repo.machine, repo.label].filter(Boolean).join(" · "),
-  }))).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)), [allRepos]);
+  const recentThreads = useMemo(() => allRepos.flatMap((repo) => repo.threads.map((thread) => {
+    const label = thread.standaloneLabel || thread.label;
+    return {
+      ...thread,
+      label,
+      description: [repo.machine, label !== repo.label ? repo.label : undefined, thread.summary].filter(Boolean).join(" · "),
+    };
+  })).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)), [allRepos]);
   const { isRepoExpanded, toggleRepoExpanded } = useExpandedWorkspaces(allRepos, workspaceThreadId);
   const { workspaceMenu, closeWorkspaceMenu, openWorkspaceMenu, openArchivedMenu } =
     useWorkspaceMenu(onWorkspaceAlias, onSetWorkspaceArchived);

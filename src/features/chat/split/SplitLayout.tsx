@@ -11,6 +11,7 @@ import { cx } from "@/utils/cx";
 import { ChatConversation } from "../components/ChatConversation";
 import { focusComposerWhenVisible } from "../focus-composer";
 import { useChatStore } from "../store";
+import { pageTitle, projectNameForSession } from "../session-display-name";
 import { sessionKey, type ActiveSession } from "../store/persistence";
 import { PANEL_TOGGLE_CLASSES } from "../panel-toggle-classes";
 import { McpCommandPanel } from "@/features/mcp/McpCommandPanel";
@@ -159,6 +160,7 @@ const SplitPaneView = memo(function SplitPaneView({
     ? sessionKey(session.engine, session.sessionId, session.workspacePath, session.machine)
     : "";
   const sessions = useChatStore((s) => s.sessions);
+  const aliases = useChatStore((s) => s.workspaceAliases);
   const streaming = useChatStore((s) => (key ? s.streamingByKey[key] === true : false));
   const splitPane = useSplitStore((s) => s.splitPane);
   const closePane = useSplitStore((s) => s.closePane);
@@ -171,8 +173,14 @@ const SplitPaneView = memo(function SplitPaneView({
     const meta = sessions.find(
       (item) => item.engine === session.engine && item.sessionId === session.sessionId && item.machine === session.machine,
     );
-    return meta?.customTitle || meta?.title || session.sessionId.slice(0, 8);
-  }, [session, sessions, t]);
+    return pageTitle({
+      machine: session.machine,
+      localName: projectNameForSession(session, workspaces, aliases),
+      customTitle: meta?.customTitle,
+      title: meta?.title,
+      sessionId: session.sessionId,
+    });
+  }, [session, sessions, workspaces, aliases]);
   const dragPayload = useMemo(
     () => ({ kind: "pane" as const, paneId: pane.id, label: title }),
     [pane.id, title],

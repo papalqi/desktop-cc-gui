@@ -46,7 +46,13 @@ beforeEach(() => {
   env.off.mockClear();
   env.select.mockClear();
   env.request.mockReset().mockImplementation(async () => { FakeNotification.permission = "granted"; return "granted"; });
-  useChatStore.setState({ unseen: {}, active: null });
+  useChatStore.setState({
+    unseen: {},
+    active: null,
+    sessions: [],
+    workspaces: [],
+    workspaceAliases: {},
+  });
   document.title = "CC GUI";
   container = document.createElement("div");
   document.body.append(container);
@@ -59,14 +65,30 @@ it("asks permission only on click and keeps notifications and unread state on th
   expect(env.request).not.toHaveBeenCalled();
   await act(async () => container.querySelector("button")!.click());
   expect(env.request).toHaveBeenCalledTimes(1);
-  const item = { id: "PC6-done", machine: "PC6", engine: "codex", sessionId: "same", workspacePath: "/same", state: "done", data: "SECRET" };
+  await act(async () => useChatStore.setState({
+    sessions: [{
+      engine: "codex", sessionId: "same", workspacePath: "/repo/pay", machine: "PC6",
+      filePath: "/repo/pay/same.jsonl", fileSize: 1, fileMtimeMs: 1, preview: "",
+      createdAt: null, updatedAt: 1, messageCount: 1, pinned: false,
+      customTitle: null, title: "帮我看看登录",
+    }],
+    workspaces: [{ id: "PC6/w", path: "/repo/pay", name: "pay", machine: "PC6", lastOpenedAt: null, sortOrder: 0, groupId: null }],
+    workspaceAliases: { "PC6/w": "支付后端" },
+  }));
+  const item = { id: "PC6-done", machine: "PC6", engine: "codex", sessionId: "same", workspacePath: "/repo/pay", state: "done", data: "SECRET" };
   await act(async () => { env.notify!({ payload: item }); env.notify!({ payload: item }); });
   expect(shown).toHaveLength(1);
-  expect(shown[0].options.body).toBe("PC6 · codex · same");
+  expect(shown[0].options.body).toBe("PC6 · codex · 支付后端");
+  expect(shown[0].options.body).not.toContain("帮我看看登录");
+  expect(shown[0].options.body).not.toContain("SECRET");
   expect(useChatStore.getState().unseen).toEqual({ "PC6/codex/same": true });
   expect(document.title).toBe("(1) CC GUI");
+  await act(async () => useChatStore.setState({
+    active: { engine: "codex", sessionId: "same", workspacePath: "/repo/pay", machine: "PC6" },
+  }));
+  expect(document.title).toBe("(1) PC6 · 支付后端 · 帮我看看登录");
   await act(async () => shown[0].onclick!());
-  expect(env.select).toHaveBeenCalledWith("codex", "same", "/same", "PC6");
+  expect(env.select).toHaveBeenCalledWith("codex", "same", "/repo/pay", "PC6");
   expect(shown[0].closed).toBe(true);
 });
 

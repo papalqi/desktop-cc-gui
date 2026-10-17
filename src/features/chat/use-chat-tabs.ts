@@ -20,6 +20,7 @@ import { fileName, useFilesStore } from "@/features/files/store";
 import { useGitStore } from "@/features/git/store";
 import type { SessionMeta } from "@/lib/ipc";
 import { sessionKey, useChatStore, type ActiveSession } from "./store";
+import { pageTitle, projectNameForSession } from "./session-display-name";
 import type { ChatPageDialog } from "./ChatPageDialogs";
 
 // File tabs share the session tab strip; their keys are prefixed so select /
@@ -41,12 +42,14 @@ export function useChatTabs({
   setDialog: (dialog: ChatPageDialog) => void;
 }) {
   const { t } = useTranslation();
-  const { active, openTabs, sessions, unseen } = useChatStore(
+  const { active, openTabs, sessions, unseen, workspaces, workspaceAliases } = useChatStore(
     useShallow((s) => ({
       active: s.active,
       openTabs: s.openTabs,
       sessions: s.sessions,
       unseen: s.unseen,
+      workspaces: s.workspaces,
+      workspaceAliases: s.workspaceAliases,
     })),
   );
   const { focusTab, closeTab, moveTab } = useChatStore(
@@ -175,14 +178,21 @@ export function useChatTabs({
           // 会话身份随页签带下去：向下拖出页签条即分屏（split/drag.tsx）。
           session: tab,
           engine: tab.engine,
-          label: `${tab.machine ? tab.machine + " · " : ""}${meta?.customTitle || meta?.title || t("chat.newChat")}`,
+          label: pageTitle({
+            machine: tab.machine,
+            localName: projectNameForSession(tab, workspaces, workspaceAliases),
+            customTitle: meta?.customTitle,
+            title: meta?.title,
+            sessionId: tab.sessionId,
+            fallback: tab.sessionId ? undefined : t("chat.newChat"),
+          }),
           streaming: tabStreaming[index] ?? false,
           retrying: tabRetrying[index] ?? false,
           unseen: unseen[sessionKey(tab.engine, tab.sessionId, tab.workspacePath, tab.machine)] ?? false,
           tab,
         };
       }),
-    [openTabs, sessionById, tabStreaming, tabRetrying, t, unseen],
+    [openTabs, sessionById, tabStreaming, tabRetrying, t, unseen, workspaces, workspaceAliases],
   );
   // File tabs trail the session tabs in the same strip.
   const fileTabItems = useMemo(

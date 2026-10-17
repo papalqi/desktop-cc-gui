@@ -24,6 +24,7 @@ import { focusComposerWhenVisible } from "./focus-composer";
 import { relativeTime } from "./time";
 import { webMultiMachine } from "@/lib/web-machine";
 import { useWorkspaceUIHooks, workspaceLabelSuffix } from "./workspace-ui-bridge";
+import { sessionDisplayName } from "./session-display-name";
 import type { ChatPageDialog } from "./ChatPageDialogs";
 import { useWatchedSessionActivities } from "./machine-run-watch";
 
@@ -150,12 +151,13 @@ export function useChatSidebar({
       const suffix = workspaceLabelSuffix(w.path);
       const meta = worktreeMetaOf(w);
       const children = childrenByParent.get(w.id);
+      const localName = alias || (meta?.branch ?? w.name);
       return {
         id: w.id,
         machine: w.machine,
         path: w.path,
         // Worktree 子行的主名是分支名（mockup 场景 1），目录名进 tooltip。
-        label: alias || (meta?.branch ?? w.name),
+        label: localName,
         originalLabel: alias || meta ? w.name : undefined,
         labelSuffix: suffix ?? undefined,
         defaultOpen,
@@ -179,10 +181,20 @@ export function useChatSidebar({
             if (s.workspacePath !== w.path || s.machine !== w.machine) return [];
             const key = sessionKey(s.engine, s.sessionId, s.workspacePath, s.machine);
             const activity = activities[s.machine ?? currentRelayMachine() ?? ""]?.[`${s.engine}/${s.sessionId}`];
+            const display = sessionDisplayName({
+              customTitle: s.customTitle,
+              title: s.title,
+              sessionId: s.sessionId,
+              localName,
+            });
+            const tooltip = [localName, display.nestedLabel, display.summary].filter((part, index, all) => part && all.indexOf(part) === index).join(" · ");
             return [
               {
                 id: key,
-                label: s.customTitle || s.title || s.sessionId.slice(0, 8),
+                label: display.nestedLabel,
+                standaloneLabel: display.headline,
+                summary: display.summary,
+                tooltip,
                 engine: s.engine,
                 origin: s.origin,
                 updatedAt: s.updatedAt ?? 0,

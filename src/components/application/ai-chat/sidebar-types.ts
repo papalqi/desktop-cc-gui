@@ -3,7 +3,11 @@ export type ThreadAction = "pin" | "rename" | "archive" | "delete";
 export interface AiChatThread {
   id?: string;
   label: string;
-  /** Hover text when the row label is shortened. */
+  /** Standalone row (recent sort): user name, else project, else summary. */
+  standaloneLabel?: string;
+  /** Engine summary when the standalone label is the project or a user name. */
+  summary?: string;
+  /** Hover text when the visible label omits the project or the summary. */
   tooltip?: string;
   /** CLI engine id — brand mark rendered left of the label. */
   engine?: string;

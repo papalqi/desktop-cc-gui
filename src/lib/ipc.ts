@@ -638,6 +638,10 @@ export interface MessageSearchHit {
   sessionId: string;
   workspacePath: string;
   workspaceName: string | null;
+  /** User alias when a hub search hit was annotated. Desktop search may omit it. */
+  workspaceAlias?: string | null;
+  /** User rename, else the local project, else the engine title. */
+  displayTitle?: string | null;
   title: string;
   customTitle: string | null;
   updatedAt: number | null;

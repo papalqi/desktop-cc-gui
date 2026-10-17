@@ -14,12 +14,10 @@ import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { listenSessionsChanged } from "@/lib/events";
 import { ipc, ipcForMachine, type SessionMeta } from "@/lib/ipc";
 import { sessionKey, useChatStore } from "@/features/chat/store";
+import { localProjectName, sessionDisplayName } from "@/features/chat/session-display-name";
 import { machineResourceKey } from "@/lib/web-machine";
 
 const ALL_WORKSPACES = "*";
-
-const sessionTitle = (session: SessionMeta) =>
-  session.customTitle || session.title || session.sessionId.slice(0, 8);
 
 const pathName = (path: string) =>
   path.split(/[\\/]/).filter(Boolean).at(-1) || path;
@@ -30,6 +28,7 @@ const pathName = (path: string) =>
 export function ArchivedSessionsSection() {
   const { t, i18n } = useTranslation();
   const workspaces = useChatStore((s) => s.workspaces);
+  const aliases = useChatStore((s) => s.workspaceAliases) ?? {};
   const scope = useChatStore((s) => s.sessionScope);
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [workspacePath, setWorkspacePath] = useState(ALL_WORKSPACES);
@@ -82,11 +81,24 @@ export function ArchivedSessionsSection() {
       const labels = new Map(sessions.map((session) => [machineResourceKey(session.workspacePath, session.machine),
         [session.machine, pathName(session.workspacePath)].filter(Boolean).join(" · ")]));
       for (const workspace of workspaces) labels.set(machineResourceKey(workspace.path, workspace.machine),
-        [workspace.machine, workspace.name].filter(Boolean).join(" · "));
+        [workspace.machine, localProjectName({ alias: aliases[workspace.id], workspaceName: workspace.name, workspacePath: workspace.path })].filter(Boolean).join(" · "));
       return labels;
     },
-    [workspaces, sessions],
+    [aliases, workspaces, sessions],
   );
+  const sessionTitle = (session: SessionMeta) => {
+    const workspace = workspaces.find((item) => item.path === session.workspacePath && (item.machine ?? "") === (session.machine ?? ""));
+    return sessionDisplayName({
+      customTitle: session.customTitle,
+      title: session.title,
+      sessionId: session.sessionId,
+      localName: localProjectName({
+        alias: workspace ? aliases[workspace.id] : undefined,
+        workspaceName: workspace?.name,
+        workspacePath: session.workspacePath,
+      }),
+    }).nestedLabel;
+  };
   const workspacePaths = useMemo(
     () => [...new Set(sessions.map((session) => machineResourceKey(session.workspacePath, session.machine)))],
     [sessions],

@@ -8,6 +8,8 @@ import type { AiChatRepo } from "@/components/application/ai-chat/sidebar-types"
 import { cx } from "@/utils/cx";
 import { useBrowserOcclusion } from "@/features/browser/occlusion";
 import { ipc, type MessageSearchHit } from "@/lib/ipc";
+import { useChatStore } from "@/features/chat/store";
+import { searchProjectLabel } from "@/features/chat/session-display-name";
 import { relativeTime } from "@/features/chat/time";
 import { formatSearchDuration } from "./session-search-format";
 import { isModalDialogOpen, hideModalDialog, showModalDialog } from "@/lib/engine-compat";
@@ -234,6 +236,8 @@ export function SessionSearchPalette({
   onThreadSelect?: (id: string) => void;
 }) {
   const { t } = useTranslation();
+  const workspaces = useChatStore((s) => s.workspaces);
+  const workspaceAliases = useChatStore((s) => s.workspaceAliases);
   useBrowserOcclusion(open);
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
@@ -435,6 +439,8 @@ export function SessionSearchPalette({
           listRef={listRef}
           matches={titleRows}
           content={content}
+          workspaces={workspaces}
+          workspaceAliases={workspaceAliases}
           contentPending={contentPending}
           queryLongEnough={trimmedQuery.length >= CONTENT_MIN_CHARS}
           active={active}
@@ -454,6 +460,8 @@ function PaletteResults({
   listRef,
   matches,
   content,
+  workspaces,
+  workspaceAliases,
   contentPending,
   queryLongEnough,
   active,
@@ -464,6 +472,8 @@ function PaletteResults({
   listRef: RefObject<HTMLDivElement>;
   matches: SessionMatch[];
   content: MessageSearchHit[];
+  workspaces: readonly { id: string; path: string; name: string; machine?: string | null }[];
+  workspaceAliases: Record<string, string> | null | undefined;
   contentPending: number;
   /** Query meets CONTENT_MIN_CHARS: the content lane is live. */
   queryLongEnough: boolean;
@@ -552,7 +562,7 @@ function PaletteResults({
                 </span>
               ) : null}
               <span className="shrink-0 text-caption-1-medium text-text-tertiary">
-                {[hit.machine, hit.workspaceName ?? hit.workspacePath, hit.origin === "local" ? t("chat.localSession") : undefined].filter(Boolean).join(" · ")}
+                {[hit.machine, searchProjectLabel(hit, workspaces, workspaceAliases), hit.origin === "local" ? t("chat.localSession") : undefined].filter(Boolean).join(" · ")}
               </span>
             </span>
             <span className="w-full truncate pl-5 text-caption-1-medium text-text-secondary">
