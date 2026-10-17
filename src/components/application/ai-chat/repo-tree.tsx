@@ -7,11 +7,10 @@ import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
 import FolderOpen from "lucide-react/dist/esm/icons/folder-open";
 import FolderSymlink from "lucide-react/dist/esm/icons/folder-symlink";
 import GitBranch from "lucide-react/dist/esm/icons/git-branch";
+import Ellipsis from "lucide-react/dist/esm/icons/ellipsis";
 import Menu from "lucide-react/dist/esm/icons/menu";
-import Pencil from "lucide-react/dist/esm/icons/pencil";
 import Pin from "lucide-react/dist/esm/icons/pin";
 import Plus from "lucide-react/dist/esm/icons/plus";
-import Trash2 from "lucide-react/dist/esm/icons/trash-2";
 import X from "lucide-react/dist/esm/icons/x";
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { paginateThreads } from "@/components/application/ai-chat/repo-pagination";
@@ -68,70 +67,12 @@ function ThreadStatusDot({
   return null;
 }
 
-/** Row-hover actions (pin / rename / delete). Drafts only offer delete. */
-function ThreadHoverActions({
-  id,
-  pinned,
-  isDraft,
-  onAction,
-}: {
-  id: string;
-  pinned: boolean;
-  isDraft: boolean;
-  onAction?: (id: string, action: ThreadAction) => void;
-}) {
-  const { t } = useTranslation();
-  if (!onAction) return null;
-  const iconClass = "text-foreground-icon-secondary hover:text-foreground-icon-primary";
-  return (
-    <span className="hidden shrink-0 items-center gap-1.5 group-hover:inline-flex">
-      {!isDraft && (
-        <button
-          type="button"
-          aria-label={pinned ? t("chat.unpin") : t("chat.pin")}
-          onClick={(event) => {
-            event.stopPropagation();
-            onAction(id, "pin");
-          }}
-          className={iconClass}
-        >
-          <Pin className="size-3.5" aria-hidden />
-        </button>
-      )}
-      {!isDraft && (
-        <button
-          type="button"
-          aria-label={t("chat.renameSession")}
-          onClick={(event) => {
-            event.stopPropagation();
-            onAction(id, "rename");
-          }}
-          className={iconClass}
-        >
-          <Pencil className="size-3.5" aria-hidden />
-        </button>
-      )}
-      <button
-        type="button"
-        aria-label={t("chat.deleteSession")}
-        onClick={(event) => {
-          event.stopPropagation();
-          onAction(id, "delete");
-        }}
-        className={iconClass}
-      >
-        <Trash2 className="size-3.5" aria-hidden />
-      </button>
-    </span>
-  );
-}
-
 /** Chat row under an open repo — indented 36px, relative-time chip on the
- *  right, hover action icons (pin / rename / delete; archive lives in the
- *  right-click menu only). */
+ *  right, and an always-visible menu (pin, rename, archive, delete). */
 export function ThreadItem({
   id,
   label,
+  tooltip,
   engine,
   origin,
   description,
@@ -144,10 +85,8 @@ export function ThreadItem({
   activity,
   retrying = false,
   unseen = false,
-  isDraft = false,
   tabIndex,
   onSelect,
-  onAction,
   onContextMenu,
   flat = false,
 }: AiChatThread & {
@@ -200,7 +139,7 @@ export function ThreadItem({
             the row truncates it (same pattern as the repo row below). */}
         <span
           className="min-w-0 flex-1 truncate text-body-2-medium text-text-secondary"
-          title={label}
+          title={tooltip || label}
         >
           {pinned && (
             <Pin
@@ -217,11 +156,22 @@ export function ThreadItem({
           {t(metadataSyncError ? "chat.metadataSyncFailed" : "chat.metadataSyncPending")}
         </span>}
       </button>
-      {id && (
-        <ThreadHoverActions id={id} pinned={pinned} isDraft={isDraft} onAction={onAction} />
+      {id && onContextMenu && (
+        <button
+          type="button"
+          aria-label={t("chat.sessionActions")}
+          title={t("chat.sessionActions")}
+          onClick={(event) => {
+            event.stopPropagation();
+            onContextMenu(event, id);
+          }}
+          className="inline-flex size-5 shrink-0 items-center justify-center rounded-sm text-foreground-icon-secondary hover:text-foreground-icon-primary"
+        >
+          <Ellipsis className="size-3.5" aria-hidden />
+        </button>
       )}
       {time ? (
-        <span className="inline-flex shrink-0 items-center justify-center rounded-sm bg-background-tertiary-default px-1 py-px text-caption-2-medium whitespace-nowrap text-text-secondary group-hover:hidden">
+        <span className="inline-flex shrink-0 items-center justify-center rounded-sm bg-background-tertiary-default px-1 py-px text-caption-2-medium whitespace-nowrap text-text-secondary">
           {time}
         </span>
       ) : null}

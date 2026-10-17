@@ -212,6 +212,7 @@ export const en: Messages = {
     queueClear: "Clear all",
     pin: "Pin",
     unpin: "Unpin",
+    sessionActions: "Session actions",
     deleteSession: "Delete session",
     archiveSession: "Archive session",
     archiveWeek: "Archive older than a week",

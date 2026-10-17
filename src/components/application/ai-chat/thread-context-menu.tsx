@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import Archive from "lucide-react/dist/esm/icons/archive";
+import Pin from "lucide-react/dist/esm/icons/pin";
 import Columns2 from "lucide-react/dist/esm/icons/columns-2";
 import Copy from "lucide-react/dist/esm/icons/copy";
 import Pencil from "lucide-react/dist/esm/icons/pencil";
@@ -14,6 +15,7 @@ import {
 } from "@ccgui/plugin-sdk";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import type { ThreadAction } from "@/components/application/ai-chat/sidebar-types";
+import { parseSessionKey, useChatStore } from "@/features/chat/store";
 import { openSessionBeside, sessionFromThreadId } from "@/features/chat/split/store";
 
 export interface ThreadMenuState {
@@ -47,18 +49,26 @@ function parseThreadTarget(threadId: string): SessionMenuTarget | null {
 function buildHostSections({
   threadId,
   isDraft,
+  pinned,
   t,
   onThreadAction,
   onCopyId,
 }: {
   threadId: string;
   isDraft: boolean;
+  pinned: boolean;
   t: TFunction;
   onThreadAction?: (id: string, action: ThreadAction) => void;
   onCopyId?: (id: string) => void;
 }): MenuEntry[][] {
   const actions: MenuEntry[] = [];
   if (onThreadAction && !isDraft) {
+    actions.push({
+      id: "pin",
+      label: t(pinned ? "chat.unpin" : "chat.pin"),
+      icon: <Pin className="size-4" aria-hidden />,
+      onSelect: () => onThreadAction(threadId, "pin"),
+    });
     actions.push({
       id: "rename",
       label: t("chat.renameSession"),
@@ -156,10 +166,23 @@ export function ThreadContextMenu({
   const { t } = useTranslation();
   const pluginDefs = useRegistry(sessionMenuRegistry);
   const isDraft = menu.threadId.startsWith("new:");
+  const pinned = useChatStore((state) => {
+    if (isDraft) return false;
+    const identity = parseSessionKey(menu.threadId);
+    if (!identity) return false;
+    return state.sessions.some(
+      (session) =>
+        session.engine === identity.engine &&
+        session.sessionId === identity.sessionId &&
+        session.machine === identity.machine &&
+        session.pinned,
+    );
+  });
 
   const hostSections = buildHostSections({
     threadId: menu.threadId,
     isDraft,
+    pinned,
     t,
     onThreadAction,
     onCopyId,

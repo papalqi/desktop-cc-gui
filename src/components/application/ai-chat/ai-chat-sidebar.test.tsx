@@ -232,7 +232,7 @@ it("renders a retrying streaming thread with a static status dot", async () => {
   expect(dot?.classList.contains("sidebar-thread-status-retrying")).toBe(true);
 });
 
-it("keeps hover actions to pin / rename / delete (archive is context-menu only)", async () => {
+it("keeps a session menu on the row, including archive and pin", async () => {
   const onThreadAction = vi.fn();
   await act(async () => {
     root.render(
@@ -253,12 +253,21 @@ it("keeps hover actions to pin / rename / delete (archive is context-menu only)"
   const actionLabels = [...threadRow("悬浮操作").querySelectorAll("button[aria-label]")].map(
     (button) => button.getAttribute("aria-label"),
   );
-  expect(actionLabels).toEqual(["chat.pin", "chat.renameSession", "chat.deleteSession"]);
+  expect(actionLabels).toEqual(["chat.sessionActions"]);
 
-  await rightClick(threadRow("悬浮操作"));
-  const menu = openMenu();
+  const menuButton = threadRow("悬浮操作").querySelector<HTMLButtonElement>(
+    'button[aria-label="chat.sessionActions"]',
+  );
+  expect(menuButton).toBeTruthy();
+  await act(async () => menuButton!.click());
+  let menu = openMenu();
   await act(async () => menuItem(menu, "chat.archiveSession").click());
   expect(onThreadAction).toHaveBeenCalledWith("claude/hover-1", "archive");
+
+  await act(async () => menuButton!.click());
+  menu = openMenu();
+  await act(async () => menuItem(menu, "chat.pin").click());
+  expect(onThreadAction).toHaveBeenCalledWith("claude/hover-1", "pin");
 });
 
 it("opens the thread context menu on right-click and dispatches its entries", async () => {

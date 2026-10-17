@@ -208,6 +208,7 @@ export const zh = {
     queueClear: "清空",
     pin: "置顶",
     unpin: "取消置顶",
+    sessionActions: "会话操作",
     deleteSession: "删除会话",
     archiveSession: "归档会话",
     archiveWeek: "归档一周前",

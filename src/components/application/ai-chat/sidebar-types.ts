@@ -3,6 +3,8 @@ export type ThreadAction = "pin" | "rename" | "archive" | "delete";
 export interface AiChatThread {
   id?: string;
   label: string;
+  /** Hover text when the row label is shortened. */
+  tooltip?: string;
   /** CLI engine id — brand mark rendered left of the label. */
   engine?: string;
   origin?: "hub" | "local";
