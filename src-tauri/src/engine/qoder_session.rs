@@ -64,7 +64,10 @@ pub(crate) const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(90);
 /// session/resume re-attaches without the workspace scan.
 pub(crate) const SESSION_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle budget for a prompt, renewed by session activity. Codex shares this
+/// constant; the ACP pump also has a generous overall lifetime bound.
 pub(crate) const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 30);
+const PROMPT_HARD_CAP: Duration = Duration::from_secs(60 * 60 * 8);
 /// qodercli interleaves the prompt response into the session/update stream:
 /// keep reading after it until the stream goes idle, else the tail is lost.
 const PROMPT_TRAILING_IDLE: Duration = Duration::from_millis(400);
@@ -79,6 +82,27 @@ const POST_TERMINAL_DRAIN: Duration = Duration::from_millis(250);
 /// scan, so the whole handshake fits in seconds.
 const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const MODEL_PROBE_TOTAL: Duration = Duration::from_secs(20);
+
+#[derive(Clone, Copy)]
+struct PumpLimits {
+    prompt_hard_cap: Duration,
+    trailing_idle: Duration,
+    trailing_cap: Duration,
+    cancel_settle: Duration,
+    kill_poll: Duration,
+}
+
+impl Default for PumpLimits {
+    fn default() -> Self {
+        Self {
+            prompt_hard_cap: PROMPT_HARD_CAP,
+            trailing_idle: PROMPT_TRAILING_IDLE,
+            trailing_cap: PROMPT_TRAILING_CAP,
+            cancel_settle: CANCEL_SETTLE_TIMEOUT,
+            kill_poll: KILL_POLL,
+        }
+    }
+}
 
 pub(crate) const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 pub(crate) const JSONRPC_INVALID_PARAMS: i64 = -32602;
@@ -651,6 +675,7 @@ pub(crate) struct AcpProcess {
     line_buf: Vec<u8>,
     next_id: u64,
     workspace_root: PathBuf,
+    limits: PumpLimits,
 }
 
 impl AcpProcess {
@@ -665,6 +690,7 @@ impl AcpProcess {
             line_buf: Vec::new(),
             next_id: 1,
             workspace_root,
+            limits: PumpLimits::default(),
         }
     }
 
@@ -724,10 +750,12 @@ impl AcpProcess {
     /// by returning the frame to write — or returns `None` when the driver
     /// answers it out of band (a question parked for the user).
     ///
-    /// The read wait is capped at KILL_POLL so an interrupt lands even
-    /// mid-handshake: with a `cancel_session_id` (prompt phase) the loop
-    /// first sends session/cancel and grants the CLI CANCEL_SETTLE_TIMEOUT to
-    /// answer typed; without one the call aborts immediately.
+    /// A prompt's timeout is an idle budget renewed by session notifications
+    /// and agent requests, with an overall hard cap. Other RPCs keep a fixed
+    /// deadline. The read wait uses short kill-poll slices so an interrupt
+    /// lands even mid-handshake: with a `cancel_session_id` (prompt phase) the
+    /// loop first sends session/cancel and grants the CLI a fixed settle
+    /// window to answer typed; without one the call aborts immediately.
     pub(crate) async fn routed(
         &mut self,
         method: &str,
@@ -742,8 +770,15 @@ impl AcpProcess {
         let expected_key = id.to_string();
         self.write_line(&jsonrpc_request(id, method, params))
             .await?;
-        let deadline = Instant::now() + timeout_dur;
-        let drain_trailing = method == "session/prompt";
+        let limits = self.limits;
+        let is_prompt = method == "session/prompt";
+        let started_at = Instant::now();
+        let idle_timeout = is_prompt.then_some(timeout_dur);
+        let prompt_hard_deadline = is_prompt.then(|| started_at + limits.prompt_hard_cap);
+        let mut deadline = started_at + timeout_dur;
+        if let Some(hard_deadline) = prompt_hard_deadline {
+            deadline = deadline.min(hard_deadline);
+        }
         let mut settled: Option<Value> = None;
         let mut drain_deadline: Option<Instant> = None;
         let mut cancel_sent_at: Option<Instant> = None;
@@ -754,10 +789,12 @@ impl AcpProcess {
                         let _ = self
                             .notify("session/cancel", json!({ "sessionId": session_id }))
                             .await;
-                        cancel_sent_at = Some(Instant::now());
+                        let sent_at = Instant::now();
+                        cancel_sent_at = Some(sent_at);
+                        deadline = deadline.min(sent_at + limits.cancel_settle);
                     }
                     (None, None) => return Err(CANCELLED.to_string()),
-                    (Some(sent), _) if sent.elapsed() > CANCEL_SETTLE_TIMEOUT => {
+                    (Some(sent), _) if sent.elapsed() > limits.cancel_settle => {
                         return Err(CANCELLED.to_string());
                     }
                     (Some(_), _) => {}
@@ -766,17 +803,21 @@ impl AcpProcess {
             let wait = if settled.is_some() {
                 let cap_remaining = drain_deadline
                     .map(|until| until.saturating_duration_since(Instant::now()))
-                    .unwrap_or(PROMPT_TRAILING_IDLE);
+                    .unwrap_or(limits.trailing_idle);
                 if cap_remaining.is_zero() {
                     return Ok(settled.take().unwrap_or(Value::Null));
                 }
-                PROMPT_TRAILING_IDLE.min(cap_remaining)
+                limits.trailing_idle.min(cap_remaining)
             } else {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(format!("{method} timed out"));
+                    return Err(if cancel_sent_at.is_some() {
+                        CANCELLED.to_string()
+                    } else {
+                        format!("{method} timed out")
+                    });
                 }
-                remaining.min(KILL_POLL)
+                remaining.min(limits.kill_poll)
             };
 
             let read = timeout(
@@ -811,7 +852,11 @@ impl AcpProcess {
                     // An idle read tick: re-check the deadline and the
                     // killed flag on the next loop pass.
                     if deadline.saturating_duration_since(Instant::now()).is_zero() {
-                        return Err(format!("{method} timed out"));
+                        return Err(if cancel_sent_at.is_some() {
+                            CANCELLED.to_string()
+                        } else {
+                            format!("{method} timed out")
+                        });
                     }
                     continue;
                 }
@@ -825,6 +870,10 @@ impl AcpProcess {
                 continue;
             };
             let parsed = parse_acp_line(&value);
+            let session_activity = matches!(
+                &parsed,
+                AcpLine::Notification { .. } | AcpLine::AgentRequest { .. }
+            );
             match parsed {
                 AcpLine::Response {
                     id: response_id,
@@ -838,13 +887,20 @@ impl AcpProcess {
                         return Err(format!("rpc:{}:{method}: {}", error.code, error.message));
                     }
                     let result = result.unwrap_or(Value::Null);
-                    if !drain_trailing {
+                    if !is_prompt {
                         return Ok(result);
                     }
                     settled = Some(result);
-                    drain_deadline = Some(Instant::now() + PROMPT_TRAILING_CAP);
+                    drain_deadline = Some(Instant::now() + limits.trailing_cap);
                 }
                 other => {
+                    if session_activity && settled.is_none() && cancel_sent_at.is_none() {
+                        if let (Some(idle_timeout), Some(hard_deadline)) =
+                            (idle_timeout, prompt_hard_deadline)
+                        {
+                            deadline = (Instant::now() + idle_timeout).min(hard_deadline);
+                        }
+                    }
                     if let Some(response) = router(&other) {
                         self.write_line(&response).await?;
                     }
@@ -1172,7 +1228,7 @@ fn handle_session_update(
 }
 
 /// Terminal message precedence (reference-proven): held-back [Error] chunks
-/// → the rpc error's message part → the stderr tail → the raw error.
+/// → the rpc error's message part → captured stderr → the raw error.
 fn terminal_message(raw: String, view: &TurnView, stderr_buf: &Arc<Mutex<String>>) -> String {
     if !view.pending_error_chunks.is_empty() {
         return view.pending_error_chunks.join("\n");
@@ -1504,5 +1560,149 @@ mod tests {
         let result = json!({"models": {"availableModels": [{"modelId": "a"}]}});
         let models = parse_models_from_session_new(&result);
         assert!(models[0].is_default);
+    }
+
+    fn test_limits() -> PumpLimits {
+        PumpLimits {
+            prompt_hard_cap: Duration::from_secs(5),
+            trailing_idle: Duration::from_millis(20),
+            trailing_cap: Duration::from_millis(100),
+            cancel_settle: Duration::from_millis(200),
+            kill_poll: Duration::from_millis(10),
+        }
+    }
+
+    async fn streaming_acp_peer() -> SpawnedAcp {
+        let peer = r#"
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+require('node:readline').createInterface({input: process.stdin}).on('line', line => {
+  const request = JSON.parse(line);
+  const mode = request.params && request.params.mode;
+  if (mode === 'complete') {
+    let count = 0;
+    const timer = setInterval(() => {
+      count += 1;
+      if (count === 4) {
+        send({jsonrpc: '2.0', id: 'permission-1', method: 'session/request_permission',
+          params: {sessionId: 's', options: [{kind: 'allow_once', optionId: 'allow'}]}});
+      } else {
+        send({jsonrpc: '2.0', method: 'session/update', params: {sessionId: 's',
+          update: {sessionUpdate: 'agent_message_chunk', content: {type: 'text', text: 'active'}}}});
+      }
+      if (count === 8) {
+        clearInterval(timer);
+        send({jsonrpc: '2.0', id: request.id, result: {stopReason: 'end_turn'}});
+      }
+    }, 100);
+  } else if (mode === 'forever') {
+    setInterval(() => send({jsonrpc: '2.0', method: 'session/update', params: {
+      sessionId: 's', update: {sessionUpdate: 'agent_message_chunk'}
+    }}), 50);
+  }
+});
+"#;
+        let mut command = Command::new("node");
+        command.args(["-e", peer]);
+        let mut spawned = spawn_piped_acp(&mut command, "ACP test peer", &std::env::temp_dir())
+            .expect("protocol test requires the project's Node runtime");
+        spawned.acp.limits = test_limits();
+        spawned
+    }
+
+    #[tokio::test]
+    async fn acp_prompt_stays_alive_while_session_output_is_active() {
+        let mut spawned = streaming_acp_peer().await;
+        let mut updates = 0;
+        let mut permissions = 0;
+        let result = timeout(
+            Duration::from_secs(3),
+            spawned.acp.routed(
+                "session/prompt",
+                json!({"mode": "complete"}),
+                Duration::from_millis(200),
+                &AtomicBool::new(false),
+                Some("s"),
+                &mut |line| match line {
+                    AcpLine::Notification { method, .. } if method == "session/update" => {
+                        updates += 1;
+                        None
+                    }
+                    AcpLine::AgentRequest { id, method, .. }
+                        if method == "session/request_permission" =>
+                    {
+                        permissions += 1;
+                        Some(jsonrpc_result_response(id, json!({})))
+                    }
+                    _ => None,
+                },
+            ),
+        )
+        .await;
+        teardown(&mut spawned.child).await;
+        let result = result
+            .expect("active prompt must not reach the test guard")
+            .unwrap();
+        assert_eq!(result["stopReason"], json!("end_turn"));
+        assert_eq!(updates, 7);
+        assert_eq!(permissions, 1);
+    }
+
+    #[tokio::test]
+    async fn acp_output_does_not_extend_rpc_or_cancel_settle_deadlines() {
+        for interrupted in [false, true] {
+            let mut spawned = streaming_acp_peer().await;
+            let killed = AtomicBool::new(interrupted);
+            let method = if interrupted {
+                "session/prompt"
+            } else {
+                "initialize"
+            };
+            let result = timeout(
+                Duration::from_secs(1),
+                spawned.acp.routed(
+                    method,
+                    json!({"mode": "forever"}),
+                    if interrupted {
+                        Duration::from_secs(1)
+                    } else {
+                        Duration::from_millis(200)
+                    },
+                    &killed,
+                    interrupted.then_some("s"),
+                    &mut |_| None,
+                ),
+            )
+            .await;
+            teardown(&mut spawned.child).await;
+            let result = result.expect("output must not prolong the RPC or cancel deadline");
+            assert_eq!(
+                result.unwrap_err(),
+                if interrupted {
+                    CANCELLED
+                } else {
+                    "initialize timed out"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_idle_prompt_still_times_out() {
+        let mut spawned = streaming_acp_peer().await;
+        let result = timeout(
+            Duration::from_secs(1),
+            spawned.acp.routed(
+                "session/prompt",
+                json!({"mode": "idle"}),
+                Duration::from_millis(100),
+                &AtomicBool::new(false),
+                Some("s"),
+                &mut |_| None,
+            ),
+        )
+        .await;
+        teardown(&mut spawned.child).await;
+        let result = result.expect("idle prompt must time out before the test guard");
+        assert_eq!(result.unwrap_err(), "session/prompt timed out");
     }
 }
