@@ -26,7 +26,13 @@ const RETRY_MIN_MS = 250;
 const RETRY_MAX_MS = 5_000;
 
 const queryHub: DeliveryQuery = (machine, runId) =>
-  queryMachine(machine, (invoke) => invoke<RunDelivery>("get_run_delivery", { runId, waitMs: HUB_WAIT_MS }));
+  queryMachine(machine, (invoke) => invoke<RunDelivery>("get_run_delivery", {
+    runId,
+    waitMs: HUB_WAIT_MS,
+    // Omitted, the hub still abandons an unseen id for pages already open.
+    // This page closes only after it has read not-received.
+    closeIfMissing: false,
+  }));
 
 const closeHub: DeliveryClose = (machine, runId) =>
   queryMachine(machine, (invoke) => invoke<RunDelivery>("close_unreceived_run", { runId }));

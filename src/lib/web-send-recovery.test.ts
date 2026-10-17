@@ -176,6 +176,38 @@ it("an older hub without delivery records reports an uncertain send without quer
   expect(query).not.toHaveBeenCalled();
 });
 
+it("the default recovery query does not let the hub abandon the id before close", async () => {
+  const { recovery, socket, send } = await connected();
+  const pending = recovery.sendWithDeliveryRecovery(args, send).catch((error: unknown) => error);
+  await vi.advanceTimersByTimeAsync(0);
+  socket.fireClose();
+  await vi.advanceTimersByTimeAsync(0);
+  const bridge = Socket.instances.at(-1)!;
+  expect(bridge).not.toBe(socket);
+  bridge.open();
+  bridge.receive({ type: "hello", version: "test", hub: true, machine: "PC6", features: ["ping", "machines", "delivery"] });
+  await vi.advanceTimersByTimeAsync(0);
+  const query = JSON.parse(bridge.send.mock.calls.at(-1)![0]);
+  expect(query).toMatchObject({
+    type: "invoke",
+    cmd: "get_run_delivery",
+    args: { runId: "run-1", waitMs: 4_000, closeIfMissing: false },
+  });
+  bridge.receive({ type: "response", id: query.id, ok: true, payload: answer("not-received") });
+  await vi.advanceTimersByTimeAsync(0);
+  const closer = Socket.instances.at(-1)!;
+  expect(closer).not.toBe(bridge);
+  closer.open();
+  closer.receive({ type: "hello", version: "test", hub: true, machine: "PC6", features: ["ping", "machines", "delivery"] });
+  await vi.advanceTimersByTimeAsync(0);
+  const close = JSON.parse(closer.send.mock.calls.at(-1)![0]);
+  expect(close.cmd).toBe("close_unreceived_run");
+  expect(close.args).toEqual({ runId: "run-1" });
+  closer.receive({ type: "response", id: close.id, ok: true, payload: answer("not-received") });
+  const error = await pending;
+  expect((error as Error).message).toBe(i18n.t("chat.sendNotDelivered"));
+});
+
 it("an executor error is passed through unchanged", async () => {
   const { recovery, socket, send } = await connected();
   const query = vi.fn();
