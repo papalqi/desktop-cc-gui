@@ -350,6 +350,7 @@ export default function ChatPage() {
             panelCollapsed={panelCollapsedEffective}
             dragging={dragging}
             panelTab={panelTab}
+            onPanelTabChange={setPanelTab}
             onResizeStart={handleResizeStart("panel")}
             overlay={panelOverlay}
           />

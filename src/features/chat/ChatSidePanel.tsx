@@ -1,6 +1,8 @@
 import { useTranslation } from "react-i18next";
 import { PluginBoundary } from "@/features/plugins/boundary/PluginBoundary";
 import { pluginIdFromRegistryKey } from "@ccgui/plugin-sdk";
+import { PillTab, PillTabList } from "@/components/base/tabs/pill-tab";
+import { pluginPanelTabIcon } from "@/features/plugins/hub/PluginPanelTabIcon";
 import { cx } from "@/utils/cx";
 import { ChangesTab, ProfileTab } from "./panel-tabs";
 import { resolveActivePanelTab, useSortedPanelTabs } from "./use-panel-tabs";
@@ -15,6 +17,7 @@ export function ChatSidePanel({
   panelCollapsed,
   dragging,
   panelTab,
+  onPanelTabChange,
   onResizeStart,
   overlay = false,
 }: {
@@ -24,6 +27,7 @@ export function ChatSidePanel({
   panelCollapsed: boolean;
   dragging: "sidebar" | "panel" | null;
   panelTab: string;
+  onPanelTabChange?: (tab: string) => void;
   onResizeStart: (e: React.PointerEvent) => void;
   overlay?: boolean;
 }) {
@@ -76,6 +80,26 @@ export function ChatSidePanel({
           !panelCollapsed && "border-l",
         )}
       >
+        {onPanelTabChange && (
+          <div className="flex shrink-0 items-center border-b border-separator-border px-3 py-2 xl:hidden">
+            <PillTabList>
+              {panelTabs.map((tab) => {
+                const isPluginTab = tab.id.startsWith("plugin:");
+                return (
+                  <PillTab
+                    key={tab.id}
+                    icon={isPluginTab ? pluginPanelTabIcon(tab) : tab.icon}
+                    isSelected={activeTab === tab.id}
+                    onSelect={() => onPanelTabChange(tab.id)}
+                    title={isPluginTab ? tab.label() : undefined}
+                  >
+                    {isPluginTab ? undefined : tab.label()}
+                  </PillTab>
+                );
+              })}
+            </PillTabList>
+          </div>
+        )}
         {panelTabs.map((tab) => {
           const TabComponent = tab.component;
           const tabVisible = !panelCollapsed && activeTab === tab.id;

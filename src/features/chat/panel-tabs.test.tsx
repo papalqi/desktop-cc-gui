@@ -2,6 +2,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { panelTabRegistry } from "@ccgui/plugin-sdk";
+import i18n from "@/lib/i18n";
 import { ChatSidePanel } from "./ChatSidePanel";
 import type { ActiveSession } from "./store";
 // Side-effect import: registers the builtin files/changes tabs (their panel
@@ -19,6 +20,13 @@ vi.mock("@/features/profile/ProfilePanel", () => ({
 }));
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+if (typeof globalThis.ResizeObserver !== "function") {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
+}
 
 const active: ActiveSession = {
   engine: "dsh",
@@ -117,6 +125,39 @@ describe("panel tabs registry integration (plan §4.2 #4)", () => {
     act(() => dispose());
     expect(container.textContent).not.toContain("plugin-panel-marker");
     expect(container.textContent).toContain("files-panel-stub");
+  });
+
+  it("keeps the tab pills inside the panel when a change handler is passed", () => {
+    const onPanelTabChange = vi.fn();
+    act(() => {
+      root.render(
+        <ChatSidePanel
+          active={active}
+          panelRef={{ current: null }}
+          panelWidth={300}
+          panelCollapsed={false}
+          dragging={null}
+          panelTab="changes"
+          onResizeStart={() => {}}
+          onPanelTabChange={onPanelTabChange}
+        />,
+      );
+    });
+    const strip = container.querySelector(".xl\\:hidden");
+    expect(strip).not.toBeNull();
+    const files = Array.from(strip!.querySelectorAll("button")).find(
+      (button) => button.textContent === i18n.t("files.tab"),
+    );
+    expect(files?.getAttribute("aria-pressed")).toBe("false");
+    act(() => {
+      files!.click();
+    });
+    expect(onPanelTabChange).toHaveBeenCalledWith("files");
+  });
+
+  it("omits the in-panel pills when no tab change handler is passed", () => {
+    render("files");
+    expect(container.querySelector(".xl\\:hidden")).toBeNull();
   });
 
   it("a crashing plugin tab is contained by PluginBoundary", () => {
