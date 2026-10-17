@@ -312,7 +312,9 @@ export function WorkspaceSection({
               {t("chat.archiveWeek")}
             </button>
           )}
-        {!isWeb && (
+        {isWeb ? (
+          <span className="px-2 text-caption-1-medium text-text-tertiary">{t("chat.addWorkspaceOnDesktop")}</span>
+        ) : (
           <button
             type="button"
             aria-label={t("chat.addWorkspace")}

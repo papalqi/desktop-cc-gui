@@ -15,6 +15,7 @@ import {
 } from "./catalog";
 import { PluginMarketRow } from "./PluginMarketRow";
 import { PluginSpotlight } from "./PluginSpotlight";
+import { isWeb } from "@/lib/platform";
 import { usePluginsStore } from "../manager/usePlugins";
 import { useMarketplaceStore } from "../marketplace/store";
 
@@ -253,6 +254,9 @@ export function PluginMarketView({ onOpenDetail }: { onOpenDetail: (id: string) 
             {t("plugins.market.hint")}
             {showDownloads ? ` ${t("plugins.hub.downloadsHint")}` : ""}
           </p>
+          {isWeb && (
+            <p className="px-1 text-body-2-regular text-text-tertiary">{t("plugins.market.desktopOnly")}</p>
+          )}
         </>
       )}
     </div>

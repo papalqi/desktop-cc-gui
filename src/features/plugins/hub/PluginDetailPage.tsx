@@ -482,6 +482,9 @@ function PluginHeaderActions({
   const { t } = useTranslation();
   return (
     <div className="flex shrink-0 flex-wrap items-center gap-2 pt-1">
+      {isWeb && (
+        <p className="w-full text-body-2-regular text-text-tertiary">{t("plugins.market.desktopOnly")}</p>
+      )}
       {installing ? (
         <button type="button" disabled className={INSTALLING_BUTTON}>
           <Loader2 className="size-4 animate-spin" aria-hidden />

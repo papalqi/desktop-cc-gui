@@ -6,7 +6,7 @@ import {
   SettingsRow,
   SettingsSectionLabel,
 } from "@/components/application/settings/settings-rows";
-import { getAppVersion } from "@/lib/platform";
+import { getAppVersion, isWeb } from "@/lib/platform";
 import { useUpdateStore, type UpdateStage } from "@/features/update/store";
 import { useUpdateDescription } from "@/features/update/stage-message";
 
@@ -66,12 +66,16 @@ export function UpdateSection() {
             </span>
           </SettingsRow>
           <SettingsRow anchor="checkUpdates" label={t("settings.checkUpdates")} description={updateDescription}>
-            <UpdateControls
-              stage={updateStage}
-              inFlight={updateInFlight}
-              onCheck={() => void checkForUpdates({ interactive: true })}
-              onStart={() => void startUpdate()}
-            />
+            {isWeb ? (
+              <span className="text-body-2-regular text-text-tertiary">{t("settings.checkUpdatesOnDesktop")}</span>
+            ) : (
+              <UpdateControls
+                stage={updateStage}
+                inFlight={updateInFlight}
+                onCheck={() => void checkForUpdates({ interactive: true })}
+                onStart={() => void startUpdate()}
+              />
+            )}
           </SettingsRow>
         </SettingsCard>
       </div>

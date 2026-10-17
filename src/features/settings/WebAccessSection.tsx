@@ -418,7 +418,9 @@ function LanBridgeRows({ model }: { model: ReturnType<typeof useWebAccess> }) {
         label={model.info ? t("settings.webAccessRunning") : t("settings.webAccessStopped")}
         description={t("settings.webAccessDesc")}
       >
-        {!isWeb && (
+        {isWeb ? (
+          <span className="max-w-sm text-body-2-regular text-text-tertiary">{t("settings.webAccessDesktopOnly")}</span>
+        ) : (
           <Button
             size="small"
             variant={model.info ? "secondary" : "primary"}

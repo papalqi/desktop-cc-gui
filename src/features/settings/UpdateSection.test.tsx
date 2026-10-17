@@ -9,6 +9,7 @@ vi.mock("@/lib/transport", () => ({ isWeb: false }));
 vi.mock("@/lib/platform", () => ({
   getAppVersion: async () => "1.0.5",
   openExternal: vi.fn(),
+  isWeb: false,
 }));
 
 import "@/lib/i18n";
