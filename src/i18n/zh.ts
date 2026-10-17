@@ -211,6 +211,7 @@ export const zh = {
     sessionActions: "会话操作",
     addWorkspaceOnDesktop: "在执行机器的桌面应用里添加",
     chatOnMachine: "当前对话在 {{machine}}。侧栏仍停在上一台机器。",
+    machineOffline: "未连接。本地操作需等待机器连接。",
     deleteSession: "删除会话",
     archiveSession: "归档会话",
     archiveWeek: "归档一周前",

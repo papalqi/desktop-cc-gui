@@ -4,6 +4,7 @@ import type { FitAddon } from "@xterm/addon-fit";
 import { useTranslation } from "react-i18next";
 import { isMacPlatform } from "@/features/shortcuts/shortcuts";
 import { ipc as defaultIpc, ipcForMachine } from "@/lib/ipc";
+import { errorText } from "@/lib/errors";
 import { loadXterm, type XtermModules } from "./xterm-loader";
 import { terminalFontFamily, terminalTheme } from "./appearance";
 import { FONT_CHANGE_EVENT } from "@/features/settings/font";
@@ -47,7 +48,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd, machine }: { i
         if (!cancelled) setXterm(modules);
       })
       .catch((e: unknown) => {
-        if (!cancelled) setError(String(e));
+        if (!cancelled) setError(errorText(e));
       });
     return () => {
       cancelled = true;
@@ -130,7 +131,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd, machine }: { i
             setError(null);
           })
           .catch((e: unknown) => {
-            if (!disposed) setError(String(e));
+            if (!disposed) setError(errorText(e));
           });
 
       safeFit();
@@ -189,7 +190,7 @@ export const TerminalView = memo(function TerminalView({ id, cwd, machine }: { i
       // Follow 设置 → 通用 → 外观 → 代码字体 changes live.
       window.addEventListener(FONT_CHANGE_EVENT, onFontChange);
     } catch (e: unknown) {
-      setError(String(e));
+      setError(errorText(e));
     }
 
     return () => {

@@ -20,6 +20,9 @@ export function errorText(err: unknown): string {
     if (text === "Invalid Codex channel config.toml") {
       return i18n.t("settings.cliCodexConfigInvalid") || text;
     }
+    if (/machine is offline/i.test(text)) {
+      return i18n.t("chat.machineOffline");
+    }
     return text;
   }
   try {

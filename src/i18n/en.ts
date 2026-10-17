@@ -215,6 +215,7 @@ export const en: Messages = {
     sessionActions: "Session actions",
     addWorkspaceOnDesktop: "Add workspaces in the desktop app on the execution machine",
     chatOnMachine: "This chat is on {{machine}}. The sidebar stays on the previous machine.",
+    machineOffline: "Offline. Local actions wait until the machine reconnects.",
     deleteSession: "Delete session",
     archiveSession: "Archive session",
     archiveWeek: "Archive older than a week",
