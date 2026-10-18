@@ -3,7 +3,7 @@ import { getAppVersion, pickDirectory } from "@/lib/platform";
 import i18n from "@/lib/i18n";
 import { buildAgentCatalog } from "../conversation/agent-catalog";
 import { APP_VERSION } from "@/version/app-version";
-import { invoke } from "@/lib/transport";
+import { invoke, isWeb } from "@/lib/transport";
 import { useChatStore } from "@/features/chat/store";
 import {
   createPluginContext,
@@ -57,10 +57,18 @@ export interface LoaderBackend extends PluginContextBackend {
 
 export const ipcBackend: LoaderBackend = {
   agentCatalog: (workspacePath) => buildAgentCatalog(ipc, workspacePath, (key) => i18n.t(key)),
-  windowGetState: (pluginId) => invoke("plugin_window_state", { pluginId }),
+  windowGetState: (pluginId) =>
+    isWeb
+      ? Promise.reject(new Error("desktop-only command: plugin_window_state"))
+      : invoke("plugin_window_state", { pluginId }),
   windowSetNormalBounds: (pluginId, bounds) =>
-    invoke("plugin_window_set_normal_bounds", { pluginId, bounds }),
-  windowSampleWechat: (pluginId) => invoke("plugin_window_sample_wechat", { pluginId }),
+    isWeb
+      ? Promise.reject(new Error("desktop-only command: plugin_window_set_normal_bounds"))
+      : invoke("plugin_window_set_normal_bounds", { pluginId, bounds }),
+  windowSampleWechat: (pluginId) =>
+    isWeb
+      ? Promise.reject(new Error("desktop-only command: plugin_window_sample_wechat"))
+      : invoke("plugin_window_sample_wechat", { pluginId }),
   modelListEngines: (pluginId) => invoke("plugin_list_engines", { pluginId }),
   modelListEngineModels: (pluginId, engine, workspace) =>
     invoke("plugin_list_engine_models", { pluginId, engine, workspace: workspace ?? null }),

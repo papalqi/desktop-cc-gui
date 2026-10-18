@@ -6,6 +6,12 @@ import { sendWithDeliveryRecovery } from "./web-send-recovery";
 import { webMachine, webMultiMachine } from "./web-machine";
 const invoke: typeof transportInvoke = (cmd, args) => transportInvoke(cmd, args);
 
+/** Host install and document writes have no remote dispatch arm. The invoke
+ *  string stays in this file so the parity test can see the command. */
+function rejectDesktopOnly<T>(command: string): Promise<T> {
+  return Promise.reject(new Error(`desktop-only command: ${command}`));
+}
+
 // ==================== Shared types (mirror Rust serde camelCase) ====================
 
 /** A turn the desktop still has in its process table. */
@@ -1977,13 +1983,21 @@ return {
   // plugins
   pluginList: () => invoke<PluginInfo[]>("plugin_list"),
   pluginInstallFromPath: (path: string) =>
-    invoke<PluginInfo>("plugin_install_from_path", { path }),
+    isWeb
+      ? rejectDesktopOnly<PluginInfo>("plugin_install_from_path")
+      : invoke<PluginInfo>("plugin_install_from_path", { path }),
   pluginUninstall: (id: string, deleteData: boolean) =>
-    invoke<void>("plugin_uninstall", { id, deleteData }),
+    isWeb
+      ? rejectDesktopOnly<void>("plugin_uninstall")
+      : invoke<void>("plugin_uninstall", { id, deleteData }),
   pluginSetEnabled: (id: string, enabled: boolean) =>
-    invoke<PluginInfo>("plugin_set_enabled", { id, enabled }),
+    isWeb
+      ? rejectDesktopOnly<PluginInfo>("plugin_set_enabled")
+      : invoke<PluginInfo>("plugin_set_enabled", { id, enabled }),
   pluginQuarantine: (id: string, error: string) =>
-    invoke<PluginInfo>("plugin_quarantine", { id, error }),
+    isWeb
+      ? rejectDesktopOnly<PluginInfo>("plugin_quarantine")
+      : invoke<PluginInfo>("plugin_quarantine", { id, error }),
   pluginReadFile: (id: string, name: string) =>
     invoke<string>("plugin_read_file", { id, name }),
   /** One declared artwork file of an installed plugin as a data URL. The
@@ -1994,54 +2008,70 @@ return {
   pluginStorageGet: (id: string, key: string) =>
     invoke<unknown>("plugin_storage_get", { id, key }),
   pluginStorageSet: (id: string, key: string, value: unknown) =>
-    invoke<void>("plugin_storage_set", { id, key, value }),
+    isWeb
+      ? rejectDesktopOnly<void>("plugin_storage_set")
+      : invoke<void>("plugin_storage_set", { id, key, value }),
   pluginStorageDelete: (id: string, key: string) =>
-    invoke<void>("plugin_storage_delete", { id, key }),
+    isWeb
+      ? rejectDesktopOnly<void>("plugin_storage_delete")
+      : invoke<void>("plugin_storage_delete", { id, key }),
   pluginWorkspaceMetadata: (pluginId: string, workspacePath: string) =>
     invoke<PluginWorkspaceMetadata>("workspace_metadata", { pluginId, workspacePath }),
   pluginDocumentStorageGetLocation: (pluginId: string) =>
-    invoke<PluginDocumentStorageLocationResponse>("plugin_document_storage_get_location", {
-      pluginId,
-    }),
+    isWeb
+      ? rejectDesktopOnly<PluginDocumentStorageLocationResponse>("plugin_document_storage_get_location")
+      : invoke<PluginDocumentStorageLocationResponse>("plugin_document_storage_get_location", {
+          pluginId,
+        }),
   pluginDocumentStorageSelectLocation: (
     pluginId: string,
     kind: PluginDocumentStorageLocationKind,
     customPath: string | null,
   ) =>
-    invoke<PluginDocumentStorageLocationResponse>("plugin_document_storage_select_location", {
-      pluginId,
-      kind,
-      customPath,
-    }),
+    isWeb
+      ? rejectDesktopOnly<PluginDocumentStorageLocationResponse>("plugin_document_storage_select_location")
+      : invoke<PluginDocumentStorageLocationResponse>("plugin_document_storage_select_location", {
+          pluginId,
+          kind,
+          customPath,
+        }),
   pluginDocumentStorageReadText: (pluginId: string, relativePath: string) =>
-    invoke<PluginDocumentReadResponse | null>("plugin_document_storage_read_text", {
-      pluginId,
-      relativePath,
-    }),
+    isWeb
+      ? rejectDesktopOnly<PluginDocumentReadResponse | null>("plugin_document_storage_read_text")
+      : invoke<PluginDocumentReadResponse | null>("plugin_document_storage_read_text", {
+          pluginId,
+          relativePath,
+        }),
   pluginDocumentStorageWriteTextAtomic: (
     pluginId: string,
     relativePath: string,
     content: string,
     expectedVersion: string | null,
   ) =>
-    invoke<PluginDocumentWriteResponse>("plugin_document_storage_write_text_atomic", {
-      pluginId,
-      relativePath,
-      content,
-      expectedVersion,
-    }),
+    isWeb
+      ? rejectDesktopOnly<PluginDocumentWriteResponse>("plugin_document_storage_write_text_atomic")
+      : invoke<PluginDocumentWriteResponse>("plugin_document_storage_write_text_atomic", {
+          pluginId,
+          relativePath,
+          content,
+          expectedVersion,
+        }),
   pluginDocumentStorageRemove: (
     pluginId: string,
     relativePath: string,
     expectedVersion: string | null,
   ) =>
-    invoke<PluginDocumentRemoveResponse>("plugin_document_storage_remove", {
-      pluginId,
-      relativePath,
-      expectedVersion,
-    }),
+    isWeb
+      ? rejectDesktopOnly<PluginDocumentRemoveResponse>("plugin_document_storage_remove")
+      : invoke<PluginDocumentRemoveResponse>("plugin_document_storage_remove", {
+          pluginId,
+          relativePath,
+          expectedVersion,
+        }),
   pluginDocumentStorageList: (pluginId: string, prefix?: string) =>
-    invoke<string[]>("plugin_document_storage_list", { pluginId, prefix: prefix ?? null }),
+    isWeb
+      ? rejectDesktopOnly<string[]>("plugin_document_storage_list")
+      : invoke<string[]>("plugin_document_storage_list", { pluginId, prefix: prefix ?? null }),
   // plugin marketplace (Phase 3, plan §6) — install is desktop-only on the
   // web bridge; fetch/checkUpdates ride the read-only whitelist.
   pluginFetchIndex: (force = false) =>
@@ -2057,7 +2087,9 @@ return {
   pluginFetchMarketReadme: (id: string) =>
     invoke<string>("plugin_fetch_market_readme", { id }),
   pluginInstallFromMarketplace: (id: string) =>
-    invoke<PluginInfo>("plugin_install_from_marketplace", { id }),
+    isWeb
+      ? rejectDesktopOnly<PluginInfo>("plugin_install_from_marketplace")
+      : invoke<PluginInfo>("plugin_install_from_marketplace", { id }),
   pluginCheckUpdates: () => invoke<PluginUpdate[]>("plugin_check_updates"),
   /** 内置「插件开发」skill 的落盘：幂等地同步进各引擎的 skills 根（Claude /
    *  Codex / ~/.agents）。插件中心的「创建插件」在开新会话前调一次，这样

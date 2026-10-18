@@ -1,4 +1,5 @@
 import { ipc } from "@/lib/ipc";
+import { isWeb } from "@/lib/platform";
 /** localStorage key holding the last applied theme, read pre-paint by bootstrap.tsx. */
 export const THEME_STORAGE_KEY = "boardui:theme";
 /** Window event fired by a theme toggle control; carries "dark" | "light". */
@@ -15,7 +16,9 @@ export function applyTheme(theme: string): void {
       typeof window !== "undefined" &&
       window.matchMedia("(prefers-color-scheme: dark)").matches);
   document.documentElement.classList.toggle("dark", dark);
-  ipc.setWindowTheme(dark).catch(() => {});
+  // The native webview theme has no browser equivalent. The document class
+  // above is the whole remote appearance change.
+  if (!isWeb) ipc.setWindowTheme(dark).catch(() => {});
   // Mirror the applied theme into storage for bootstrap.tsx's pre-paint read.
   window.localStorage.setItem(THEME_STORAGE_KEY, dark ? "dark" : "light");
 }

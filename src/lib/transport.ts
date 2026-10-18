@@ -22,6 +22,7 @@ export const webToken: string | null = isWeb
 type Listener = (payload: unknown, machine?: string) => void;
 
 interface PendingReq {
+  cmd: string;
   machine: string | null;
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
@@ -29,6 +30,10 @@ interface PendingReq {
   sent: boolean;
   historyTiming?: { startedAt: number; session: number };
 }
+
+/** Commands this page has already been told the executor does not route.
+ *  A permanent "unknown command" must not be sent again. */
+const permanentUnknown = new Map<string, string>();
 
 const RETRY_MAX_MS = 10_000;
 const LONG_COMMANDS = new Set(["add_workspace", "plugin_add_workspace", "read_file", "read_font_file", "plugin_read_file", "plugin_read_artwork", "rescan_sessions"]);
@@ -249,7 +254,14 @@ class WebBridge {
         });
       }
       if (msg.ok) entry.resolve(msg.payload);
-      else entry.reject(new Error(msg.error === "executor_history_offline" ? i18n.t("chat.executorHistoryOffline") : String(msg.error ?? "unknown error")));
+      else {
+        const raw = typeof msg.error === "string" ? msg.error : "";
+        const errorText = raw === "executor_history_offline"
+          ? i18n.t("chat.executorHistoryOffline")
+          : String(msg.error ?? "unknown error");
+        if (raw.startsWith("unknown command")) permanentUnknown.set(entry.cmd, errorText);
+        entry.reject(new Error(errorText));
+      }
       return;
     }
     if (msg.type === "event" && typeof msg.name === "string") {
@@ -403,6 +415,7 @@ class WebBridge {
     const { promise, resolve, reject } = Promise.withResolvers<T>();
     const timeout = requestTimeout(cmd);
     this.pending.set(id, {
+      cmd,
       machine,
       resolve: resolve as (v: unknown) => void,
       reject,
@@ -530,6 +543,8 @@ let bridge: WebBridge | null = null;
 /** Drop-in for @tauri-apps/api/core invoke. */
 export function invoke<T>(cmd: string, args?: Record<string, unknown>, machine?: string | null): Promise<T> {
   if (!isWeb) return tauriInvoke<T>(cmd, args);
+  const rejected = permanentUnknown.get(cmd);
+  if (rejected) return Promise.reject(new Error(rejected));
   return (bridge ??= new WebBridge()).invoke<T>(cmd, args, machine);
 }
 

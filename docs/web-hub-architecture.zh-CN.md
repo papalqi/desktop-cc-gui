@@ -16,6 +16,10 @@
 - 原生转录本已覆盖结束回合时，Hub 从 SQLite 按页读取历史，不再重建这些回合的事件投影。图片、文件等无需文本改写的 HTTP 响应在收到响应头后直接流式转发。
 - 已同步的会话可离线浏览、搜索及修改管理状态；任务发送、本地文件操作和需要本机环境的功能在离线时明确失败。Hub 不自动重放可能已经送达的提示词。
 
+## 远程命令面
+
+浏览器里的 `invoke("命令")` 由执行端 `src-tauri/src/web/dispatch.rs` 转到和桌面 Tauri 相同的函数。对齐由 `dispatch::dispatch_parity_test::frontend_invokes_are_routed_or_explicitly_desktop_only` 在测试时读 `src/` 与 `packages/` 的源码：每个静态 `invoke("命令")` 必须出现在分派分支里，或者写进带原因的桌面专属表。桌面专属调用点用 `isWeb` 改成明确的空操作或拒绝，网页不再发出这些命令。执行端对同一个未知命令每个进程只记一条 error；网页收到 `unknown command` 后在这一页的生命周期内不再发送该命令。`get_run_delivery` 由 Hub 的 `queryMachine` 回答，不进执行端分派。插件 `bridgeInvoke(command, args)` 的命令名是运行时字符串，静态扫描看不到，测试只锁住这个调用形状。
+
 AI 通过登录后的 `/_relay/api` 发现 HTTP 接口与 `/commands` 参数契约；`/machines/<name>/invoke` 复用既有命令查询工作区、会话、消息、文件与 Git，或开始/继续会话、回答提问及中断回合。`/machines/<name>/runs/<runId>` 持久化查询投递和回复，支持有界等待，超时不重放提示词。这些操作接口仅需更新 Hub，不要求升级执行端。诊断接口另提供中转/观察连接、待处理 RPC、历史完整性、操作结果及执行端状态；显式 POST 可同步目录或指定历史。执行端提供 `/api/debug` 和既有 RPC 中的新 `debug_snapshot`，沿用桥接令牌与设备审批。接口契约和调用示例见 [AI 操作与调试 API](ai-debug-api.zh-CN.md)。
 
 运行诊断日志独立保存到 Hub 的 `data/logs.db` 和执行端应用目录的 `diagnostics/logs.db`，包括性能、错误、异常与生命周期；按有界容量保留，沿用原鉴权提供筛选和 NDJSON 导出。执行端升级后在 hello 声明 `debug_logs`，Hub 实时保存日志事件并按独立持久化游标补拉，离线继续读取缓存。日志游标与会话历史游标分离，采集错误与耗时不保存对话增量或工具结果。

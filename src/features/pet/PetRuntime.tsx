@@ -3,7 +3,7 @@ import { useChatStore } from "@/features/chat/store";
 import { ensureMissionPersistenceLoaded } from "@/features/mission/runtime";
 import { useMissionStore } from "@/features/mission/store";
 import { ipc } from "@/lib/ipc";
-import { listen } from "@/lib/transport";
+import { isWeb, listen } from "@/lib/transport";
 import { derivePetStates, type PetStateSnapshot } from "./pet-state";
 
 const DISPLAY_INTERVAL_MS = 1800;
@@ -35,6 +35,8 @@ const IDLE_SNAPSHOT: PetStateSnapshot = {
  * PetOverlayApp through the #/pet-overlay route. */
 export function PetRuntime() {
   useEffect(() => {
+    // The overlay is a native window. A browser must not poll pet_set_state.
+    if (isWeb) return;
     let disposed = false;
     // State derivation walks every session on each chat-store update; skip
     // all of it while the pet is disabled (default). pet_set_scale and

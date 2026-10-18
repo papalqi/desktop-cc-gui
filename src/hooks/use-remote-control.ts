@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { listenRemoteControl } from "@/lib/events";
 import { ipc } from "@/lib/ipc";
+import { isWeb } from "@/lib/platform";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 
 /**
@@ -14,6 +15,9 @@ export function useRemoteControl(): boolean {
   const [active, setActive] = useState(false);
 
   useEffect(() => {
+    // The badge means "someone else is driving this desktop". On that
+    // desktop's own browser session the answer is not meaningful.
+    if (isWeb) return;
     void ipc
       .remoteControlActive()
       .then(setActive)
