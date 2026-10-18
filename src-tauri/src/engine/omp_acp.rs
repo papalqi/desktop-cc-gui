@@ -47,9 +47,9 @@ use serde_json::{json, Map, Value};
 
 use crate::engine::plan_review::{self, PlanExecution, PlanReview, PlanReviewKind, PlanStatus};
 use crate::engine::qoder_session::{
-    answer_agent_request, initialize_params, jsonrpc_id_key, jsonrpc_result_response,
-    session_update_from_notification, spawn_piped_acp, teardown, AcpLine, AcpProcess,
-    QoderSessionUpdate, PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT, SESSION_NEW_TIMEOUT,
+    answer_agent_request, end_stdio_turn, initialize_params, jsonrpc_id_key,
+    jsonrpc_result_response, session_update_from_notification, spawn_piped_acp, AcpLine,
+    AcpProcess, QoderSessionUpdate, PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT, SESSION_NEW_TIMEOUT,
 };
 use crate::engine::{
     cleanup_staged_files, BuiltCommand, EngineEvent, HostTurnGuard, SendRequest, TurnCore,
@@ -102,7 +102,7 @@ pub(crate) async fn run_acp_turn(
     let mut state = TurnState::new(None);
     let mut view = TurnView::default();
     // Abort-safe backstop（同 grok）：任务被 abort 时仍发出一条终态并清注册键。
-    let mut host_guard = HostTurnGuard::arm(&core, Arc::clone(&killed), virtual_pid);
+    let mut host_guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
     let result = if req.session_id.is_some() {
         // 双保险：build_command 已在 spawn 前拒绝；防御层被绕过同样不许
         // 在一个没有人工等待点的恢复会话里跑计划。
@@ -139,6 +139,7 @@ pub(crate) async fn run_acp_turn(
         let session_id = state.native_session_id.clone();
         core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
     }
+    // 终态派发和 disarm 之间没有 await，abort 不会再发一条。
     host_guard.disarm_settled(was_killed, failed && !was_killed);
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     if let Some(session_id) = state.native_session_id.clone() {
@@ -166,8 +167,9 @@ async fn turn_inner(
     core.registry
         .set_stdin(&core.run_id, spawned.acp.stdin.clone());
     let result = handshake_and_prompt(&mut spawned.acp, core, state, view, req, killed).await;
-    // ACP 是驻留会话协议：prompt 应答后 CLI 仍在，每条退出路径都拆树。
-    teardown(&mut spawned.child).await;
+    // ACP 是驻留会话协议：prompt 应答后 CLI 仍在。先关 stdin（已入队帧之后才
+    // EOF），再拆树。
+    end_stdio_turn(&spawned.acp.stdin, &mut spawned.child).await;
     match result {
         Ok(()) => Ok(()),
         Err(error) => Err(terminal_message(error, &spawned.stderr_buf)),

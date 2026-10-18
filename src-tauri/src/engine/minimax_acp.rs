@@ -35,10 +35,10 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 
 use super::qoder_session::{
-    answer_agent_request, initialize_params, jsonrpc_id_key, jsonrpc_result_response,
-    session_update_from_notification, spawn_piped_acp, teardown, AcpLine, AcpProcess,
-    JSONRPC_INVALID_PARAMS, JSONRPC_METHOD_NOT_FOUND, PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT,
-    SESSION_NEW_TIMEOUT, SESSION_RESUME_TIMEOUT,
+    answer_agent_request, end_stdio_turn, initialize_params, jsonrpc_id_key,
+    jsonrpc_result_response, session_update_from_notification, spawn_piped_acp, teardown, AcpLine,
+    AcpProcess, JSONRPC_INVALID_PARAMS, JSONRPC_METHOD_NOT_FOUND, PROMPT_TIMEOUT,
+    RPC_HANDSHAKE_TIMEOUT, SESSION_NEW_TIMEOUT, SESSION_RESUME_TIMEOUT,
 };
 use super::{BuiltCommand, Engine, EngineEvent, HostTurnGuard, SendRequest, TurnCore, TurnState};
 
@@ -84,7 +84,7 @@ pub(super) async fn run_acp_turn(
     let mut view = TurnView::default();
     let preassigned_session_id = req.session_id.clone();
     // Abort-safe backstop: an aborted turn never reaches the dispatch below.
-    let mut host_guard = HostTurnGuard::arm(&core, Arc::clone(&killed), virtual_pid);
+    let mut host_guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
     let result = turn_inner(&core, &mut state, &mut view, &req, &mut command, &killed).await;
     // Pending questions die with the turn: settle their cards BEFORE any
     // terminal dispatch, or the monotonic saw_done/saw_error guard in
@@ -118,6 +118,7 @@ pub(super) async fn run_acp_turn(
         let session_id = state.native_session_id.clone();
         core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
     }
+    // No await between the terminal dispatch and disarm.
     host_guard.disarm_settled(was_killed, failed && !was_killed);
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     // A resumed conversation was keyed under the incoming session id, and the
@@ -149,8 +150,9 @@ async fn turn_inner(
         .set_stdin(&core.run_id, spawned.acp.stdin.clone());
     let result = handshake_and_prompt(&mut spawned.acp, core, state, view, req, killed).await;
     // ACP is a session protocol: the CLI stays resident after the prompt
-    // response, so every exit path tears the tree down.
-    teardown(&mut spawned.child).await;
+    // response, so every exit path closes stdin (EOF after queued frames)
+    // and then tears the tree down.
+    end_stdio_turn(&spawned.acp.stdin, &mut spawned.child).await;
     match result {
         Ok(()) => Ok(()),
         Err(error) => Err(terminal_message(error, &spawned.stderr_buf)),

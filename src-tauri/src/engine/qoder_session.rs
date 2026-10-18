@@ -1035,6 +1035,18 @@ pub(crate) async fn teardown(child: &mut Child) {
     let _ = timeout(POST_TERMINAL_DRAIN, child.wait()).await;
 }
 
+/// End a turn's stdin, then kill. `close` is queued behind frames already
+/// accepted (including `session/cancel`), so EOF follows them. The kill is
+/// the next step. Tests also wait until the writer and its watchdog have
+/// exited; `close` ends those tasks even while the registry still holds a
+/// clone of the handle.
+pub(crate) async fn end_stdio_turn(stdin: &super::stdio_duplex::StdioWriter, child: &mut Child) {
+    stdin.close();
+    teardown(child).await;
+    #[cfg(test)]
+    stdin.wait_tasks_finished().await;
+}
+
 // ==================== turn driver ====================
 
 /// Per-turn projection state.
@@ -1082,7 +1094,7 @@ async fn run_prepared_turn(
     let preassigned_session_id = req.session_id.clone();
     // Abort-safe backstop: an aborted turn never reaches the dispatch below,
     // so the guard emits the one terminal event and frees the registry keys.
-    let mut host_guard = HostTurnGuard::arm(&core, Arc::clone(&killed), virtual_pid);
+    let mut host_guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
     let result = turn_inner(
         &core,
         &mut state,
@@ -1109,6 +1121,8 @@ async fn run_prepared_turn(
         let session_id = state.native_session_id.clone();
         core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
     }
+    // No await between the terminal dispatch and disarm. An abort only drops
+    // the guard at an await point, so it cannot also emit.
     host_guard.disarm_settled(was_killed, failed && !was_killed);
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     // Clean up both the native session id (if the engine reported one) and
@@ -1141,7 +1155,10 @@ async fn turn_inner(
     let mut spawned = spawn_piped_acp(command, label, &req.workspace)?;
     spawned.acp.bind_run(&core.run_id);
     let result = handshake_and_prompt(&mut spawned.acp, core, state, view, req, killed).await;
-    teardown(&mut spawned.child).await;
+    // Already-queued frames, including session/cancel, sit ahead of this EOF.
+    // Disarm of the host guard happens later with no await after the terminal
+    // dispatch; this await is still inside the turn, before that dispatch.
+    end_stdio_turn(&spawned.acp.stdin, &mut spawned.child).await;
     match result {
         Ok(()) => Ok(()),
         Err(error) => Err(terminal_message(error, view, &spawned.stderr_buf)),
@@ -1742,7 +1759,7 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
             ),
         )
         .await;
-        teardown(&mut spawned.child).await;
+        end_stdio_turn(&spawned.acp.stdin, &mut spawned.child).await;
         let result = result
             .expect("active prompt must not reach the test guard")
             .unwrap();
@@ -1780,7 +1797,7 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
                 ),
             )
             .await;
-            teardown(&mut spawned.child).await;
+            end_stdio_turn(&spawned.acp.stdin, &mut spawned.child).await;
             let result = result.expect("output must not prolong the RPC or cancel deadline");
             assert_eq!(
                 result.unwrap_err(),
@@ -1808,7 +1825,7 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
             ),
         )
         .await;
-        teardown(&mut spawned.child).await;
+        end_stdio_turn(&spawned.acp.stdin, &mut spawned.child).await;
         let result = result.expect("idle prompt must time out before the test guard");
         assert_eq!(result.unwrap_err(), "session/prompt timed out");
     }
@@ -1942,7 +1959,7 @@ readUntil(msg => {{
             ),
         )
         .await;
-        teardown(&mut spawned.child).await;
+        end_stdio_turn(&spawned.acp.stdin, &mut spawned.child).await;
         let result = outcome
             .expect("full-duplex burst must not deadlock the read loop")
             .expect("prompt must complete");
@@ -1979,7 +1996,7 @@ setInterval(() => {}, 1e9);
         )
         .await;
         let pid = spawned.child.id();
-        teardown(&mut spawned.child).await;
+        end_stdio_turn(&spawned.acp.stdin, &mut spawned.child).await;
         let err = outcome
             .expect("a silent peer must hit the idle deadline, not the test guard")
             .expect_err("silent peer ends with a typed timeout");

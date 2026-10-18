@@ -58,9 +58,11 @@ use tokio::time::{timeout, Instant};
 use super::codex_read_only;
 use super::images;
 use super::plan_review::{self, PlanDecision, PlanReview, PlanReviewKind};
+#[cfg(target_os = "macos")]
+use super::qoder_session::teardown;
 use super::qoder_session::{
-    encode_ndjson, jsonrpc_id_key, jsonrpc_request, jsonrpc_result_response, teardown, KILL_POLL,
-    PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT,
+    encode_ndjson, end_stdio_turn, jsonrpc_id_key, jsonrpc_request, jsonrpc_result_response,
+    KILL_POLL, PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT,
 };
 use super::{
     assistant_message, read_line_capped, spawn_stderr_capture, tool_call_message,
@@ -1251,7 +1253,7 @@ pub(super) async fn run_app_server_turn(
     view.workspace = req.workspace.to_string_lossy().into_owned();
     let preassigned_session_id = req.session_id.clone();
     // Abort-safe backstop: an aborted turn never reaches settle's dispatch.
-    let mut host_guard = HostTurnGuard::arm(&core, Arc::clone(&killed), virtual_pid);
+    let mut host_guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
     let result = turn_inner(&core, &mut state, &mut view, &req, built, &killed, None).await;
     let was_killed = killed.load(Ordering::SeqCst);
     let failed = result.is_err();
@@ -1263,8 +1265,9 @@ pub(super) async fn run_app_server_turn(
         &killed,
         virtual_pid,
         preassigned_session_id,
-    )
-    .await;
+    );
+    // settle pushes the terminal and does not await. Disarm is the next
+    // statement, so a normal terminal and this guard cannot both emit.
     host_guard.disarm_settled(was_killed, failed && !was_killed);
 }
 
@@ -1273,7 +1276,11 @@ pub(super) async fn run_app_server_turn(
 /// expire with it (a no-op for codex — next_turn never parks — kept as the
 /// host-driver contract the sibling drivers follow), then the turn reports
 /// either the engine's error or its own Done.
-async fn settle(
+///
+/// Synchronous on purpose. Callers disarm [`HostTurnGuard`] on the next
+/// line. An await between the terminal push and that disarm would let an
+/// abort drop the guard while it is still armed and emit a second terminal.
+fn settle(
     core: &TurnCore,
     state: &mut TurnState,
     view: &TurnView,
@@ -1389,7 +1396,9 @@ async fn drive(
         decision,
     )
     .await;
-    teardown(&mut spawned.child).await;
+    // Queued frames first, then EOF, then the kill. settle() below is
+    // synchronous and disarms the guard on the next line after it returns.
+    end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
     view.exit_unconfirmed = !matches!(spawned.child.try_wait(), Ok(Some(_)));
     match result {
         Ok(()) => Ok(()),
@@ -1982,7 +1991,7 @@ async fn start_decision_turn(
         Ok(started) => started,
         Err(error) => {
             let error = terminal_message(error, &spawned.stderr_buf);
-            teardown(&mut spawned.child).await;
+            end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
             view.exit_unconfirmed = !matches!(spawned.child.try_wait(), Ok(Some(_)));
             let reason = if killed.load(Ordering::SeqCst) {
                 "interrupt"
@@ -1998,8 +2007,7 @@ async fn start_decision_turn(
                 killed,
                 virtual_pid,
                 req.session_id.clone(),
-            )
-            .await;
+            );
             return Err(error);
         }
     };
@@ -2019,7 +2027,7 @@ async fn finish_decision_turn(
     mut state: TurnState,
     mut view: TurnView,
 ) {
-    let mut host_guard = HostTurnGuard::arm(&core, Arc::clone(&killed), virtual_pid);
+    let mut host_guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
     let result = match started {
         Some(started) => {
             pump_turn_to_end(
@@ -2035,7 +2043,7 @@ async fn finish_decision_turn(
         // The turn ended inside its own ack window.
         None => Ok(()),
     };
-    teardown(&mut spawned.child).await;
+    end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
     view.exit_unconfirmed = !matches!(spawned.child.try_wait(), Ok(Some(_)));
     let was_killed = killed.load(Ordering::SeqCst);
     let failed = result.is_err();
@@ -2048,8 +2056,8 @@ async fn finish_decision_turn(
         &killed,
         virtual_pid,
         preassigned_session_id,
-    )
-    .await;
+    );
+    // No await between settle's terminal push and disarm.
     host_guard.disarm_settled(was_killed, failed && !was_killed);
 }
 
@@ -2211,7 +2219,7 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
                 },
             )
             .await;
-        teardown(&mut spawned.child).await;
+        end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
         assert_eq!(result.unwrap(), None);
         assert_eq!(
             updates, 8,
@@ -2233,7 +2241,7 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
                 &mut |_| Handled::Ignore,
             )
             .await;
-        teardown(&mut spawned.child).await;
+        end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
         assert_eq!(result.unwrap_err(), "turn timed out");
     }
 
@@ -2264,7 +2272,7 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
                 ),
             )
             .await;
-            teardown(&mut spawned.child).await;
+            end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
             let result = result.expect("output must not prolong the RPC or interrupt deadline");
             assert_eq!(
                 result.unwrap_err(),
@@ -2275,6 +2283,93 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
                 }
             );
         }
+    }
+
+    /// A full app-server turn (initialize, thread/start, turn/start,
+    /// turn/completed) goes through `drive`, which closes stdin after the
+    /// queued frames and waits until the writer and the watchdog have exited.
+    /// The peer stays up until stdin ends, so a writer that kept its own
+    /// sender would still be running when this returns.
+    #[tokio::test]
+    async fn app_server_turn_end_finishes_the_writer() {
+        let peer = r#"
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+require('node:readline').createInterface({input: process.stdin}).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') {
+    send({jsonrpc:'2.0', id: request.id, result: {}});
+  } else if (request.method === 'thread/start') {
+    send({jsonrpc:'2.0', id: request.id, result: {thread: {id: 'thread-1'}}});
+  } else if (request.method === 'turn/start') {
+    send({jsonrpc:'2.0', id: request.id, result: {turn: {id: 'turn-1'}}});
+    send({jsonrpc:'2.0', method: 'turn/completed', params: {turn: {status: 'completed'}}});
+  }
+});
+process.stdin.on('end', () => process.exit(0));
+"#;
+        let mut command = Command::new("node");
+        command.args(["-e", peer]);
+        let (core, registry, emitter) = test_core();
+        let entry = registry.get("test-run").expect("registry entry");
+        let killed = Arc::clone(&entry.killed);
+        let virtual_pid = entry.pid;
+        let request = SendRequest {
+            session_id: None,
+            workspace: std::env::temp_dir(),
+            prompt: "ping".into(),
+            prompt_contributions: Vec::new(),
+            native_compact: false,
+            images: vec![],
+            model: None,
+            effort: None,
+            service_tier: None,
+            permission: None,
+            additional_dirs: vec![],
+            provider_id: None,
+            computer_use: None,
+            memory_bot: None,
+            allowed_tools: None,
+        };
+        let built = BuiltCommand {
+            command,
+            stdin_payload: None,
+            keep_stdin_open: true,
+            cleanup_files: vec![],
+            mcp_restore: None,
+            preassigned_session_id: None,
+        };
+        timeout(
+            Duration::from_secs(10),
+            run_app_server_turn(core, request, built, killed, virtual_pid),
+        )
+        .await
+        .expect("app-server turn must finish, writer included");
+        let events = flushed_events(&emitter);
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event["kind"].as_str(), Some("done") | Some("error")))
+            .collect();
+        assert_eq!(terminals.len(), 1, "one terminal: {events:?}");
+        assert_eq!(terminals[0]["kind"], "done");
+        assert_eq!(terminals[0]["sessionId"], "thread-1");
+        let mut seqs = std::collections::HashSet::new();
+        for event in &events {
+            assert!(
+                seqs.insert(event["seq"].as_u64().expect("seq")),
+                "duplicate seq in {events:?}"
+            );
+        }
+        assert_eq!(registry.active_run_count(), 0);
+    }
+
+    fn flushed_events(emitter: &Arc<CollectingEmitter>) -> Vec<Value> {
+        let mut out = Vec::new();
+        for raw in emitter.0.lock().unwrap().iter() {
+            let parsed: Value = serde_json::from_str(raw).expect("flushed batch must be JSON");
+            let batch = parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]);
+            out.extend(batch);
+        }
+        out
     }
 
     #[cfg(target_os = "macos")]
@@ -3444,7 +3539,7 @@ fs.writeSync(1, JSON.stringify({{jsonrpc:'2.0', method:'turn/completed', params:
             ),
         )
         .await;
-        teardown(&mut spawned.child).await;
+        end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
         outcome
             .expect("full-duplex burst must not deadlock the read loop")
             .expect("turn must complete");

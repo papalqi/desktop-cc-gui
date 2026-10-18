@@ -13,6 +13,7 @@ use super::Engine;
 use crate::event_sink;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
@@ -192,7 +193,12 @@ pub(super) fn redact_secrets(text: &str) -> String {
 }
 /// Mutable per-run streaming state shared by the reader loop's dispatch.
 pub(crate) struct TurnState {
-    seq: u64,
+    /// Next sequence number is `fetch_add + 1`. Shared with [`HostTurnGuard`]
+    /// so an abort terminal continues this run instead of reusing seq 1.
+    seq: Arc<AtomicU64>,
+    /// Live native session id. The guard reads this at emit time, including
+    /// an id learned after the guard was armed.
+    session_slot: Arc<Mutex<Option<String>>>,
     started_at: Option<u64>,
     pub(crate) native_session_id: Option<String>,
     pub(crate) saw_done: bool,
@@ -218,7 +224,8 @@ pub(crate) struct TurnState {
 impl TurnState {
     pub(crate) fn new(preassigned: Option<String>) -> Self {
         Self {
-            seq: 0,
+            seq: Arc::new(AtomicU64::new(0)),
+            session_slot: Arc::new(Mutex::new(preassigned.clone())),
             started_at: None,
             native_session_id: preassigned,
             saw_done: false,
@@ -274,12 +281,12 @@ impl TurnState {
             self.pending_terminal = Some((kind.to_string(), data));
             return;
         }
-        self.seq += 1;
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut payload = serde_json::json!({
             "runId": run_id,
             "sessionId": self.native_session_id,
             "engine": engine_id,
-            "seq": self.seq,
+            "seq": seq,
             "kind": kind,
             "data": data,
             // Emit-side timestamp (Unix ms): plugins compute throughput from
@@ -385,16 +392,21 @@ impl TurnCore {
         if state.native_session_id.as_deref() == Some(id) {
             return;
         }
-        state.native_session_id = Some(id.to_string());
-        self.registry.rekey(&self.run_id, id.to_string());
-        self.registry.note_session(&self.run_id, id);
+        let id = id.to_string();
+        state.native_session_id = Some(id.clone());
+        *state
+            .session_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+        self.registry.rekey(&self.run_id, id.clone());
+        self.registry.note_session(&self.run_id, &id);
         if announce {
             state.push(
                 &self.sink,
                 &self.run_id,
                 &self.engine_id,
                 "session",
-                Value::String(id.to_string()),
+                Value::String(id),
             );
         }
     }
@@ -939,12 +951,15 @@ pub(crate) struct HostTurnGuard {
     engine_id: String,
     run_id: String,
     killed: Arc<std::sync::atomic::AtomicBool>,
+    seq: Arc<AtomicU64>,
+    session_id: Arc<Mutex<Option<String>>>,
     armed: bool,
 }
 
 impl HostTurnGuard {
     pub(crate) fn arm(
         core: &TurnCore,
+        state: &TurnState,
         killed: Arc<std::sync::atomic::AtomicBool>,
         virtual_pid: u32,
     ) -> Self {
@@ -958,6 +973,8 @@ impl HostTurnGuard {
             engine_id: core.engine_id.clone(),
             run_id: core.run_id.clone(),
             killed,
+            seq: Arc::clone(&state.seq),
+            session_id: Arc::clone(&state.session_slot),
             armed: true,
         }
     }
@@ -987,11 +1004,19 @@ impl HostTurnGuard {
     }
 
     fn emit_terminal(&self, kind: &str, data: Value) {
+        // Same counter as TurnState::push_meta. fetch_add never hands out a
+        // sequence this run already emitted.
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let session_id = self
+            .session_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         self.sink.push(serde_json::json!({
             "runId": self.run_id,
-            "sessionId": Value::Null,
+            "sessionId": session_id,
             "engine": self.engine_id,
-            "seq": 1,
+            "seq": seq,
             "kind": kind,
             "data": data,
             "ts": std::time::SystemTime::now()
@@ -2224,7 +2249,8 @@ fs.writeSync(2, 'TAIL-MARK\n');
         };
         let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
-            let _guard = HostTurnGuard::arm(&core, killed, virtual_pid);
+            let state = TurnState::new(None);
+            let _guard = HostTurnGuard::arm(&core, &state, killed, virtual_pid);
             let _ = armed_tx.send(());
             std::future::pending::<()>().await;
         });
@@ -2266,5 +2292,213 @@ fs.writeSync(2, 'TAIL-MARK\n');
             0,
             "abort must clear the registry"
         );
+    }
+
+    fn parse_events(raw: &[String]) -> Vec<Value> {
+        let mut out = Vec::new();
+        for batch in raw {
+            let parsed: Value = serde_json::from_str(batch).unwrap();
+            let items = parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]);
+            out.extend(items);
+        }
+        out
+    }
+
+    fn assert_unique_seqs(events: &[Value]) {
+        let mut seen = std::collections::HashSet::new();
+        for event in events {
+            let seq = event["seq"].as_u64().expect("seq");
+            assert!(
+                seen.insert((event["runId"].as_str().unwrap().to_string(), seq)),
+                "duplicate seq {seq} in {events:?}"
+            );
+        }
+    }
+
+    /// An abort after N emitted events must continue the run's sequence and
+    /// keep the native session id. Reusing seq 1 collides with the first event.
+    #[tokio::test]
+    async fn aborted_turn_after_n_events_uses_the_next_seq_and_session_id() {
+        use crate::engine::ChildEntry;
+        use crate::event_sink::{Emit, EventSink};
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicBool;
+
+        struct Collecting(Mutex<Vec<String>>);
+        impl Emit for Collecting {
+            fn emit_json(&self, _name: &str, raw_json: &str) {
+                self.0.lock().unwrap().push(raw_json.to_string());
+            }
+        }
+
+        let emitter = Arc::new(Collecting(Mutex::new(Vec::new())));
+        let registry = Arc::new(ProcessRegistry::default());
+        let killed = Arc::new(AtomicBool::new(false));
+        let run_id = "abort-seq".to_string();
+        let virtual_pid = 4_000_000_203u32;
+        registry.insert(
+            run_id.clone(),
+            ChildEntry {
+                child: None,
+                pid: virtual_pid,
+                run_id: run_id.clone(),
+                killed: Arc::clone(&killed),
+                reader_abort: Arc::new(std::sync::OnceLock::new()),
+                stdin: None,
+                questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let core = TurnCore {
+            sink: EventSink::new(emitter.clone()),
+            registry: Arc::clone(&registry),
+            engine_id: "kimi".to_string(),
+            run_id: run_id.clone(),
+            db: None,
+        };
+        let path =
+            std::env::temp_dir().join(format!("ccgui-abort-seq-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(crate::db::Db::open_at(&path).unwrap());
+        crate::history::journal::begin(&db, &run_id, "kimi", Some("sess-native"), "/ws", 1, None)
+            .unwrap();
+        // Replace the plain sink with the executor journal. A repeated seq is
+        // INSERT OR IGNORE, so the abort terminal would not be stored and the
+        // run would stay reserved.
+        let core = TurnCore {
+            sink: EventSink::with_journal(emitter.clone(), Arc::clone(&db)),
+            ..core
+        };
+        let mut state = TurnState::new(None);
+        for text in ["one", "two", "three"] {
+            core.dispatch_event(&mut state, EngineEvent::Delta(text.into()));
+        }
+        core.dispatch_event(&mut state, EngineEvent::SessionId("sess-native".into()));
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _guard = HostTurnGuard::arm(&core, &state, killed, virtual_pid);
+            let _ = armed_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), armed_rx)
+            .await
+            .expect("guard should arm")
+            .expect("armed channel open");
+        task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        let raw = emitter.0.lock().unwrap();
+        let events = parse_events(&raw);
+        assert_unique_seqs(&events);
+        let terminal = events
+            .iter()
+            .find(|event| event["kind"] == "error")
+            .expect("abort emits an error terminal");
+        assert_eq!(
+            terminal["seq"].as_u64(),
+            Some(5),
+            "terminal must be last seq + 1: {events:?}"
+        );
+        assert_eq!(terminal["sessionId"], "sess-native");
+        let stored: i64 =
+            db.0.lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_events WHERE run_id=?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(
+            stored, 5,
+            "journal must keep the abort terminal as its own seq"
+        );
+        let run_state: String =
+            db.0.lock()
+                .query_row(
+                    "SELECT state FROM chat_runs WHERE run_id=?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(run_state, "error");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A normal terminal and an interrupt terminal each disarm the guard with
+    /// no await in between, so drop does not emit a second event. Sequences
+    /// stay unique on all three paths (abort is the test above).
+    #[tokio::test]
+    async fn normal_and_interrupt_terminals_do_not_share_a_seq_with_the_guard() {
+        use crate::engine::ChildEntry;
+        use crate::event_sink::{Emit, EventSink};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct Collecting(Mutex<Vec<String>>);
+        impl Emit for Collecting {
+            fn emit_json(&self, _name: &str, raw_json: &str) {
+                self.0.lock().unwrap().push(raw_json.to_string());
+            }
+        }
+
+        for killed_flag in [false, true] {
+            let emitter = Arc::new(Collecting(Mutex::new(Vec::new())));
+            let registry = Arc::new(ProcessRegistry::default());
+            let killed = Arc::new(AtomicBool::new(killed_flag));
+            let run_id = format!("settle-{killed_flag}");
+            let virtual_pid = 4_000_000_204u32;
+            registry.insert(
+                run_id.clone(),
+                ChildEntry {
+                    child: None,
+                    pid: virtual_pid,
+                    run_id: run_id.clone(),
+                    killed: Arc::clone(&killed),
+                    reader_abort: Arc::new(std::sync::OnceLock::new()),
+                    stdin: None,
+                    questions: Arc::new(Mutex::new(HashMap::new())),
+                    plans: Arc::new(Mutex::new(HashMap::new())),
+                },
+            );
+            let core = TurnCore {
+                sink: EventSink::new(emitter.clone()),
+                registry: Arc::clone(&registry),
+                engine_id: "kimi".to_string(),
+                run_id: run_id.clone(),
+                db: None,
+            };
+            let mut state = TurnState::new(Some("sess-native".into()));
+            let mut guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
+            core.dispatch_event(&mut state, EngineEvent::Delta("partial".into()));
+            let session_id = state.native_session_id.clone();
+            core.dispatch_event(
+                &mut state,
+                EngineEvent::Done {
+                    session_id,
+                    usage: None,
+                },
+            );
+            // The drivers do this on the next line, with no await. An abort
+            // can only drop the guard at an await point, so it cannot observe
+            // `armed == true` after this store.
+            guard.disarm_settled(killed.load(AtomicOrdering::SeqCst), false);
+            drop(guard);
+            core.sink.flush();
+            let events = parse_events(&emitter.0.lock().unwrap());
+            assert_unique_seqs(&events);
+            let terminals: Vec<_> = events
+                .iter()
+                .filter(|event| matches!(event["kind"].as_str(), Some("done") | Some("error")))
+                .collect();
+            assert_eq!(
+                terminals.len(),
+                1,
+                "guard must not emit after disarm: {events:?}"
+            );
+            assert_eq!(terminals[0]["seq"].as_u64(), Some(2));
+            assert_eq!(terminals[0]["sessionId"], "sess-native");
+            if killed_flag {
+                assert_eq!(terminals[0]["data"]["cancelled"], true);
+            }
+        }
     }
 }
