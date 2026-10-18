@@ -49,22 +49,25 @@ use std::time::Duration;
 use rusqlite::OptionalExtension;
 
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::io::BufReader;
+use tokio::process::{Child, ChildStdout, Command};
+
+use super::stdio_duplex::StdioWriter;
 use tokio::time::{timeout, Instant};
 
 use super::codex_read_only;
 use super::images;
-use super::qoder_session::{
-    encode_ndjson, jsonrpc_id_key, jsonrpc_request, jsonrpc_result_response, teardown, KILL_POLL,
-    PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT,
-};
 use super::plan_review::{self, PlanDecision, PlanReview, PlanReviewKind};
+#[cfg(target_os = "macos")]
+use super::qoder_session::teardown;
+use super::qoder_session::{
+    encode_ndjson, end_stdio_turn, jsonrpc_id_key, jsonrpc_request, jsonrpc_result_response,
+    KILL_POLL, PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT,
+};
 use super::{
     assistant_message, read_line_capped, spawn_stderr_capture, tool_call_message,
-    tool_result_patch, BuiltCommand, ChildEntry, Engine, EngineEvent, LineRead, SendRequest,
-    TurnCore, TurnState, VirtualRunGuard, MAX_LINE_BYTES,
+    tool_result_patch, BuiltCommand, ChildEntry, Engine, EngineEvent, HostTurnGuard, LineRead,
+    SendRequest, TurnCore, TurnState, MAX_LINE_BYTES,
 };
 
 /// Terminal marker for a kill-interrupted turn. The driver swallows it (the
@@ -130,39 +133,44 @@ struct TurnView {
 
 /// A turn's JSON-RPC channel to one `codex app-server` child.
 struct AppServer {
-    /// Shared with the registry: the answer command writes a parked question's
-    /// response on this same pipe, so the lock is the only serialization point
-    /// between the two writers.
-    stdin: Arc<TokioMutex<Option<ChildStdin>>>,
+    /// Shared with the registry. Enqueue-only, so the pump never waits on a
+    /// pipe the peer has stopped reading.
+    stdin: StdioWriter,
+    run_id: String,
     stdout: BufReader<ChildStdout>,
     line_buf: Vec<u8>,
     next_id: u64,
 }
 
 impl AppServer {
-    fn new(stdin: Arc<TokioMutex<Option<ChildStdin>>>, stdout: ChildStdout) -> Self {
+    fn new(stdin: StdioWriter, stdout: ChildStdout) -> Self {
         Self {
             stdin,
+            run_id: String::new(),
             stdout: BufReader::new(stdout),
             line_buf: Vec::new(),
             next_id: 1,
         }
     }
 
+    fn set_run_id(&mut self, run_id: &str) {
+        self.run_id = run_id.to_string();
+        self.stdin.set_run_id(run_id);
+    }
+
+    /// Stays async so every pump call site still awaits it. The body only
+    /// enqueues; it does not wait on the pipe.
+    #[allow(clippy::unused_async)]
     async fn write(&self, value: &Value) -> Result<(), String> {
-        let bytes = encode_ndjson(value)?;
-        let mut guard = self.stdin.lock().await;
-        let Some(stdin) = guard.as_mut() else {
+        if self.stdin.is_closed() {
             return Err("codex stdin is already closed".to_string());
-        };
-        stdin
-            .write_all(&bytes)
-            .await
-            .map_err(|error| format!("codex stdin write failed: {error}"))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|error| format!("codex stdin flush failed: {error}"))
+        }
+        let bytes = encode_ndjson(value)?;
+        self.stdin.enqueue_frame(bytes)?;
+        if let Some(error) = self.stdin.fatal() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Send a request and return the id key its reply will carry.
@@ -213,6 +221,10 @@ impl AppServer {
                     Some((thread_id, turn_id)) if !interrupted => {
                         interrupted = true;
                         deadline = deadline.min(Instant::now() + INTERRUPT_SETTLE_TIMEOUT);
+                        eprintln!(
+                            "[codex] settle run={} reason=interrupt label={label}",
+                            self.run_id
+                        );
                         self.request(
                             "turn/interrupt",
                             json!({ "threadId": thread_id, "turnId": turn_id }),
@@ -224,13 +236,35 @@ impl AppServer {
                     // Nothing to interrupt, so there is no turn left to settle.
                     // The answer command still needs the registry entry, so
                     // this returns rather than tearing the child down here.
-                    None => return Err(CANCELLED.to_string()),
+                    None => {
+                        eprintln!(
+                            "[codex] deadline run={} label={label} reason=interrupt",
+                            self.run_id
+                        );
+                        return Err(CANCELLED.to_string());
+                    }
                 }
+            }
+            if let Some(error) = self.stdin.fatal() {
+                eprintln!(
+                    "[codex] stdio fatal run={} label={label} reason={error}",
+                    self.run_id
+                );
+                return Err(error);
             }
             // Poll in short slices instead of blocking on the socket, so a kill
             // is honored within KILL_POLL rather than at the next line.
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                let reason = if interrupted {
+                    "interrupt"
+                } else {
+                    "idle-timeout"
+                };
+                eprintln!(
+                    "[codex] deadline run={} label={label} reason={reason}",
+                    self.run_id
+                );
                 return Err(if interrupted {
                     CANCELLED.to_string()
                 } else {
@@ -245,9 +279,16 @@ impl AppServer {
             {
                 // Idle tick with no complete line yet.
                 Err(_) => continue,
-                Ok(Err(error)) => return Err(format!("{label}: reading codex stdout: {error}")),
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "[codex] stdout error run={} label={label} reason={error}",
+                        self.run_id
+                    );
+                    return Err(format!("{label}: reading codex stdout: {error}"));
+                }
                 Ok(Ok(LineRead::Eof)) => {
-                    return Err(format!("{label}: the codex app-server closed stdout"))
+                    eprintln!("[codex] stdout eof run={} label={label}", self.run_id);
+                    return Err(format!("{label}: the codex app-server closed stdout"));
                 }
                 Ok(Ok(LineRead::TooLong)) => {
                     // Mirrors the host reader's own terminal message: a line
@@ -401,7 +442,14 @@ fn handle_notification(
         "item/started" | "item/completed" => {
             if let Some(item) = params.get("item") {
                 let thread_id = params.get("threadId").and_then(Value::as_str);
-                handle_item(core, state, view, item, method == "item/completed", thread_id);
+                handle_item(
+                    core,
+                    state,
+                    view,
+                    item,
+                    method == "item/completed",
+                    thread_id,
+                );
             }
         }
         // Plan body streaming (EXPERIMENTAL): draft preview only. The schema
@@ -1020,8 +1068,7 @@ fn decision_collaboration(
     let model = thread_model
         .filter(|m| !m.trim().is_empty())
         .ok_or_else(|| {
-            "thread/resume reported no model; cannot restate collaborationMode settings"
-                .to_string()
+            "thread/resume reported no model; cannot restate collaborationMode settings".to_string()
         })?;
     Ok(collaboration_mode(mode, model, thread_effort))
 }
@@ -1059,11 +1106,13 @@ fn decision_spec(
         PlanDecision::Approve => {
             let permission = review.exec_permission.trim();
             if permission.is_empty() {
-                return Err(
-                    "the plan review lost its execution permission snapshot".to_string()
-                );
+                return Err("the plan review lost its execution permission snapshot".to_string());
             }
-            ("default", EXECUTE_PLAN_PROMPT.to_string(), permission.to_string())
+            (
+                "default",
+                EXECUTE_PLAN_PROMPT.to_string(),
+                permission.to_string(),
+            )
         }
         PlanDecision::RequestChanges => {
             let feedback = feedback
@@ -1179,7 +1228,7 @@ fn spawn_app_server(command: &mut Command, workspace: &Path) -> Result<SpawnedCo
         };
     Ok(SpawnedCodex {
         child,
-        server: AppServer::new(Arc::new(TokioMutex::new(Some(stdin))), stdout),
+        server: AppServer::new(StdioWriter::spawn(stdin, "codex"), stdout),
         stderr_buf: spawn_stderr_capture(stderr),
         #[cfg(windows)]
         _tree_guard: tree_guard,
@@ -1203,12 +1252,11 @@ pub(super) async fn run_app_server_turn(
     view.plan_mode = req.permission.as_deref() == Some("plan");
     view.workspace = req.workspace.to_string_lossy().into_owned();
     let preassigned_session_id = req.session_id.clone();
-    // Abort-safe backstop: the by-name removals below only run when the task
-    // finishes normally. An abort or a panic would otherwise leave this run's
-    // keys pinning a concurrency slot until app exit.
-    let _registry_guard =
-        VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
+    // Abort-safe backstop: an aborted turn never reaches settle's dispatch.
+    let mut host_guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
     let result = turn_inner(&core, &mut state, &mut view, &req, built, &killed, None).await;
+    let was_killed = killed.load(Ordering::SeqCst);
+    let failed = result.is_err();
     settle(
         &core,
         &mut state,
@@ -1217,8 +1265,10 @@ pub(super) async fn run_app_server_turn(
         &killed,
         virtual_pid,
         preassigned_session_id,
-    )
-    .await;
+    );
+    // settle pushes the terminal and does not await. Disarm is the next
+    // statement, so a normal terminal and this guard cannot both emit.
+    host_guard.disarm_settled(was_killed, failed && !was_killed);
 }
 
 /// Shared settle for every virtual app-server run (ordinary turns and plan
@@ -1226,7 +1276,11 @@ pub(super) async fn run_app_server_turn(
 /// expire with it (a no-op for codex — next_turn never parks — kept as the
 /// host-driver contract the sibling drivers follow), then the turn reports
 /// either the engine's error or its own Done.
-async fn settle(
+///
+/// Synchronous on purpose. Callers disarm [`HostTurnGuard`] on the next
+/// line. An await between the terminal push and that disarm would let an
+/// abort drop the guard while it is still armed and emit a second terminal.
+fn settle(
     core: &TurnCore,
     state: &mut TurnState,
     view: &TurnView,
@@ -1329,11 +1383,22 @@ async fn drive(
     view.exit_unconfirmed = true;
     // The answer command writes a parked question's response on this same pipe,
     // so the registry gets the writer from the first frame on.
+    spawned.server.set_run_id(&core.run_id);
     core.registry
-        .set_stdin(&core.run_id, Arc::clone(&spawned.server.stdin));
-    let result =
-        handshake_and_turn(&mut spawned.server, core, state, view, req, killed, decision).await;
-    teardown(&mut spawned.child).await;
+        .set_stdin(&core.run_id, spawned.server.stdin.clone());
+    let result = handshake_and_turn(
+        &mut spawned.server,
+        core,
+        state,
+        view,
+        req,
+        killed,
+        decision,
+    )
+    .await;
+    // Queued frames first, then EOF, then the kill. settle() below is
+    // synchronous and disarms the guard on the next line after it returns.
+    end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
     view.exit_unconfirmed = !matches!(spawned.child.try_wait(), Ok(Some(_)));
     match result {
         Ok(()) => Ok(()),
@@ -1581,8 +1646,11 @@ async fn handshake_and_start(
         // Planning turn (EXPERIMENTAL): collaborationMode takes precedence
         // over the top-level model/effort fields, so only one of the two
         // shapes is sent. A missing model is schema-invalid — fail closed.
-        turn_params["collaborationMode"] =
-            plan_collaboration(req.model.as_deref(), thread_model.as_deref(), req.effort.as_deref())?;
+        turn_params["collaborationMode"] = plan_collaboration(
+            req.model.as_deref(),
+            thread_model.as_deref(),
+            req.effort.as_deref(),
+        )?;
     } else {
         if let Some(effort) = req.effort.as_deref() {
             turn_params["effort"] = json!(effort);
@@ -1705,7 +1773,9 @@ async fn verify_plan_item(
             &mut |value| route(core, state, view, value),
         )
         .await?
-        .ok_or_else(|| "the codex app-server ended before thread/turns/list was answered".to_string())?;
+        .ok_or_else(|| {
+            "the codex app-server ended before thread/turns/list was answered".to_string()
+        })?;
     check_plan_item(&page, &check.native_plan_id, &check.content_hash)
 }
 
@@ -1901,8 +1971,9 @@ async fn start_decision_turn(
         }
     };
     view.exit_unconfirmed = true;
+    spawned.server.set_run_id(&core.run_id);
     core.registry
-        .set_stdin(&core.run_id, Arc::clone(&spawned.server.stdin));
+        .set_stdin(&core.run_id, spawned.server.stdin.clone());
     // The ack is immediate by protocol; bound it like a resume, not like a
     // turn — the caller (an IPC handler) is waiting on this phase.
     let started = handshake_and_start(
@@ -1920,8 +1991,14 @@ async fn start_decision_turn(
         Ok(started) => started,
         Err(error) => {
             let error = terminal_message(error, &spawned.stderr_buf);
-            teardown(&mut spawned.child).await;
+            end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
             view.exit_unconfirmed = !matches!(spawned.child.try_wait(), Ok(Some(_)));
+            let reason = if killed.load(Ordering::SeqCst) {
+                "interrupt"
+            } else {
+                "error"
+            };
+            eprintln!("[codex] settle run={} reason={reason}", core.run_id);
             settle(
                 core,
                 state,
@@ -1930,8 +2007,7 @@ async fn start_decision_turn(
                 killed,
                 virtual_pid,
                 req.session_id.clone(),
-            )
-            .await;
+            );
             return Err(error);
         }
     };
@@ -1951,8 +2027,7 @@ async fn finish_decision_turn(
     mut state: TurnState,
     mut view: TurnView,
 ) {
-    let _registry_guard =
-        VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
+    let mut host_guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
     let result = match started {
         Some(started) => {
             pump_turn_to_end(
@@ -1968,8 +2043,10 @@ async fn finish_decision_turn(
         // The turn ended inside its own ack window.
         None => Ok(()),
     };
-    teardown(&mut spawned.child).await;
+    end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
     view.exit_unconfirmed = !matches!(spawned.child.try_wait(), Ok(Some(_)));
+    let was_killed = killed.load(Ordering::SeqCst);
+    let failed = result.is_err();
     let result = result.map_err(|error| terminal_message(error, &spawned.stderr_buf));
     settle(
         &core,
@@ -1979,13 +2056,14 @@ async fn finish_decision_turn(
         &killed,
         virtual_pid,
         preassigned_session_id,
-    )
-    .await;
+    );
+    // No await between settle's terminal push and disarm.
+    host_guard.disarm_settled(was_killed, failed && !was_killed);
 }
 
 /// Reduce a failure to what the user should read: the CLI's own rpc message,
-/// else its stderr tail (a crash or a rejected launch speaks there), else the
-/// driver's own words.
+/// else its captured stderr (a crash or a rejected launch speaks there), else
+/// the driver's own words.
 fn terminal_message(raw: String, stderr_buf: &Mutex<String>) -> String {
     if let Some(rest) = raw.strip_prefix("rpc:") {
         if let Some((_, message)) = rest.split_once(':') {
@@ -2094,45 +2172,76 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
         let mut command = Command::new("node");
         command.args(["-e", peer]);
         let mut spawned = spawn_app_server(&mut command, &std::env::temp_dir()).unwrap();
-        let key = spawned.server.request("initialize", json!({})).await.unwrap();
-        spawned.server.pump(
-            "initialize", Expect::Reply(&key), Instant::now() + Duration::from_secs(5),
-            &AtomicBool::new(false), None, &mut |_| Handled::Ignore,
-        ).await.unwrap();
+        let key = spawned
+            .server
+            .request("initialize", json!({}))
+            .await
+            .unwrap();
+        spawned
+            .server
+            .pump(
+                "initialize",
+                Expect::Reply(&key),
+                Instant::now() + Duration::from_secs(5),
+                &AtomicBool::new(false),
+                None,
+                &mut |_| Handled::Ignore,
+            )
+            .await
+            .unwrap();
         spawned
     }
 
     #[tokio::test]
     async fn turn_pump_keeps_active_output_past_the_initial_deadline() {
         let mut spawned = streaming_pump_peer().await;
-        spawned.server.request("fixture/start", json!({})).await.unwrap();
+        spawned
+            .server
+            .request("fixture/start", json!({}))
+            .await
+            .unwrap();
         let mut updates = 0;
-        let result = spawned.server.pump(
-            "turn", Expect::Turn, Instant::now() + Duration::from_secs(1),
-            &AtomicBool::new(false), None, &mut |value| {
-                match value["method"].as_str() {
+        let result = spawned
+            .server
+            .pump(
+                "turn",
+                Expect::Turn,
+                Instant::now() + Duration::from_secs(1),
+                &AtomicBool::new(false),
+                None,
+                &mut |value| match value["method"].as_str() {
                     Some("item/agentMessage/delta") => {
                         updates += 1;
                         Handled::Ignore
                     }
                     Some("turn/completed") => Handled::Ended,
                     _ => Handled::Ignore,
-                }
-            },
-        ).await;
-        teardown(&mut spawned.child).await;
+                },
+            )
+            .await;
+        end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
         assert_eq!(result.unwrap(), None);
-        assert_eq!(updates, 8, "the final output must survive a long active turn");
+        assert_eq!(
+            updates, 8,
+            "the final output must survive a long active turn"
+        );
     }
 
     #[tokio::test]
     async fn turn_pump_still_times_out_without_output() {
         let mut spawned = streaming_pump_peer().await;
-        let result = spawned.server.pump(
-            "turn", Expect::Turn, Instant::now() + Duration::from_millis(100),
-            &AtomicBool::new(false), None, &mut |_| Handled::Ignore,
-        ).await;
-        teardown(&mut spawned.child).await;
+        let result = spawned
+            .server
+            .pump(
+                "turn",
+                Expect::Turn,
+                Instant::now() + Duration::from_millis(100),
+                &AtomicBool::new(false),
+                None,
+                &mut |_| Handled::Ignore,
+            )
+            .await;
+        end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
         assert_eq!(result.unwrap_err(), "turn timed out");
     }
 
@@ -2140,18 +2249,127 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
     async fn turn_pump_output_does_not_extend_rpc_or_interrupt_deadlines() {
         for interrupted in [false, true] {
             let mut spawned = streaming_pump_peer().await;
-            spawned.server.request("fixture/start", json!({})).await.unwrap();
+            spawned
+                .server
+                .request("fixture/start", json!({}))
+                .await
+                .unwrap();
             let killed = AtomicBool::new(interrupted);
-            let expect = if interrupted { Expect::Turn } else { Expect::Reply("missing") };
-            let result = timeout(Duration::from_secs(2), spawned.server.pump(
-                "turn", expect, Instant::now() + Duration::from_secs(1), &killed,
-                interrupted.then_some(("thread-123", "turn-123")),
-                &mut |_| Handled::Ignore,
-            )).await;
-            teardown(&mut spawned.child).await;
+            let expect = if interrupted {
+                Expect::Turn
+            } else {
+                Expect::Reply("missing")
+            };
+            let result = timeout(
+                Duration::from_secs(2),
+                spawned.server.pump(
+                    "turn",
+                    expect,
+                    Instant::now() + Duration::from_secs(1),
+                    &killed,
+                    interrupted.then_some(("thread-123", "turn-123")),
+                    &mut |_| Handled::Ignore,
+                ),
+            )
+            .await;
+            end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
             let result = result.expect("output must not prolong the RPC or interrupt deadline");
-            assert_eq!(result.unwrap_err(), if interrupted { CANCELLED } else { "turn timed out" });
+            assert_eq!(
+                result.unwrap_err(),
+                if interrupted {
+                    CANCELLED
+                } else {
+                    "turn timed out"
+                }
+            );
         }
+    }
+
+    /// A full app-server turn (initialize, thread/start, turn/start,
+    /// turn/completed) goes through `drive`, which closes stdin after the
+    /// queued frames and waits until the writer and the watchdog have exited.
+    /// The peer stays up until stdin ends, so a writer that kept its own
+    /// sender would still be running when this returns.
+    #[tokio::test]
+    async fn app_server_turn_end_finishes_the_writer() {
+        let peer = r#"
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+require('node:readline').createInterface({input: process.stdin}).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') {
+    send({jsonrpc:'2.0', id: request.id, result: {}});
+  } else if (request.method === 'thread/start') {
+    send({jsonrpc:'2.0', id: request.id, result: {thread: {id: 'thread-1'}}});
+  } else if (request.method === 'turn/start') {
+    send({jsonrpc:'2.0', id: request.id, result: {turn: {id: 'turn-1'}}});
+    send({jsonrpc:'2.0', method: 'turn/completed', params: {turn: {status: 'completed'}}});
+  }
+});
+process.stdin.on('end', () => process.exit(0));
+"#;
+        let mut command = Command::new("node");
+        command.args(["-e", peer]);
+        let (core, registry, emitter) = test_core();
+        let entry = registry.get("test-run").expect("registry entry");
+        let killed = Arc::clone(&entry.killed);
+        let virtual_pid = entry.pid;
+        let request = SendRequest {
+            session_id: None,
+            workspace: std::env::temp_dir(),
+            prompt: "ping".into(),
+            prompt_contributions: Vec::new(),
+            native_compact: false,
+            images: vec![],
+            model: None,
+            effort: None,
+            service_tier: None,
+            permission: None,
+            additional_dirs: vec![],
+            provider_id: None,
+            computer_use: None,
+            memory_bot: None,
+            allowed_tools: None,
+        };
+        let built = BuiltCommand {
+            command,
+            stdin_payload: None,
+            keep_stdin_open: true,
+            cleanup_files: vec![],
+            mcp_restore: None,
+            preassigned_session_id: None,
+        };
+        timeout(
+            Duration::from_secs(10),
+            run_app_server_turn(core, request, built, killed, virtual_pid),
+        )
+        .await
+        .expect("app-server turn must finish, writer included");
+        let events = flushed_events(&emitter);
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event["kind"].as_str(), Some("done") | Some("error")))
+            .collect();
+        assert_eq!(terminals.len(), 1, "one terminal: {events:?}");
+        assert_eq!(terminals[0]["kind"], "done");
+        assert_eq!(terminals[0]["sessionId"], "thread-1");
+        let mut seqs = std::collections::HashSet::new();
+        for event in &events {
+            assert!(
+                seqs.insert(event["seq"].as_u64().expect("seq")),
+                "duplicate seq in {events:?}"
+            );
+        }
+        assert_eq!(registry.active_run_count(), 0);
+    }
+
+    fn flushed_events(emitter: &Arc<CollectingEmitter>) -> Vec<Value> {
+        let mut out = Vec::new();
+        for raw in emitter.0.lock().unwrap().iter() {
+            let parsed: Value = serde_json::from_str(raw).expect("flushed batch must be JSON");
+            let batch = parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]);
+            out.extend(batch);
+        }
+        out
     }
 
     #[cfg(target_os = "macos")]
@@ -2530,7 +2748,7 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
                 .kill_on_drop(true)
                 .spawn()
                 .expect("protocol test requires the project's Node runtime");
-            let stdin = Arc::new(TokioMutex::new(child.stdin.take()));
+            let stdin = StdioWriter::spawn(child.stdin.take().expect("stdin"), "test");
             let mut server = AppServer::new(stdin, child.stdout.take().unwrap());
             let req = SendRequest {
                 session_id: (mode != "new").then(|| "thread-123".into()),
@@ -2636,7 +2854,8 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
         let events = flushed(&core, &emitter);
         assert!(
             events.iter().any(|(kind, data)| {
-                kind == "served" && data.get("model").and_then(Value::as_str) == Some("gpt-5.6-cyber")
+                kind == "served"
+                    && data.get("model").and_then(Value::as_str) == Some("gpt-5.6-cyber")
             }),
             "{events:?}"
         );
@@ -2987,8 +3206,14 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
         assert_eq!(
             events,
             vec![
-                ("plan_draft".to_string(), json!({"planId": "thread-1/plan", "text": "# Dra", "replace": false})),
-                ("plan_draft".to_string(), json!({"planId": "thread-1/plan", "text": "ft", "replace": false})),
+                (
+                    "plan_draft".to_string(),
+                    json!({"planId": "thread-1/plan", "text": "# Dra", "replace": false})
+                ),
+                (
+                    "plan_draft".to_string(),
+                    json!({"planId": "thread-1/plan", "text": "ft", "replace": false})
+                ),
             ]
         );
         // 非计划轮:同样的 delta 一律忽略,永不进入审批主干。
@@ -3239,5 +3464,86 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
         assert_eq!(events[0].0, "warn");
         assert_eq!(events[0].1, json!("upstream 502"));
         assert!(!state.saw_error, "a retry must not settle the run");
+    }
+
+    /// A server request answered with a large frame, while the peer is blocked
+    /// in `fs.writeSync` on a multi-megabyte stdout burst, must not stall the
+    /// pump. The peer only reads stdin after that burst.
+    #[tokio::test]
+    async fn codex_full_duplex_burst_does_not_deadlock() {
+        let bytes = 2 * 1024 * 1024usize;
+        let dir = std::env::temp_dir().join(format!("ccgui-codex-duplex-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("peer.js");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+const fs = require('fs');
+const bytes = {bytes};
+fs.writeSync(1, JSON.stringify({{jsonrpc:'2.0', id:'q-1', method:'item/tool/requestUserInput', params:{{}}}}) + '\n');
+const chunk = 'z'.repeat(32 * 1024);
+let sent = 0;
+while (sent < bytes) {{
+  const line = JSON.stringify({{jsonrpc:'2.0', method:'item/agentMessage/delta', params:{{delta:chunk}}}}) + '\n';
+  fs.writeSync(1, line);
+  sent += Buffer.byteLength(line);
+}}
+let acc = Buffer.alloc(0);
+const buf = Buffer.alloc(65536);
+let answer = null;
+while (!answer) {{
+  const n = fs.readSync(0, buf, 0, buf.length);
+  if (n <= 0) break;
+  acc = Buffer.concat([acc, buf.subarray(0, n)]);
+  let nl;
+  while ((nl = acc.indexOf(10)) >= 0) {{
+    const line = acc.subarray(0, nl).toString('utf8');
+    acc = acc.subarray(nl + 1);
+    if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    if (String(msg.id) === 'q-1') answer = msg;
+  }}
+}}
+const ok = !!(answer && answer.result && answer.result.content && answer.result.content.length >= bytes);
+fs.writeSync(1, JSON.stringify({{jsonrpc:'2.0', method:'turn/completed', params:{{turn:{{status: ok ? 'completed' : 'failed'}}}}}}) + '\n');
+"#,
+                bytes = bytes,
+            ),
+        )
+        .unwrap();
+        let mut command = Command::new("node");
+        command.arg(&script);
+        let mut spawned = spawn_app_server(&mut command, &dir).expect("node");
+        let mut answered = false;
+        let outcome = timeout(
+            Duration::from_secs(8),
+            spawned.server.pump(
+                "turn",
+                Expect::Turn,
+                Instant::now() + Duration::from_secs(20),
+                &AtomicBool::new(false),
+                None,
+                &mut |value| match value["method"].as_str() {
+                    Some("item/tool/requestUserInput") if !answered => {
+                        answered = true;
+                        let blob = "a".repeat(bytes);
+                        Handled::Answer(jsonrpc_result_response(
+                            &value["id"],
+                            json!({ "content": blob }),
+                        ))
+                    }
+                    Some("turn/completed") => Handled::Ended,
+                    _ => Handled::Ignore,
+                },
+            ),
+        )
+        .await;
+        end_stdio_turn(&spawned.server.stdin, &mut spawned.child).await;
+        outcome
+            .expect("full-duplex burst must not deadlock the read loop")
+            .expect("turn must complete");
+        assert!(answered, "the server request must be answered");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

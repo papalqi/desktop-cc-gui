@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{dsh_images, EngineEvent, SendRequest, TurnCore, TurnState, VirtualRunGuard};
+use super::{dsh_images, EngineEvent, HostTurnGuard, SendRequest, TurnCore, TurnState};
 use crate::dsh_host::host_call;
 
 /// 提取并规范化上下文窗口字段
@@ -106,11 +106,11 @@ pub(crate) async fn run_host_turn(
     let mut view = TurnView::default();
     let preassigned_session_id = req.session_id.clone();
     view.workspace = req.workspace.to_string_lossy().into_owned();
-    // Abort-safe backstop: the by-name removals below only run when the task
-    // finishes normally. An abort or a panic would otherwise leave this run's
-    // keys pinning a concurrency slot until app exit.
-    let _registry_guard =
-        VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
+    // Abort-safe backstop: an aborted turn never reaches the dispatch below,
+    // so the guard emits the one terminal event and frees the registry keys.
+    // The registry kill path can abort this task: send_host_stream stores its
+    // abort handle, and kill() aborts that handle after the settle grace.
+    let mut host_guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
     let result = turn_inner(&core, &mut state, &mut view, &req, &host, &killed).await;
     // Pending questions die with the turn: settle their cards BEFORE any
     // terminal dispatch, or the monotonic saw_done/saw_error guard in
@@ -130,13 +130,17 @@ pub(crate) async fn run_host_turn(
         // 停住的计划审批随运行消亡即过期（P1 收尾义务，PRD §8 防线 3）。
         super::reader::expire_parked_plans(&core, &mut state, &key);
     }
+    let was_killed = killed.load(Ordering::SeqCst);
+    let failed = result.is_err();
     if let Err(error) = result {
         core.dispatch_event(&mut state, EngineEvent::Error(error));
     }
     // An interrupted run commits its partial output as a normal turn end —
-    // the same contract as the SIGKILL'd process path.
+    // the same contract as the SIGKILL'd process path. That done is the only
+    // terminal: disarm before any later await so the guard cannot also emit
+    // done{cancelled:true}.
     if !state.saw_done && !state.saw_error {
-        let usage = if killed.load(Ordering::SeqCst) {
+        let usage = if was_killed {
             None
         } else {
             view.last_usage.clone()
@@ -144,6 +148,8 @@ pub(crate) async fn run_host_turn(
         let session_id = state.native_session_id.clone();
         core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
     }
+    // No await between the terminal dispatch and disarm.
+    host_guard.disarm_settled(was_killed, failed && !was_killed);
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     // Clean up both the native session id (if the engine reported one) and
     // the preassigned session id (if we resumed an existing conversation).
@@ -450,9 +456,10 @@ async fn await_plan_mode_active(ws: &mut Ws) -> Result<(), String> {
                 {
                     continue;
                 }
-                if value.pointer("/value/event/type").and_then(Value::as_str)
-                    == Some("plan/mode")
-                    && value.pointer("/value/event/data/active").and_then(Value::as_bool)
+                if value.pointer("/value/event/type").and_then(Value::as_str) == Some("plan/mode")
+                    && value
+                        .pointer("/value/event/data/active")
+                        .and_then(Value::as_bool)
                         == Some(true)
                 {
                     return Ok(());
@@ -836,8 +843,7 @@ async fn park_plan_review(
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty());
-    let (Some(content), Some(approve), Some(question_id)) = (content, approve, question_id)
-    else {
+    let (Some(content), Some(approve), Some(question_id)) = (content, approve, question_id) else {
         // fail-closed：正文/批准标签/问题 id 缺一都无法构造忠实于原生语义
         // 的审批——拒绝该 waterfall 让 host 解除阻塞并警告，绝不降级为普通
         // 问题卡（那会丢失审批语义）。
@@ -1802,9 +1808,13 @@ mod tests {
                 .any(|(kind, _)| kind == "plan_review" || kind == "question"),
             "{kinds:?}"
         );
-        let empty = registry
-            .get("test-run")
-            .map(|entry| entry.plans.lock().map(|plans| plans.is_empty()).unwrap_or(true));
+        let empty = registry.get("test-run").map(|entry| {
+            entry
+                .plans
+                .lock()
+                .map(|plans| plans.is_empty())
+                .unwrap_or(true)
+        });
         assert_eq!(empty, Some(true));
     }
 
@@ -1833,6 +1843,421 @@ mod tests {
         assert!(!plan_command_listed(&json!([{ "name": "compact" }])));
         assert!(!plan_command_listed(&json!([])));
         assert!(!plan_command_listed(&Value::Null));
+    }
+
+    const NATIVE_SESSION: &str = "sess-native";
+    const PREASSIGNED_SESSION: &str = "sess-pre";
+
+    /// What the mock does after the two text deltas.
+    #[derive(Clone, Copy)]
+    enum MockTail {
+        /// Keep the mux open so the turn stays parked on the read.
+        Hang,
+        /// `turn/end` so the driver settles itself.
+        TurnEnd,
+    }
+
+    struct HomeEnv {
+        prev_home: Option<std::ffi::OsString>,
+        prev_profile: Option<std::ffi::OsString>,
+    }
+
+    impl HomeEnv {
+        fn set(path: &std::path::Path) -> Self {
+            let prev_home = std::env::var_os("HOME");
+            let prev_profile = std::env::var_os("USERPROFILE");
+            std::env::set_var("HOME", path);
+            std::env::set_var("USERPROFILE", path);
+            Self {
+                prev_home,
+                prev_profile,
+            }
+        }
+    }
+
+    impl Drop for HomeEnv {
+        fn drop(&mut self) {
+            restore_var("HOME", self.prev_home.take());
+            restore_var("USERPROFILE", self.prev_profile.take());
+        }
+    }
+
+    fn restore_var(key: &str, prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    fn parse_flushed(raw: &[String]) -> Vec<Value> {
+        let mut out = Vec::new();
+        for batch in raw {
+            let parsed: Value = serde_json::from_str(batch).expect("flushed batch");
+            let items = parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]);
+            out.extend(items);
+        }
+        out
+    }
+
+    fn assert_unique_seqs(events: &[Value]) {
+        let mut seen = std::collections::HashSet::new();
+        for event in events {
+            let seq = event["seq"].as_u64().expect("seq");
+            assert!(seen.insert(seq), "duplicate seq {seq} in {events:?}");
+        }
+    }
+
+    fn terminals(events: &[Value]) -> Vec<&Value> {
+        events
+            .iter()
+            .filter(|event| matches!(event["kind"].as_str(), Some("done") | Some("error")))
+            .collect()
+    }
+
+    /// Mock dsh host on an ephemeral port: describe/create/prompt over HTTP
+    /// and a mux that replays two deltas. Settings point at it through a
+    /// scratch HOME so the real host and the user's settings.json stay
+    /// untouched.
+    async fn spawn_mock_host(tail: MockTail) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock dsh host");
+        let port = listener.local_addr().expect("port").port();
+        let prompted = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                handlers.spawn(handle_mock_conn(socket, Arc::clone(&prompted), tail));
+            }
+        });
+        (port, task)
+    }
+
+    async fn handle_mock_conn(
+        mut socket: tokio::net::TcpStream,
+        prompted: Arc<tokio::sync::Notify>,
+        tail: MockTail,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut peeked = [0u8; 2048];
+        let mut head = String::new();
+        for _ in 0..50 {
+            match socket.peek(&mut peeked).await {
+                Ok(0) => tokio::time::sleep(Duration::from_millis(5)).await,
+                Ok(n) => {
+                    head = String::from_utf8_lossy(&peeked[..n]).to_string();
+                    if head.contains("\r\n\r\n") || n == peeked.len() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(_) => return,
+            }
+        }
+        let is_ws = head.contains("websocket") || head.contains("/api/remote.mux");
+        if is_ws {
+            let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                return;
+            };
+            for _ in 0..2 {
+                let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+            }
+            let snapshot = json!({"type":"item","streamId":"follow","value":{"type":"snapshot"}});
+            let ready =
+                json!({"type":"item","streamId":"events","value":{"type":"ready","clientId":"c1"}});
+            let _ = ws.send(Message::Text(snapshot.to_string().into())).await;
+            let _ = ws.send(Message::Text(ready.to_string().into())).await;
+            prompted.notified().await;
+            for text in ["one", "two"] {
+                let frame = json!({
+                    "type": "item",
+                    "streamId": "follow",
+                    "value": {
+                        "type": "assistant-stream",
+                        "frame": { "type": "chunk", "chunk": { "type": "text-delta", "text": text } }
+                    }
+                });
+                let _ = ws.send(Message::Text(frame.to_string().into())).await;
+            }
+            if matches!(tail, MockTail::TurnEnd) {
+                let end = json!({
+                    "type": "item",
+                    "streamId": "follow",
+                    "value": {
+                        "type": "event",
+                        "event": { "type": "turn/end", "data": { "reason": { "kind": "completed" } } }
+                    }
+                });
+                let _ = ws.send(Message::Text(end.to_string().into())).await;
+            }
+            std::future::pending::<()>().await;
+            return;
+        }
+
+        let mut data = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                break;
+            }
+            data.push(byte[0]);
+            if data.windows(4).any(|window| window == b"\r\n\r\n") || data.len() > 65536 {
+                break;
+            }
+        }
+        let request_head = String::from_utf8_lossy(&data);
+        let content_length: usize = request_head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            let _ = socket.read_exact(&mut body).await;
+        }
+        let line = request_head.lines().next().unwrap_or("");
+        if line.contains("session/prompt") {
+            prompted.notify_one();
+        }
+        let value = if line.contains("workspace/create") {
+            json!({ "workspace": { "workspaceId": "ws-1" } })
+        } else if line.contains("session/create") {
+            json!({ "sessionId": NATIVE_SESSION })
+        } else {
+            json!({})
+        };
+        let body = json!({
+            "type": "server-response",
+            "rpcId": "mock",
+            "result": { "ok": true, "value": value }
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    }
+
+    fn point_settings_at(port: u16) {
+        let settings = crate::settings::AppSettings {
+            dsh_host: Some("127.0.0.1".to_string()),
+            dsh_port: Some(port),
+            ..crate::settings::AppSettings::default()
+        };
+        let path = crate::paths::settings_path();
+        std::fs::create_dir_all(path.parent().expect("settings dir")).expect("settings dir");
+        std::fs::write(
+            path,
+            serde_json::to_string(&settings).expect("settings json"),
+        )
+        .expect("write scratch settings");
+    }
+
+    struct TurnParts {
+        emitter: Arc<CollectingEmitter>,
+        registry: Arc<ProcessRegistry>,
+        killed: Arc<AtomicBool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn start_turn(pid: u32, run_id: &str) -> TurnParts {
+        let emitter = Arc::new(CollectingEmitter(StdMutex::new(Vec::new())));
+        let registry = Arc::new(ProcessRegistry::default());
+        let killed = Arc::new(AtomicBool::new(false));
+        let entry = crate::engine::registry::ChildEntry {
+            child: None,
+            pid,
+            run_id: run_id.to_string(),
+            killed: Arc::clone(&killed),
+            reader_abort: Arc::new(std::sync::OnceLock::new()),
+            stdin: None,
+            questions: Arc::new(StdMutex::new(HashMap::new())),
+            plans: Arc::new(StdMutex::new(HashMap::new())),
+        };
+        registry.insert(run_id.to_string(), entry.clone());
+        registry.insert_alias(PREASSIGNED_SESSION.to_string(), entry);
+        let core = TurnCore {
+            sink: EventSink::new(emitter.clone()),
+            registry: Arc::clone(&registry),
+            engine_id: "dsh".to_string(),
+            run_id: run_id.to_string(),
+            db: None,
+        };
+        let req = SendRequest {
+            session_id: Some(PREASSIGNED_SESSION.to_string()),
+            workspace: PathBuf::from("/tmp"),
+            prompt: "hello".to_string(),
+            prompt_contributions: Vec::new(),
+            native_compact: false,
+            images: Vec::new(),
+            model: None,
+            effort: None,
+            service_tier: None,
+            permission: None,
+            additional_dirs: Vec::new(),
+            provider_id: None,
+            computer_use: None,
+            memory_bot: None,
+            allowed_tools: None,
+        };
+        let task = tokio::spawn(run_host_turn(
+            core,
+            req,
+            Arc::new(crate::dsh_host::DshHostState::default()),
+            Arc::clone(&killed),
+            pid,
+        ));
+        TurnParts {
+            emitter,
+            registry,
+            killed,
+            task,
+        }
+    }
+
+    async fn wait_for_deltas(emitter: &CollectingEmitter) -> Vec<Value> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let events = parse_flushed(&emitter.0.lock().unwrap());
+            let deltas = events
+                .iter()
+                .filter(|event| event["kind"] == "delta")
+                .count();
+            if deltas >= 2
+                && events
+                    .iter()
+                    .any(|event| event["kind"] == "session" && event["data"] == NATIVE_SESSION)
+            {
+                return events;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("dsh mock turn did not emit session + 2 deltas: {events:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn assert_keys_freed(registry: &ProcessRegistry, run_id: &str) {
+        assert!(registry.get(run_id).is_none(), "run id still registered");
+        assert!(
+            registry.get(NATIVE_SESSION).is_none(),
+            "native session id still registered"
+        );
+        assert!(
+            registry.get(PREASSIGNED_SESSION).is_none(),
+            "preassigned session id still registered"
+        );
+        assert_eq!(registry.active_run_count(), 0);
+    }
+
+    /// Abort after the session announcement and two deltas. The registry
+    /// kill path stores this task's abort handle (`send_host_stream`) and
+    /// aborts it after the settle grace. A killed abort is `done` with
+    /// `cancelled`; a plain abort is `error`. Either way exactly one
+    /// terminal continues the sequence, and every key the run owned is gone.
+    #[tokio::test]
+    // The lock is the crate-wide HOME serializer. Releasing it at an await
+    // would let another test point home_dir at a different settings file.
+    #[allow(clippy::await_holding_lock)]
+    async fn aborted_turn_emits_one_terminal_with_the_next_seq_and_frees_keys() {
+        let _home_lock = crate::paths::HOME_ENV_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("ccgui-dsh-abort-{}", uuid::Uuid::new_v4()));
+        let _env = HomeEnv::set(&home);
+        for (killed_abort, pid, run_id) in [
+            (true, 4_000_000_311u32, "dsh-abort-killed"),
+            (false, 4_000_000_312u32, "dsh-abort-plain"),
+        ] {
+            let (port, server) = spawn_mock_host(MockTail::Hang).await;
+            point_settings_at(port);
+            tokio::task::yield_now().await;
+            let turn = start_turn(pid, run_id);
+            let before = wait_for_deltas(&turn.emitter).await;
+            assert!(
+                terminals(&before).is_empty(),
+                "parked turn already settled: {before:?}"
+            );
+            let n = before.len();
+            if killed_abort {
+                turn.killed.store(true, Ordering::SeqCst);
+            }
+            turn.task.abort();
+            let joined = tokio::time::timeout(Duration::from_secs(2), turn.task)
+                .await
+                .expect("abort must drop the turn");
+            assert!(
+                joined.expect_err("abort cancels the task").is_cancelled(),
+                "expected the turn task to be aborted"
+            );
+            let events = parse_flushed(&turn.emitter.0.lock().unwrap());
+            assert_unique_seqs(&events);
+            let done = terminals(&events);
+            assert_eq!(done.len(), 1, "exactly one terminal: {events:?}");
+            assert_eq!(done[0]["seq"].as_u64(), Some((n as u64) + 1), "{events:?}");
+            assert_eq!(done[0]["sessionId"], NATIVE_SESSION, "{events:?}");
+            if killed_abort {
+                assert_eq!(done[0]["kind"], "done", "{events:?}");
+                assert_eq!(done[0]["data"]["cancelled"], true, "{events:?}");
+                assert!(done[0]["data"]["usage"].is_null(), "{events:?}");
+            } else {
+                assert_eq!(done[0]["kind"], "error", "{events:?}");
+                assert_eq!(done[0]["data"], "turn aborted before it could settle");
+            }
+            assert_keys_freed(&turn.registry, run_id);
+            server.abort();
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A turn the driver finishes itself emits one terminal and never reuses
+    /// a sequence. Covers a normal `turn/end` and a user stop the driver
+    /// observes (done, no usage) so that path cannot also emit the guard's
+    /// abort terminal.
+    #[tokio::test]
+    // Same HOME lock as the abort test: it has to stay held across the awaits.
+    #[allow(clippy::await_holding_lock)]
+    async fn normal_turn_emits_one_terminal_with_unique_seqs() {
+        let _home_lock = crate::paths::HOME_ENV_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("ccgui-dsh-normal-{}", uuid::Uuid::new_v4()));
+        let _env = HomeEnv::set(&home);
+        for (user_stop, tail, pid, run_id) in [
+            (false, MockTail::TurnEnd, 4_000_000_313u32, "dsh-normal"),
+            (true, MockTail::Hang, 4_000_000_314u32, "dsh-user-stop"),
+        ] {
+            let (port, server) = spawn_mock_host(tail).await;
+            point_settings_at(port);
+            tokio::task::yield_now().await;
+            let turn = start_turn(pid, run_id);
+            let _ = wait_for_deltas(&turn.emitter).await;
+            if user_stop {
+                turn.killed.store(true, Ordering::SeqCst);
+            }
+            let joined = tokio::time::timeout(Duration::from_secs(5), turn.task)
+                .await
+                .unwrap_or_else(|_| panic!("{run_id} did not settle"));
+            joined.expect("turn task");
+            let events = parse_flushed(&turn.emitter.0.lock().unwrap());
+            assert_unique_seqs(&events);
+            let done = terminals(&events);
+            assert_eq!(done.len(), 1, "exactly one terminal: {events:?}");
+            assert_eq!(done[0]["kind"], "done", "{events:?}");
+            assert_eq!(done[0]["sessionId"], NATIVE_SESSION, "{events:?}");
+            if user_stop {
+                assert!(done[0]["data"]["usage"].is_null(), "{events:?}");
+            }
+            assert_keys_freed(&turn.registry, run_id);
+            server.abort();
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// 标题取正文首个 markdown 标题（与 dsh-plan-mode firstHeading 同

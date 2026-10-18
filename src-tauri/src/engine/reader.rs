@@ -13,9 +13,10 @@ use super::Engine;
 use crate::event_sink;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 #[cfg(test)]
 use tokio::process::Command;
 use tokio::process::{Child, ChildStderr, ChildStdout};
@@ -45,73 +46,132 @@ pub(crate) fn spawn_stdin_writer(
     child: &mut Child,
     payload: Option<String>,
     keep_open: bool,
-) -> Option<Arc<TokioMutex<Option<tokio::process::ChildStdin>>>> {
-    if !keep_open {
-        let Some(payload) = payload else {
-            return None;
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            tokio::spawn(async move {
-                let _ = stdin.write_all(payload.as_bytes()).await;
-                let _ = stdin.write_all(b"\n").await;
-                // drop closes stdin -> EOF
-            });
-        }
+    run_id: &str,
+) -> Option<super::stdio_duplex::StdioWriter> {
+    if !keep_open && payload.is_none() {
         return None;
     }
-    let keep = Arc::new(TokioMutex::new(child.stdin.take()));
+    let stdin = child.stdin.take()?;
+    let writer = super::stdio_duplex::StdioWriter::spawn(stdin, run_id);
     if let Some(payload) = payload {
-        let handle = Arc::clone(&keep);
-        tokio::spawn(async move {
-            let mut guard = handle.lock().await;
-            if let Some(stdin) = guard.as_mut() {
-                let _ = stdin.write_all(payload.as_bytes()).await;
-                let _ = stdin.write_all(b"\n").await;
-            }
-        });
+        let mut bytes = payload.into_bytes();
+        if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        // Best effort, same as the previous fire-and-forget payload task.
+        // A queue overflow is a typed error the turn can observe on keep-open
+        // handles; a one-shot payload has no turn loop to report it to.
+        if let Err(error) = writer.enqueue_frame(bytes) {
+            eprintln!("[stdio] warn: stdin payload rejected run={run_id} reason={error}");
+        }
     }
-    Some(keep)
+    if !keep_open {
+        writer.close();
+        None
+    } else {
+        Some(writer)
+    }
 }
-/// Diagnostics ring: keeps the last 4KB for the error banner.
+const DIAGNOSTIC_RING_CAP: usize = 4096;
+const DIAGNOSTIC_RING_HEAD_CAP: usize = 2048;
+const DIAGNOSTIC_RING_TAIL_CAP: usize =
+    DIAGNOSTIC_RING_CAP - DIAGNOSTIC_RING_HEAD_CAP - DIAGNOSTIC_RING_MARKER.len();
+const DIAGNOSTIC_RING_MARKER: &str = "\n... [truncated] ...\n";
+
+/// Diagnostics ring: keeps the head and latest tail within 4KB so a long
+/// stack trace cannot hide its original failure message from the error banner.
 pub(crate) fn ring_push(buf: &Arc<Mutex<String>>, text: &str) {
-    const CAP: usize = 4096;
     let mut guard = match buf.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     guard.push_str(text);
-    if guard.len() > CAP {
-        // drain panics on a non-char-boundary start — snap forward. The old
-        // stderr ring could panic mid-CJK here, silently killing the
-        // capture task and starving the error banner of the failure text.
-        let mut keep = guard.len() - CAP;
+    if guard.len() <= DIAGNOSTIC_RING_CAP {
+        return;
+    }
+    if let Some(marker_at) = guard.find(DIAGNOSTIC_RING_MARKER) {
+        // The head is already settled; only slide the tail window forward.
+        let tail_at = marker_at + DIAGNOSTIC_RING_MARKER.len();
+        let mut keep = (guard.len() - DIAGNOSTIC_RING_TAIL_CAP).max(tail_at);
         while !guard.is_char_boundary(keep) {
             keep += 1;
         }
-        guard.drain(..keep);
+        guard.drain(tail_at..keep);
+        return;
     }
+    let mut head_at = DIAGNOSTIC_RING_HEAD_CAP;
+    while !guard.is_char_boundary(head_at) {
+        head_at -= 1;
+    }
+    // drain/slice panic on non-char-boundary starts — snap forward. The old
+    // stderr ring could panic mid-CJK here, silently killing the capture task
+    // and starving the error banner of the failure text.
+    let mut tail_at = guard.len() - DIAGNOSTIC_RING_TAIL_CAP;
+    while !guard.is_char_boundary(tail_at) {
+        tail_at += 1;
+    }
+    let tail = guard[tail_at..].to_string();
+    guard.truncate(head_at);
+    guard.push_str(DIAGNOSTIC_RING_MARKER);
+    guard.push_str(&tail);
 }
-/// Stderr capture ring: keeps the last 4KB for the error banner.
+/// One stderr read is capped so a CLI that writes without newlines cannot
+/// stall the drain or buffer an unbounded line. Invalid UTF-8 is decoded
+/// lossily; the task stops only on EOF or a real IO error.
+const STDERR_CHUNK_CAP: usize = 64 * 1024;
+
+/// Stderr capture ring: keeps the first failure and latest stack frames.
 pub(crate) fn spawn_stderr_capture(stderr: ChildStderr) -> Arc<Mutex<String>> {
     let buf = Arc::new(Mutex::new(String::new()));
     let target = Arc::clone(&buf);
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
+        let mut chunk = Vec::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => ring_push(&target, &line),
+            match read_stderr_chunk(&mut reader, &mut chunk).await {
+                Ok(0) => break,
+                Ok(_) => ring_push(&target, &String::from_utf8_lossy(&chunk)),
+                Err(error) => {
+                    eprintln!("[stderr] capture stopped: {error}");
+                    break;
+                }
             }
         }
     });
     buf
 }
+
+async fn read_stderr_chunk<R>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buf.clear();
+    loop {
+        if buf.len() >= STDERR_CHUNK_CAP {
+            return Ok(buf.len());
+        }
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len());
+        }
+        let room = STDERR_CHUNK_CAP - buf.len();
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(available.len())
+            .min(room);
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if buf.last() == Some(&b'\n') || buf.len() >= STDERR_CHUNK_CAP {
+            return Ok(buf.len());
+        }
+    }
+}
 // ==================== stderr redaction ====================
 
 /// Engine stderr can echo the channel credentials from the CLI's own config files; redact credential
-/// shapes before the tail is shown to the user in an error banner.
+/// shapes before the captured excerpt is shown to the user in an error banner.
 pub(super) fn redact_secrets(text: &str) -> String {
     use std::sync::LazyLock;
     static PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
@@ -133,7 +193,12 @@ pub(super) fn redact_secrets(text: &str) -> String {
 }
 /// Mutable per-run streaming state shared by the reader loop's dispatch.
 pub(crate) struct TurnState {
-    seq: u64,
+    /// Next sequence number is `fetch_add + 1`. Shared with [`HostTurnGuard`]
+    /// so an abort terminal continues this run instead of reusing seq 1.
+    seq: Arc<AtomicU64>,
+    /// Live native session id. The guard reads this at emit time, including
+    /// an id learned after the guard was armed.
+    session_slot: Arc<Mutex<Option<String>>>,
     started_at: Option<u64>,
     pub(crate) native_session_id: Option<String>,
     pub(crate) saw_done: bool,
@@ -159,7 +224,8 @@ pub(crate) struct TurnState {
 impl TurnState {
     pub(crate) fn new(preassigned: Option<String>) -> Self {
         Self {
-            seq: 0,
+            seq: Arc::new(AtomicU64::new(0)),
+            session_slot: Arc::new(Mutex::new(preassigned.clone())),
             started_at: None,
             native_session_id: preassigned,
             saw_done: false,
@@ -215,12 +281,12 @@ impl TurnState {
             self.pending_terminal = Some((kind.to_string(), data));
             return;
         }
-        self.seq += 1;
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut payload = serde_json::json!({
             "runId": run_id,
             "sessionId": self.native_session_id,
             "engine": engine_id,
-            "seq": self.seq,
+            "seq": seq,
             "kind": kind,
             "data": data,
             // Emit-side timestamp (Unix ms): plugins compute throughput from
@@ -307,11 +373,14 @@ pub(crate) fn expire_parked_plans(core: &TurnCore, state: &mut TurnState, key: &
         .collect();
     if let Ok(expired) = plan_review::expire_reviews(db, &parked) {
         for (plan_id, revision, _previous) in expired {
-            core.dispatch_event(state, EngineEvent::PlanReviewSettled {
-                plan_id,
-                revision,
-                status: plan_review::PlanStatus::Expired.as_str().to_string(),
-            });
+            core.dispatch_event(
+                state,
+                EngineEvent::PlanReviewSettled {
+                    plan_id,
+                    revision,
+                    status: plan_review::PlanStatus::Expired.as_str().to_string(),
+                },
+            );
         }
     }
 }
@@ -323,16 +392,21 @@ impl TurnCore {
         if state.native_session_id.as_deref() == Some(id) {
             return;
         }
-        state.native_session_id = Some(id.to_string());
-        self.registry.rekey(&self.run_id, id.to_string());
-        self.registry.note_session(&self.run_id, id);
+        let id = id.to_string();
+        state.native_session_id = Some(id.clone());
+        *state
+            .session_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+        self.registry.rekey(&self.run_id, id.clone());
+        self.registry.note_session(&self.run_id, &id);
         if announce {
             state.push(
                 &self.sink,
                 &self.run_id,
                 &self.engine_id,
                 "session",
-                Value::String(id.to_string()),
+                Value::String(id),
             );
         }
     }
@@ -396,8 +470,7 @@ impl TurnCore {
                 // explicit start marker keep running: claude streams tool
                 // arguments inside the same response and closes it at
                 // message_stop.
-                let response_end = role == "assistant"
-                    || (role == "tool" && result.is_none());
+                let response_end = role == "assistant" || (role == "tool" && result.is_none());
                 if response_end && !state.gen_explicit {
                     state.gen_end();
                 }
@@ -605,27 +678,33 @@ impl TurnCore {
                 // {revision, route, frames, ...} 顶层平铺——context 是适配器
                 // 产出的对象,revision 由后端注入,适配器不得占用该键。
                 if record.review_kind == plan_review::PlanReviewKind::NativeRequest {
-                if let Some(entry) = self.registry.get(&self.run_id) {
-                    if let Ok(mut plans) = entry.plans.lock() {
-                        let mut parked = context;
-                        if let Some(map) = parked.as_object_mut() {
-                            map.insert(
-                                "revision".to_string(),
-                                serde_json::Value::from(record.revision),
-                            );
-                        } else {
-                            parked = serde_json::json!({
-                                "revision": record.revision,
-                                "opaque": parked,
-                            });
+                    if let Some(entry) = self.registry.get(&self.run_id) {
+                        if let Ok(mut plans) = entry.plans.lock() {
+                            let mut parked = context;
+                            if let Some(map) = parked.as_object_mut() {
+                                map.insert(
+                                    "revision".to_string(),
+                                    serde_json::Value::from(record.revision),
+                                );
+                            } else {
+                                parked = serde_json::json!({
+                                    "revision": record.revision,
+                                    "opaque": parked,
+                                });
+                            }
+                            plans.insert(record.plan_id.clone(), parked);
                         }
-                        plans.insert(record.plan_id.clone(), parked);
                     }
-                }
                 }
                 let payload = serde_json::to_value(&record)
                     .unwrap_or_else(|_| serde_json::json!({ "planId": record.plan_id }));
-                state.push(&self.sink, &self.run_id, &self.engine_id, "plan_review", payload);
+                state.push(
+                    &self.sink,
+                    &self.run_id,
+                    &self.engine_id,
+                    "plan_review",
+                    payload,
+                );
             }
             EngineEvent::PlanReviewSettled {
                 plan_id,
@@ -685,8 +764,6 @@ impl TurnCore {
                 // the pre-control-protocol headless run (ask -> denial, the
                 // model works around it). Best effort: if the pipe is gone
                 // the CLI is already dead and its own deadline settles.
-                let registry = Arc::clone(&self.registry);
-                let run_id = self.run_id.clone();
                 let line = serde_json::json!({
                     "type": "control_response",
                     "response": {
@@ -701,9 +778,7 @@ impl TurnCore {
                     },
                 })
                 .to_string();
-                tokio::spawn(async move {
-                    let _ = registry.write_line(&run_id, line).await;
-                });
+                let _ = self.registry.write_line(&self.run_id, line);
             }
             EngineEvent::Model(model) => {
                 state.push(
@@ -764,7 +839,11 @@ impl TurnCore {
                 // exits instead of waiting for a next message forever.
                 self.registry.close_stdin(&self.run_id);
                 let mut data = serde_json::json!({ "usage": usage });
-                if self.registry.get(&self.run_id).is_some_and(|entry| entry.killed.load(std::sync::atomic::Ordering::SeqCst)) {
+                if self
+                    .registry
+                    .get(&self.run_id)
+                    .is_some_and(|entry| entry.killed.load(std::sync::atomic::Ordering::SeqCst))
+                {
                     data["cancelled"] = true.into();
                 }
                 state.push_with_gen_ms(
@@ -856,6 +935,135 @@ impl Drop for VirtualRunGuard {
     fn drop(&mut self) {
         self.registry
             .remove_run_if_pid(&self.run_id, self.virtual_pid);
+    }
+}
+
+/// Log prefix for [`HostTurnGuard`]. Codex stays `codex` and every other
+/// engine that already logged `acp` stays `acp`. dsh and opencode derive the
+/// label from their engine id.
+fn settle_channel(engine_id: &str) -> &str {
+    match engine_id {
+        "codex" => "codex",
+        "dsh" | "opencode" => engine_id,
+        _ => "acp",
+    }
+}
+
+/// Abort backstop for a virtual host-stream turn. The registry's kill path
+/// aborts the turn task after the settle grace; an aborted future never
+/// reaches the driver's terminal dispatch, so the guard emits the one
+/// terminal event on drop and still frees the registry keys. `disarm_settled`
+/// after a normal dispatch, with no await between them, so a healthy turn
+/// does not emit twice.
+pub(crate) struct HostTurnGuard {
+    sink: Arc<event_sink::EventSink>,
+    // Dropped with the guard: frees the run's registry keys on abort.
+    _registry_guard: VirtualRunGuard,
+    engine_id: String,
+    run_id: String,
+    killed: Arc<std::sync::atomic::AtomicBool>,
+    seq: Arc<AtomicU64>,
+    session_id: Arc<Mutex<Option<String>>>,
+    armed: bool,
+}
+
+impl HostTurnGuard {
+    pub(crate) fn arm(
+        core: &TurnCore,
+        state: &TurnState,
+        killed: Arc<std::sync::atomic::AtomicBool>,
+        virtual_pid: u32,
+    ) -> Self {
+        Self {
+            sink: Arc::clone(&core.sink),
+            _registry_guard: VirtualRunGuard::new(
+                Arc::clone(&core.registry),
+                core.run_id.clone(),
+                virtual_pid,
+            ),
+            engine_id: core.engine_id.clone(),
+            run_id: core.run_id.clone(),
+            killed,
+            seq: Arc::clone(&state.seq),
+            session_id: Arc::clone(&state.session_slot),
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm_settled(&mut self, killed: bool, failed: bool) {
+        let reason = if killed {
+            "interrupt"
+        } else if failed {
+            "error"
+        } else {
+            "completed"
+        };
+        eprintln!(
+            "[{}] settle run={} reason={reason}",
+            self.channel(),
+            self.run_id
+        );
+        self.armed = false;
+    }
+
+    /// Log prefix. Codex stays `codex` and the ACP drivers stay `acp`.
+    /// dsh and opencode use their own engine id so an abort is not logged
+    /// as an ACP settle.
+    fn channel(&self) -> &str {
+        settle_channel(&self.engine_id)
+    }
+
+    fn emit_terminal(&self, kind: &str, data: Value) {
+        // Same counter as TurnState::push_meta. fetch_add never hands out a
+        // sequence this run already emitted.
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let session_id = self
+            .session_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.sink.push(serde_json::json!({
+            "runId": self.run_id,
+            "sessionId": session_id,
+            "engine": self.engine_id,
+            "seq": seq,
+            "kind": kind,
+            "data": data,
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        }));
+        self.sink.flush();
+    }
+}
+
+impl Drop for HostTurnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.killed.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!(
+                "[{}] settle run={} reason=interrupt-abort",
+                self.channel(),
+                self.run_id
+            );
+            self.emit_terminal(
+                "done",
+                serde_json::json!({ "usage": Value::Null, "cancelled": true }),
+            );
+        } else {
+            eprintln!(
+                "[{}] settle run={} reason=aborted",
+                self.channel(),
+                self.run_id
+            );
+            self.emit_terminal(
+                "error",
+                Value::String("turn aborted before it could settle".to_string()),
+            );
+        }
     }
 }
 
@@ -1251,8 +1459,25 @@ mod staging_tests {
         // std Mutex stays: ring buffers are deliberately poison-tolerant
         // (a panicked capture task must not take down error reporting).
         let kept = buf.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(kept.len() <= 4096);
+        assert!(kept.len() <= DIAGNOSTIC_RING_CAP);
         assert!(kept.ends_with("引擎错误"));
+    }
+
+    #[test]
+    fn ring_push_keeps_error_head_and_latest_tail() {
+        let buf = Arc::new(Mutex::new(String::new()));
+        ring_push(&buf, "java.net.BindException: model gateway failed\n");
+        ring_push(
+            &buf,
+            &"    at example.StackFrame.call(StackFrame.java:1)\n".repeat(100),
+        );
+        ring_push(&buf, "Caused by: final gateway context\n");
+
+        let kept = buf.lock().unwrap();
+        assert!(kept.starts_with("java.net.BindException: model gateway failed\n"));
+        assert!(kept.contains(DIAGNOSTIC_RING_MARKER));
+        assert!(kept.ends_with("Caused by: final gateway context\n"));
+        assert!(kept.len() <= DIAGNOSTIC_RING_CAP);
     }
 
     /// Absent sides stay absent: a sparse report must never read as an
@@ -1605,8 +1830,14 @@ mod terminal_event_tests {
             .filter_map(|event| event.get("genMs").and_then(Value::as_u64))
             .collect();
         assert_eq!(usages.len(), 2, "both usage reports carry genMs");
-        assert!(usages[0] >= 200, "explicit window ignored the tool row: {usages:?}");
-        assert!(usages[1] < 200, "implicit window closed at the tool row: {usages:?}");
+        assert!(
+            usages[0] >= 200,
+            "explicit window ignored the tool row: {usages:?}"
+        );
+        assert!(
+            usages[1] < 200,
+            "implicit window closed at the tool row: {usages:?}"
+        );
     }
 
     #[tokio::test]
@@ -1789,10 +2020,7 @@ mod plan_dispatch_tests {
         }
     }
 
-    fn ready_core(
-        tag: &str,
-        drop_table: bool,
-    ) -> (TurnCore, Arc<Collector>, Arc<crate::db::Db>) {
+    fn ready_core(tag: &str, drop_table: bool) -> (TurnCore, Arc<Collector>, Arc<crate::db::Db>) {
         let dir = std::env::temp_dir().join(format!(
             "ccgui-plan-dispatch-{tag}-{}-{}",
             std::process::id(),
@@ -1801,9 +2029,7 @@ mod plan_dispatch_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(crate::db::Db::open_at(&dir.join("app.db")).unwrap());
         if drop_table {
-            db.0.lock()
-                .execute("DROP TABLE plan_reviews", [])
-                .unwrap();
+            db.0.lock().execute("DROP TABLE plan_reviews", []).unwrap();
         }
         let collector = Arc::new(Collector::default());
         let core = TurnCore {
@@ -1933,5 +2159,366 @@ mod plan_dispatch_tests {
                 .contains("could not be persisted"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    /// Invalid UTF-8 must not stop the drain: a later megabyte of stderr, and
+    /// the tail written after it, still land in the ring. The child has to
+    /// exit; a capture that stops on the first bad byte fills the pipe and
+    /// blocks the writer.
+    #[tokio::test]
+    async fn stderr_lossy_utf8_keeps_draining_until_eof() {
+        let peer = r#"
+const fs = require('fs');
+fs.writeSync(2, Buffer.from([0xff, 0xfe, 0x0a]));
+const chunk = Buffer.alloc(64 * 1024, 0x61);
+let sent = 0;
+while (sent < 1024 * 1024) {
+  fs.writeSync(2, chunk);
+  sent += chunk.length;
+}
+fs.writeSync(2, 'TAIL-MARK\n');
+"#;
+        let mut child = Command::new("node")
+            .args(["-e", peer])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("node");
+        let stderr = child.stderr.take().expect("stderr");
+        let buf = spawn_stderr_capture(stderr);
+        let finished = timeout(Duration::from_secs(5), child.wait()).await;
+        if finished.is_err() {
+            let _ = child.start_kill();
+            panic!("stderr peer blocked; capture stopped before EOF");
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let text = buf.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if text.contains('\u{FFFD}') && text.contains("TAIL-MARK") {
+                return;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("ring missing lossy text or tail, len={}", text.len());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn settle_channel_labels_dsh_and_opencode_without_changing_the_others() {
+        assert_eq!(super::settle_channel("codex"), "codex");
+        assert_eq!(super::settle_channel("dsh"), "dsh");
+        assert_eq!(super::settle_channel("opencode"), "opencode");
+        for engine in ["kimi", "grok", "minimax", "omp", "qoder", "qoder-cn"] {
+            assert_eq!(super::settle_channel(engine), "acp", "{engine}");
+        }
+    }
+
+    /// The registry aborts the turn task when a killed child never settles.
+    /// Dropping that future must still emit one terminal event and free the
+    /// registry keys. A second event would mean the guard and the driver both
+    /// settled.
+    #[tokio::test]
+    async fn aborted_host_turn_emits_one_terminal_event_and_clears_the_registry() {
+        use crate::engine::ChildEntry;
+        use crate::event_sink::{Emit, EventSink};
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicBool;
+
+        struct Collecting(Mutex<Vec<String>>);
+        impl Emit for Collecting {
+            fn emit_json(&self, _name: &str, raw_json: &str) {
+                self.0.lock().unwrap().push(raw_json.to_string());
+            }
+        }
+
+        let emitter = Arc::new(Collecting(Mutex::new(Vec::new())));
+        let registry = Arc::new(ProcessRegistry::default());
+        let killed = Arc::new(AtomicBool::new(true));
+        let run_id = "abort-settle".to_string();
+        let virtual_pid = 4_000_000_202u32;
+        registry.insert(
+            run_id.clone(),
+            ChildEntry {
+                child: None,
+                pid: virtual_pid,
+                run_id: run_id.clone(),
+                killed: Arc::clone(&killed),
+                reader_abort: Arc::new(std::sync::OnceLock::new()),
+                stdin: None,
+                questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let core = TurnCore {
+            sink: EventSink::new(emitter.clone()),
+            registry: Arc::clone(&registry),
+            engine_id: "kimi".to_string(),
+            run_id: run_id.clone(),
+            db: None,
+        };
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let state = TurnState::new(None);
+            let _guard = HostTurnGuard::arm(&core, &state, killed, virtual_pid);
+            let _ = armed_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        // Abort before the first poll drops the future without running `arm`.
+        // The registry backstop aborts a turn that is already inside the read
+        // loop, so the guard exists and its Drop must settle the run.
+        tokio::time::timeout(std::time::Duration::from_secs(2), armed_rx)
+            .await
+            .expect("guard should arm before the abort")
+            .expect("armed channel open");
+        task.abort();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("abort must finish dropping the turn")
+                .is_err(),
+            "abort must cancel the turn future"
+        );
+        let raw = emitter.0.lock().unwrap();
+        let mut terminal = Vec::new();
+        for batch in raw.iter() {
+            let parsed: Value = serde_json::from_str(batch).unwrap();
+            let items = parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]);
+            for event in items {
+                if matches!(event["kind"].as_str(), Some("done") | Some("error")) {
+                    terminal.push(event);
+                }
+            }
+        }
+        assert_eq!(
+            terminal.len(),
+            1,
+            "exactly one terminal event: {terminal:?}"
+        );
+        assert_eq!(terminal[0]["kind"], "done");
+        assert_eq!(terminal[0]["data"]["cancelled"], true);
+        assert_eq!(
+            registry.active_run_count(),
+            0,
+            "abort must clear the registry"
+        );
+    }
+
+    fn parse_events(raw: &[String]) -> Vec<Value> {
+        let mut out = Vec::new();
+        for batch in raw {
+            let parsed: Value = serde_json::from_str(batch).unwrap();
+            let items = parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]);
+            out.extend(items);
+        }
+        out
+    }
+
+    fn assert_unique_seqs(events: &[Value]) {
+        let mut seen = std::collections::HashSet::new();
+        for event in events {
+            let seq = event["seq"].as_u64().expect("seq");
+            assert!(
+                seen.insert((event["runId"].as_str().unwrap().to_string(), seq)),
+                "duplicate seq {seq} in {events:?}"
+            );
+        }
+    }
+
+    /// An abort after N emitted events must continue the run's sequence and
+    /// keep the native session id. Reusing seq 1 collides with the first event.
+    #[tokio::test]
+    async fn aborted_turn_after_n_events_uses_the_next_seq_and_session_id() {
+        use crate::engine::ChildEntry;
+        use crate::event_sink::{Emit, EventSink};
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicBool;
+
+        struct Collecting(Mutex<Vec<String>>);
+        impl Emit for Collecting {
+            fn emit_json(&self, _name: &str, raw_json: &str) {
+                self.0.lock().unwrap().push(raw_json.to_string());
+            }
+        }
+
+        let emitter = Arc::new(Collecting(Mutex::new(Vec::new())));
+        let registry = Arc::new(ProcessRegistry::default());
+        let killed = Arc::new(AtomicBool::new(false));
+        let run_id = "abort-seq".to_string();
+        let virtual_pid = 4_000_000_203u32;
+        registry.insert(
+            run_id.clone(),
+            ChildEntry {
+                child: None,
+                pid: virtual_pid,
+                run_id: run_id.clone(),
+                killed: Arc::clone(&killed),
+                reader_abort: Arc::new(std::sync::OnceLock::new()),
+                stdin: None,
+                questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let core = TurnCore {
+            sink: EventSink::new(emitter.clone()),
+            registry: Arc::clone(&registry),
+            engine_id: "kimi".to_string(),
+            run_id: run_id.clone(),
+            db: None,
+        };
+        let path =
+            std::env::temp_dir().join(format!("ccgui-abort-seq-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(crate::db::Db::open_at(&path).unwrap());
+        crate::history::journal::begin(&db, &run_id, "kimi", Some("sess-native"), "/ws", 1, None)
+            .unwrap();
+        // Replace the plain sink with the executor journal. A repeated seq is
+        // INSERT OR IGNORE, so the abort terminal would not be stored and the
+        // run would stay reserved.
+        let core = TurnCore {
+            sink: EventSink::with_journal(emitter.clone(), Arc::clone(&db)),
+            ..core
+        };
+        let mut state = TurnState::new(None);
+        for text in ["one", "two", "three"] {
+            core.dispatch_event(&mut state, EngineEvent::Delta(text.into()));
+        }
+        core.dispatch_event(&mut state, EngineEvent::SessionId("sess-native".into()));
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _guard = HostTurnGuard::arm(&core, &state, killed, virtual_pid);
+            let _ = armed_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), armed_rx)
+            .await
+            .expect("guard should arm")
+            .expect("armed channel open");
+        task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        let raw = emitter.0.lock().unwrap();
+        let events = parse_events(&raw);
+        assert_unique_seqs(&events);
+        let terminal = events
+            .iter()
+            .find(|event| event["kind"] == "error")
+            .expect("abort emits an error terminal");
+        assert_eq!(
+            terminal["seq"].as_u64(),
+            Some(5),
+            "terminal must be last seq + 1: {events:?}"
+        );
+        assert_eq!(terminal["sessionId"], "sess-native");
+        let stored: i64 =
+            db.0.lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_events WHERE run_id=?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(
+            stored, 5,
+            "journal must keep the abort terminal as its own seq"
+        );
+        let run_state: String =
+            db.0.lock()
+                .query_row(
+                    "SELECT state FROM chat_runs WHERE run_id=?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(run_state, "error");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A normal terminal and an interrupt terminal each disarm the guard with
+    /// no await in between, so drop does not emit a second event. Sequences
+    /// stay unique on all three paths (abort is the test above).
+    #[tokio::test]
+    async fn normal_and_interrupt_terminals_do_not_share_a_seq_with_the_guard() {
+        use crate::engine::ChildEntry;
+        use crate::event_sink::{Emit, EventSink};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct Collecting(Mutex<Vec<String>>);
+        impl Emit for Collecting {
+            fn emit_json(&self, _name: &str, raw_json: &str) {
+                self.0.lock().unwrap().push(raw_json.to_string());
+            }
+        }
+
+        for killed_flag in [false, true] {
+            let emitter = Arc::new(Collecting(Mutex::new(Vec::new())));
+            let registry = Arc::new(ProcessRegistry::default());
+            let killed = Arc::new(AtomicBool::new(killed_flag));
+            let run_id = format!("settle-{killed_flag}");
+            let virtual_pid = 4_000_000_204u32;
+            registry.insert(
+                run_id.clone(),
+                ChildEntry {
+                    child: None,
+                    pid: virtual_pid,
+                    run_id: run_id.clone(),
+                    killed: Arc::clone(&killed),
+                    reader_abort: Arc::new(std::sync::OnceLock::new()),
+                    stdin: None,
+                    questions: Arc::new(Mutex::new(HashMap::new())),
+                    plans: Arc::new(Mutex::new(HashMap::new())),
+                },
+            );
+            let core = TurnCore {
+                sink: EventSink::new(emitter.clone()),
+                registry: Arc::clone(&registry),
+                engine_id: "kimi".to_string(),
+                run_id: run_id.clone(),
+                db: None,
+            };
+            let mut state = TurnState::new(Some("sess-native".into()));
+            let mut guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
+            core.dispatch_event(&mut state, EngineEvent::Delta("partial".into()));
+            let session_id = state.native_session_id.clone();
+            core.dispatch_event(
+                &mut state,
+                EngineEvent::Done {
+                    session_id,
+                    usage: None,
+                },
+            );
+            // The drivers do this on the next line, with no await. An abort
+            // can only drop the guard at an await point, so it cannot observe
+            // `armed == true` after this store.
+            guard.disarm_settled(killed.load(AtomicOrdering::SeqCst), false);
+            drop(guard);
+            core.sink.flush();
+            let events = parse_events(&emitter.0.lock().unwrap());
+            assert_unique_seqs(&events);
+            let terminals: Vec<_> = events
+                .iter()
+                .filter(|event| matches!(event["kind"].as_str(), Some("done") | Some("error")))
+                .collect();
+            assert_eq!(
+                terminals.len(),
+                1,
+                "guard must not emit after disarm: {events:?}"
+            );
+            assert_eq!(terminals[0]["seq"].as_u64(), Some(2));
+            assert_eq!(terminals[0]["sessionId"], "sess-native");
+            if killed_flag {
+                assert_eq!(terminals[0]["data"]["cancelled"], true);
+            }
+        }
     }
 }

@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::opencode_server::{self, OpencodeServerState};
-use super::{EngineEvent, SendRequest, TurnCore, TurnState};
+use super::{EngineEvent, HostTurnGuard, SendRequest, TurnCore, TurnState};
 
 /// The killed-flag poll cadence inside the select loop.
 const KILL_POLL: Duration = Duration::from_millis(150);
@@ -85,6 +85,13 @@ async fn run_server_turn_with_probe_port(
     let mut state = TurnState::new(req.session_id.clone());
     let mut view = TurnView::default();
     let preassigned_session_id = req.session_id.clone();
+    // Abort-safe backstop. send_host_stream stores this task's abort handle
+    // and kill() aborts it after the settle grace; without a guard that drop
+    // frees nothing and emits no terminal. The guard's VirtualRunGuard drops
+    // every key of this run id + pid (run id, native session id, preassigned
+    // alias). The explicit removals below stay for the healthy path and are
+    // harmless when the key is already gone.
+    let mut host_guard = HostTurnGuard::arm(&core, &state, Arc::clone(&killed), virtual_pid);
     let result = turn_inner(
         &core, &mut state, &mut view, &req, &bin, &server, &killed, probe_port,
     )
@@ -104,20 +111,27 @@ async fn run_server_turn_with_probe_port(
             core.dispatch_event(&mut state, EngineEvent::QuestionSettled { request_id });
         }
     }
+    let was_killed = killed.load(Ordering::SeqCst);
+    let failed = result.is_err();
     if let Err(error) = result {
         core.dispatch_event(&mut state, EngineEvent::Error(error));
     }
     if !state.saw_done && !state.saw_error {
-        // User-initiated stop commits the partial turn as done; an SSE drop
-        // mid-turn without any content is an error (reported by turn_inner).
+        // User-initiated stop commits the partial turn as done with no usage.
+        // That dispatch is the only terminal: disarm on the next line, with
+        // no await between them, so the guard's done{cancelled:true} cannot
+        // also fire. An SSE drop mid-turn without any content is an error
+        // (reported by turn_inner).
         let session_id = state.native_session_id.clone();
-        let usage = if killed.load(Ordering::SeqCst) {
+        let usage = if was_killed {
             None
         } else {
             view.last_usage.clone()
         };
         core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
     }
+    // No await between the terminal dispatch and disarm.
+    host_guard.disarm_settled(was_killed, failed && !was_killed);
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     if let Some(session_id) = state.native_session_id.clone() {
         core.registry.remove_if_pid(&session_id, virtual_pid);
@@ -262,11 +276,7 @@ fn parse_context_windows(config: &Value) -> HashMap<String, u64> {
 /// one, keyed as `model_context_window` — the field the rest of the app reads.
 /// The provider/model come off the assistant message, so resumed sessions and
 /// model switches both resolve correctly.
-fn attach_context_window(
-    mut usage: Value,
-    info: &Value,
-    windows: &HashMap<String, u64>,
-) -> Value {
+fn attach_context_window(mut usage: Value, info: &Value, windows: &HashMap<String, u64>) -> Value {
     if usage.get("model_context_window").is_some() {
         return usage;
     }
@@ -1077,8 +1087,7 @@ mod tests {
         windows.insert("qf/deepseek-v4.1-flash".to_string(), 1_048_576u64);
         let info = json!({ "providerID": "qf", "modelID": "deepseek-v4.1-flash" });
 
-        let usage =
-            attach_context_window(json!({ "input": 12018, "output": 50 }), &info, &windows);
+        let usage = attach_context_window(json!({ "input": 12018, "output": 50 }), &info, &windows);
         assert_eq!(usage["model_context_window"], 1_048_576);
 
         // An engine-reported window wins; an unknown model stays untouched.
@@ -1120,5 +1129,412 @@ mod tests {
         assert_eq!(permission_reply(Some("plan")), "once");
         assert_eq!(permission_reply(Some("manual")), "once");
         assert_eq!(permission_reply(None), "once");
+    }
+
+    const NATIVE_SESSION: &str = "ses_native";
+    const PREASSIGNED_SESSION: &str = "ses_pre";
+
+    /// After the two text deltas, either hold the SSE stream (abort / user
+    /// stop) or send `session.status` idle so the driver settles.
+    #[derive(Clone, Copy)]
+    enum MockTail {
+        Hang,
+        Idle,
+    }
+
+    struct CollectingEmitter(std::sync::Mutex<Vec<String>>);
+    impl crate::event_sink::Emit for CollectingEmitter {
+        fn emit_json(&self, _name: &str, raw_json: &str) {
+            self.0.lock().unwrap().push(raw_json.to_string());
+        }
+    }
+
+    fn parse_flushed(raw: &[String]) -> Vec<Value> {
+        let mut out = Vec::new();
+        for batch in raw {
+            let parsed: Value = serde_json::from_str(batch).expect("flushed batch");
+            out.extend(parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]));
+        }
+        out
+    }
+
+    fn assert_unique_seqs(events: &[Value]) {
+        let mut seen = std::collections::HashSet::new();
+        for event in events {
+            let seq = event["seq"].as_u64().expect("seq");
+            assert!(seen.insert(seq), "duplicate seq {seq} in {events:?}");
+        }
+    }
+
+    fn terminals(events: &[Value]) -> Vec<&Value> {
+        events
+            .iter()
+            .filter(|event| matches!(event["kind"].as_str(), Some("done") | Some("error")))
+            .collect()
+    }
+
+    async fn write_json(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    }
+
+    async fn read_http(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut data = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                break;
+            }
+            data.push(byte[0]);
+            if data.windows(4).any(|window| window == b"\r\n\r\n") || data.len() > 65536 {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&data).to_string();
+        let content_length: usize = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            let _ = socket.read_exact(&mut body).await;
+        }
+        head.lines().next().unwrap_or("").to_string()
+    }
+
+    async fn write_sse_frame(socket: &mut tokio::net::TcpStream, frame: &Value) {
+        use tokio::io::AsyncWriteExt;
+        let data = format!("data: {frame}\n\n");
+        let chunk = format!("{:x}\r\n{data}\r\n", data.len());
+        let _ = socket.write_all(chunk.as_bytes()).await;
+    }
+
+    /// Same shape as `serves_a_full_question_turn_against_a_mock_server`, on
+    /// an ephemeral port so it does not share 4190 with that test.
+    async fn spawn_mock_server(tail: MockTail) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock opencode");
+        let port = listener.local_addr().expect("port").port();
+        let prompted = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let prompted = Arc::clone(&prompted);
+                handlers.spawn(async move {
+                    let line = read_http(&mut socket).await;
+                    if line.starts_with("GET /global/health") {
+                        write_json(&mut socket, "200 OK", r#"{"healthy":true,"version":"mock"}"#)
+                            .await;
+                    } else if line.starts_with("GET /config") {
+                        write_json(&mut socket, "200 OK", "{}").await;
+                    } else if line.starts_with("POST /session/") && line.contains("prompt_async") {
+                        write_json(&mut socket, "204 No Content", "").await;
+                        prompted.notify_one();
+                    } else if line.starts_with("POST /session/") && line.contains("/abort") {
+                        write_json(&mut socket, "200 OK", "true").await;
+                    } else if line.starts_with("POST /session") {
+                        write_json(
+                            &mut socket,
+                            "200 OK",
+                            &format!(r#"{{"id":"{NATIVE_SESSION}","slug":"mock"}}"#),
+                        )
+                        .await;
+                    } else if line.starts_with("GET /event") {
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                            )
+                            .await;
+                        prompted.notified().await;
+                        let updated = json!({
+                            "type": "message.part.updated",
+                            "properties": {
+                                "sessionID": NATIVE_SESSION,
+                                "part": { "id": "p1", "messageID": "m1", "type": "text" }
+                            }
+                        });
+                        // Resume keeps the preassigned id; the filter drops
+                        // frames whose sessionID does not match. Send both.
+                        write_sse_frame(&mut socket, &updated).await;
+                        let updated_pre = json!({
+                            "type": "message.part.updated",
+                            "properties": {
+                                "sessionID": PREASSIGNED_SESSION,
+                                "part": { "id": "p1", "messageID": "m1", "type": "text" }
+                            }
+                        });
+                        write_sse_frame(&mut socket, &updated_pre).await;
+                        for (session, text) in [
+                            (NATIVE_SESSION, "one"),
+                            (PREASSIGNED_SESSION, "one"),
+                            (NATIVE_SESSION, "two"),
+                            (PREASSIGNED_SESSION, "two"),
+                        ] {
+                            write_sse_frame(
+                                &mut socket,
+                                &json!({
+                                    "type": "message.part.delta",
+                                    "properties": {
+                                        "sessionID": session,
+                                        "messageID": "m1",
+                                        "partID": "p1",
+                                        "field": "text",
+                                        "delta": text
+                                    }
+                                }),
+                            )
+                            .await;
+                        }
+                        if matches!(tail, MockTail::Idle) {
+                            for session in [NATIVE_SESSION, PREASSIGNED_SESSION] {
+                                write_sse_frame(
+                                    &mut socket,
+                                    &json!({
+                                        "type": "session.status",
+                                        "properties": {
+                                            "sessionID": session,
+                                            "status": { "type": "idle" }
+                                        }
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
+                        std::future::pending::<()>().await;
+                    } else {
+                        write_json(&mut socket, "200 OK", r#"{"error":"unmocked"}"#).await;
+                    }
+                });
+            }
+        });
+        (port, task)
+    }
+
+    struct TurnParts {
+        emitter: Arc<CollectingEmitter>,
+        registry: Arc<crate::engine::ProcessRegistry>,
+        killed: Arc<AtomicBool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn start_turn(pid: u32, run_id: &str, session_id: Option<&str>, port: u16) -> TurnParts {
+        use crate::engine::registry::ChildEntry;
+        use crate::engine::ProcessRegistry;
+        use crate::event_sink::EventSink;
+
+        let emitter = Arc::new(CollectingEmitter(std::sync::Mutex::new(Vec::new())));
+        let registry = Arc::new(ProcessRegistry::default());
+        let killed = Arc::new(AtomicBool::new(false));
+        let entry = ChildEntry {
+            child: None,
+            pid,
+            run_id: run_id.to_string(),
+            killed: Arc::clone(&killed),
+            reader_abort: Arc::new(std::sync::OnceLock::new()),
+            stdin: None,
+            questions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            plans: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        registry.insert(run_id.to_string(), entry.clone());
+        if let Some(session_id) = session_id {
+            registry.insert_alias(session_id.to_string(), entry);
+        }
+        let core = TurnCore {
+            sink: EventSink::new(emitter.clone()),
+            registry: Arc::clone(&registry),
+            engine_id: "opencode".to_string(),
+            run_id: run_id.to_string(),
+            db: None,
+        };
+        let req = SendRequest {
+            session_id: session_id.map(str::to_string),
+            workspace: std::path::PathBuf::from("/tmp"),
+            prompt: "hello".to_string(),
+            prompt_contributions: Vec::new(),
+            native_compact: false,
+            images: Vec::new(),
+            model: None,
+            effort: None,
+            service_tier: None,
+            permission: None,
+            additional_dirs: Vec::new(),
+            provider_id: None,
+            computer_use: None,
+            memory_bot: None,
+            allowed_tools: None,
+        };
+        let task = tokio::spawn(run_server_turn_with_probe_port(
+            core,
+            req,
+            "opencode".to_string(),
+            Arc::new(OpencodeServerState::default()),
+            Arc::clone(&killed),
+            pid,
+            port,
+        ));
+        TurnParts {
+            emitter,
+            registry,
+            killed,
+            task,
+        }
+    }
+
+    async fn wait_for_deltas(emitter: &CollectingEmitter, session_id: &str) -> Vec<Value> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let events = parse_flushed(&emitter.0.lock().unwrap());
+            let deltas = events
+                .iter()
+                .filter(|event| event["kind"] == "delta" && event["sessionId"] == session_id)
+                .count();
+            let session_ok = events
+                .iter()
+                .any(|event| event["kind"] == "session" && event["data"] == session_id)
+                || events.iter().any(|event| event["sessionId"] == session_id);
+            if deltas >= 2 && session_ok {
+                return events;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("opencode mock turn did not emit 2 deltas for {session_id}: {events:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn assert_keys_freed(
+        registry: &crate::engine::ProcessRegistry,
+        run_id: &str,
+        session_id: &str,
+    ) {
+        assert!(registry.get(run_id).is_none(), "run id still registered");
+        assert!(
+            registry.get(session_id).is_none(),
+            "session id still registered"
+        );
+        assert!(
+            registry.get(PREASSIGNED_SESSION).is_none() || session_id == PREASSIGNED_SESSION,
+            "preassigned alias still registered"
+        );
+        if session_id != PREASSIGNED_SESSION {
+            assert!(
+                registry.get(PREASSIGNED_SESSION).is_none(),
+                "unexpected preassigned key"
+            );
+        }
+        assert_eq!(registry.active_run_count(), 0);
+    }
+
+    /// Abort after two deltas (and the session event, when the server
+    /// assigned one). Killed abort emits `done`/`cancelled`; a plain abort
+    /// emits `error`. The run's registry keys are gone either way.
+    #[tokio::test]
+    async fn aborted_turn_emits_one_terminal_with_the_next_seq_and_frees_keys() {
+        // Resume: preassigned alias is the native id. Fresh: the server id
+        // is rekeyed in beside the run id.
+        for (killed_abort, session_id, pid, run_id) in [
+            (
+                true,
+                Some(PREASSIGNED_SESSION),
+                4_000_000_321u32,
+                "oc-abort-killed",
+            ),
+            (false, None, 4_000_000_322u32, "oc-abort-plain"),
+        ] {
+            let (port, server) = spawn_mock_server(MockTail::Hang).await;
+            tokio::task::yield_now().await;
+            let turn = start_turn(pid, run_id, session_id, port);
+            let expect_id = session_id.unwrap_or(NATIVE_SESSION);
+            let before = wait_for_deltas(&turn.emitter, expect_id).await;
+            assert!(
+                terminals(&before).is_empty(),
+                "parked turn already settled: {before:?}"
+            );
+            let n = before.len();
+            if killed_abort {
+                turn.killed.store(true, Ordering::SeqCst);
+            }
+            turn.task.abort();
+            let joined = tokio::time::timeout(Duration::from_secs(2), turn.task)
+                .await
+                .expect("abort must drop the turn");
+            assert!(
+                joined.expect_err("abort cancels the task").is_cancelled(),
+                "expected the turn task to be aborted"
+            );
+            let events = parse_flushed(&turn.emitter.0.lock().unwrap());
+            assert_unique_seqs(&events);
+            let done = terminals(&events);
+            assert_eq!(done.len(), 1, "exactly one terminal: {events:?}");
+            assert_eq!(done[0]["seq"].as_u64(), Some((n as u64) + 1), "{events:?}");
+            assert_eq!(done[0]["sessionId"], expect_id, "{events:?}");
+            if killed_abort {
+                assert_eq!(done[0]["kind"], "done", "{events:?}");
+                assert_eq!(done[0]["data"]["cancelled"], true, "{events:?}");
+                assert!(done[0]["data"]["usage"].is_null(), "{events:?}");
+            } else {
+                assert_eq!(done[0]["kind"], "error", "{events:?}");
+                assert_eq!(done[0]["data"], "turn aborted before it could settle");
+            }
+            assert_keys_freed(&turn.registry, run_id, expect_id);
+            server.abort();
+        }
+    }
+
+    /// A turn the driver finishes itself emits one terminal and never reuses
+    /// a sequence. The user-stop case commits `done` with no usage and must
+    /// not also emit the guard's `done{cancelled:true}`.
+    #[tokio::test]
+    async fn normal_turn_emits_one_terminal_with_unique_seqs() {
+        for (user_stop, tail, session_id, pid, run_id) in [
+            (false, MockTail::Idle, None, 4_000_000_323u32, "oc-normal"),
+            (
+                true,
+                MockTail::Hang,
+                Some(PREASSIGNED_SESSION),
+                4_000_000_324u32,
+                "oc-user-stop",
+            ),
+        ] {
+            let (port, server) = spawn_mock_server(tail).await;
+            tokio::task::yield_now().await;
+            let turn = start_turn(pid, run_id, session_id, port);
+            let expect_id = session_id.unwrap_or(NATIVE_SESSION);
+            let _ = wait_for_deltas(&turn.emitter, expect_id).await;
+            if user_stop {
+                turn.killed.store(true, Ordering::SeqCst);
+            }
+            let joined = tokio::time::timeout(Duration::from_secs(5), turn.task)
+                .await
+                .unwrap_or_else(|_| panic!("{run_id} did not settle"));
+            joined.expect("turn task");
+            let events = parse_flushed(&turn.emitter.0.lock().unwrap());
+            assert_unique_seqs(&events);
+            let done = terminals(&events);
+            assert_eq!(done.len(), 1, "exactly one terminal: {events:?}");
+            assert_eq!(done[0]["kind"], "done", "{events:?}");
+            assert_eq!(done[0]["sessionId"], expect_id, "{events:?}");
+            if user_stop {
+                assert!(done[0]["data"]["usage"].is_null(), "{events:?}");
+            }
+            assert_keys_freed(&turn.registry, run_id, expect_id);
+            server.abort();
+        }
     }
 }
