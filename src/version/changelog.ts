@@ -29,6 +29,20 @@ export function changelogEntryFor(version: string): ChangelogEntry | undefined {
 
 export const CHANGELOG_DATA: ChangelogEntry[] = [
   {
+    version: "1.3.3",
+    date: "2026-10-18",
+    content: {
+      zh: `🐛 修复
+- **远程网页报“unknown command”**：网页已在调用、执行端分派表却漏掉的命令（计划审阅、Git worktree、任务代理、pi 系列凭据等）现在都已接入；测试会检查前端每个静态命令要么已接入，要么列为桌面专属并写明原因。
+- **网页不再反复发送执行端不支持的命令**：按目标机器记住“unknown command”，一台旧版机器不会挡住其他机器；桥重连到这台机器，或 Hub 显示它重新上线后会再发。执行端对同一个未知命令每个进程只记一条 error。
+- **进行中会话的日志同步失败**：转录本仍在追加时按一致前缀读取，不再报“session changed while reading revision log”并从头重来。`,
+      en: `🐛 Fixes
+- **"unknown command" on the remote web**: commands the web UI already sent but the executor dispatch table lacked (plan reviews, Git worktrees, mission agents, pi-family credentials and others) are now routed. A test requires every static frontend command to be routed or listed as desktop-only with a reason.
+- **The web no longer keeps sending commands an executor does not support**: an "unknown command" is remembered per target machine, so one older machine does not block the others. It is sent again after the bridge reconnects to that machine or the Hub shows it back online. The executor logs each unknown command once per process.
+- **Log sync failed for active sessions**: a transcript that is still being appended is read up to a consistent prefix, instead of failing with "session changed while reading revision log" and starting over.`,
+    },
+  },
+  {
     version: "1.3.2",
     date: "2026-10-18",
     content: {
