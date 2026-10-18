@@ -161,10 +161,16 @@ const DESKTOP_ONLY: &[(&str, &str)] = &[
 ];
 
 /// Answered by the hub, not by executor `dispatch`.
-const HUB_ONLY: &[(&str, &str)] = &[(
-    "get_run_delivery",
-    "answered by the hub via queryMachine, not executor dispatch",
-)];
+const HUB_ONLY: &[(&str, &str)] = &[
+    (
+        "get_run_delivery",
+        "answered by the hub via queryMachine, not executor dispatch",
+    ),
+    (
+        "close_unreceived_run",
+        "answered by the hub via queryMachine, not executor dispatch",
+    ),
+];
 
 #[test]
 fn unknown_command_is_recorded_once_per_process() {

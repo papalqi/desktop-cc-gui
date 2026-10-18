@@ -31,9 +31,62 @@ interface PendingReq {
   historyTiming?: { startedAt: number; session: number };
 }
 
-/** Commands this page has already been told the executor does not route.
- *  A permanent "unknown command" must not be sent again. */
-const permanentUnknown = new Map<string, string>();
+/** Misses for one executor. A null machine is the unnamed connection, and in
+ *  multi-machine mode a hub-global command. Another machine must still be asked. */
+const permanentUnknown = new Map<string, Map<string, string>>();
+const unnamedUnknown = new Map<string, string>();
+
+function unknownBucket(machine: string | null): Map<string, string> {
+  if (machine === null) return unnamedUnknown;
+  let bucket = permanentUnknown.get(machine);
+  if (!bucket) {
+    bucket = new Map();
+    permanentUnknown.set(machine, bucket);
+  }
+  return bucket;
+}
+
+function unknownError(machine: string | null, cmd: string): string | undefined {
+  return (machine === null ? unnamedUnknown : permanentUnknown.get(machine))?.get(cmd);
+}
+
+function rememberUnknown(machine: string | null, cmd: string, errorText: string): void {
+  unknownBucket(machine).set(cmd, errorText);
+}
+
+function forgetUnknown(machine: string | null): void {
+  if (machine === null) unnamedUnknown.clear();
+  else permanentUnknown.delete(machine);
+}
+
+/** Drop misses for the executor this socket is about to talk to. */
+function forgetBridgeMachine(machine: string | null): void {
+  forgetUnknown(machine);
+  if (!webMultiMachine() && machine !== null) unnamedUnknown.clear();
+}
+
+/** A reply that arrived before hello still belongs to the machine hello names. */
+function claimUnnamedUnknowns(machine: string): void {
+  if (unnamedUnknown.size === 0) return;
+  const bucket = unknownBucket(machine);
+  for (const [cmd, errorText] of unnamedUnknown) {
+    if (!bucket.has(cmd)) bucket.set(cmd, errorText);
+  }
+  unnamedUnknown.clear();
+}
+
+/** The machine `WebBridge.invoke` sends to. Explicit target, else a global
+ *  command on the shared socket, else this page's machine. */
+function resolvedTarget(cmd: string, target: string | null | undefined): string | null {
+  if (target !== undefined) return target;
+  return webMultiMachine() && GLOBAL_COMMANDS.has(cmd) ? null : webMachine();
+}
+
+/** A single-machine miss recorded before hello uses the machine hello just named. */
+function attributedMachine(machine: string | null): string | null {
+  if (machine !== null || webMultiMachine()) return machine;
+  return webMachine();
+}
 
 const RETRY_MAX_MS = 10_000;
 const LONG_COMMANDS = new Set(["add_workspace", "plugin_add_workspace", "read_file", "read_font_file", "plugin_read_file", "plugin_read_artwork", "rescan_sessions"]);
@@ -118,6 +171,9 @@ class WebBridge {
   private listeners = new Map<string, Set<Listener>>();
   private retryMs = 1000;
   private versionValue: string | null = null;
+  /** Hello `version` last seen for an executor. A different value drops that machine's misses. */
+  private executorVersions = new Map<string, string | null>();
+  private unnamedExecutorVersion: string | null | undefined = undefined;
   private versionWaiters: ((v: string | null) => void)[] = [];
   /** Hello on the attempt in progress. A previous connection does not count. */
   private helloSeen = false;
@@ -157,6 +213,10 @@ class WebBridge {
     ) {
       return this.openGate!;
     }
+    // A replacement socket is this bridge reconnecting to the page's machine.
+    // The shared multi-machine socket is not one executor; reconnect() drops
+    // the machine it was aimed at.
+    if (!webMultiMachine()) forgetBridgeMachine(webMachine());
     const proto = location.protocol === "https:" ? "wss" : "ws";
     this.helloSeen = false;
     const machine = webMultiMachine() ? null : webMachine();
@@ -223,10 +283,14 @@ class WebBridge {
         this.ws?.close();
         return;
       }
-      if (typeof msg.machine === "string" && msg.machine) setWebMachine(msg.machine);
+      const named = typeof msg.machine === "string" && msg.machine ? msg.machine : null;
+      if (named) setWebMachine(named);
+      if (!webMultiMachine() && named) claimUnnamedUnknowns(named);
+      const version = typeof msg.version === "string" ? msg.version : null;
+      this.noteExecutorVersion(named ?? (webMultiMachine() ? null : webMachine()), version);
       this.helloSeen = true;
       this.everOpen = true;
-      this.versionValue = typeof msg.version === "string" ? msg.version : null;
+      this.versionValue = version;
       this.features = features;
       if (this.features.has("ping")) this.startHeartbeat();
       setBridgeState("open");
@@ -259,7 +323,7 @@ class WebBridge {
         const errorText = raw === "executor_history_offline"
           ? i18n.t("chat.executorHistoryOffline")
           : String(msg.error ?? "unknown error");
-        if (raw.startsWith("unknown command")) permanentUnknown.set(entry.cmd, errorText);
+        if (raw.startsWith("unknown command")) rememberUnknown(attributedMachine(entry.machine), entry.cmd, errorText);
         entry.reject(new Error(errorText));
       }
       return;
@@ -409,8 +473,10 @@ class WebBridge {
 
   invoke<T>(cmd: string, args?: Record<string, unknown>, target?: string | null): Promise<T> {
     if (this.capabilityError) return Promise.reject(this.capabilityError);
-    const machine = target === undefined ? webMultiMachine() && GLOBAL_COMMANDS.has(cmd) ? null : webMachine() : target;
     if (!webMultiMachine() && target && target !== webMachine()) return Promise.reject(new Error("machine does not match this connection"));
+    const machine = resolvedTarget(cmd, target);
+    const rejected = unknownError(machine, cmd);
+    if (rejected) return Promise.reject(new Error(rejected));
     const id = this.nextId++;
     const { promise, resolve, reject } = Promise.withResolvers<T>();
     const timeout = requestTimeout(cmd);
@@ -505,8 +571,20 @@ class WebBridge {
     });
   }
 
+  /** Last hello version for this machine. A change means that executor was replaced. */
+  private noteExecutorVersion(machine: string | null, version: string | null): void {
+    if (machine === null) {
+      if (this.unnamedExecutorVersion !== undefined && this.unnamedExecutorVersion !== version) forgetUnknown(null);
+      this.unnamedExecutorVersion = version;
+      return;
+    }
+    if (this.executorVersions.has(machine) && this.executorVersions.get(machine) !== version) forgetBridgeMachine(machine);
+    this.executorVersions.set(machine, version);
+  }
+
   /** Drop the socket and open another for this page's machine. */
   reconnect(): Promise<void> {
+    forgetBridgeMachine(webMachine());
     this.capabilityError = null;
     bridgeGeneration += 1;
     this.stopHeartbeat();
@@ -543,8 +621,6 @@ let bridge: WebBridge | null = null;
 /** Drop-in for @tauri-apps/api/core invoke. */
 export function invoke<T>(cmd: string, args?: Record<string, unknown>, machine?: string | null): Promise<T> {
   if (!isWeb) return tauriInvoke<T>(cmd, args);
-  const rejected = permanentUnknown.get(cmd);
-  if (rejected) return Promise.reject(new Error(rejected));
   return (bridge ??= new WebBridge()).invoke<T>(cmd, args, machine);
 }
 
