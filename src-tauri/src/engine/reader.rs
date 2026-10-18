@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 #[cfg(test)]
 use tokio::process::Command;
 use tokio::process::{Child, ChildStderr, ChildStdout};
@@ -45,32 +45,31 @@ pub(crate) fn spawn_stdin_writer(
     child: &mut Child,
     payload: Option<String>,
     keep_open: bool,
-) -> Option<Arc<TokioMutex<Option<tokio::process::ChildStdin>>>> {
-    if !keep_open {
-        let Some(payload) = payload else {
-            return None;
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            tokio::spawn(async move {
-                let _ = stdin.write_all(payload.as_bytes()).await;
-                let _ = stdin.write_all(b"\n").await;
-                // drop closes stdin -> EOF
-            });
-        }
+    run_id: &str,
+) -> Option<super::stdio_duplex::StdioWriter> {
+    if !keep_open && payload.is_none() {
         return None;
     }
-    let keep = Arc::new(TokioMutex::new(child.stdin.take()));
+    let stdin = child.stdin.take()?;
+    let writer = super::stdio_duplex::StdioWriter::spawn(stdin, run_id);
     if let Some(payload) = payload {
-        let handle = Arc::clone(&keep);
-        tokio::spawn(async move {
-            let mut guard = handle.lock().await;
-            if let Some(stdin) = guard.as_mut() {
-                let _ = stdin.write_all(payload.as_bytes()).await;
-                let _ = stdin.write_all(b"\n").await;
-            }
-        });
+        let mut bytes = payload.into_bytes();
+        if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        // Best effort, same as the previous fire-and-forget payload task.
+        // A queue overflow is a typed error the turn can observe on keep-open
+        // handles; a one-shot payload has no turn loop to report it to.
+        if let Err(error) = writer.enqueue_frame(bytes) {
+            eprintln!("[stdio] warn: stdin payload rejected run={run_id} reason={error}");
+        }
     }
-    Some(keep)
+    if !keep_open {
+        writer.close();
+        None
+    } else {
+        Some(writer)
+    }
 }
 const DIAGNOSTIC_RING_CAP: usize = 4096;
 const DIAGNOSTIC_RING_HEAD_CAP: usize = 2048;
@@ -115,22 +114,58 @@ pub(crate) fn ring_push(buf: &Arc<Mutex<String>>, text: &str) {
     guard.push_str(DIAGNOSTIC_RING_MARKER);
     guard.push_str(&tail);
 }
+/// One stderr read is capped so a CLI that writes without newlines cannot
+/// stall the drain or buffer an unbounded line. Invalid UTF-8 is decoded
+/// lossily; the task stops only on EOF or a real IO error.
+const STDERR_CHUNK_CAP: usize = 64 * 1024;
+
 /// Stderr capture ring: keeps the first failure and latest stack frames.
 pub(crate) fn spawn_stderr_capture(stderr: ChildStderr) -> Arc<Mutex<String>> {
     let buf = Arc::new(Mutex::new(String::new()));
     let target = Arc::clone(&buf);
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
+        let mut chunk = Vec::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => ring_push(&target, &line),
+            match read_stderr_chunk(&mut reader, &mut chunk).await {
+                Ok(0) => break,
+                Ok(_) => ring_push(&target, &String::from_utf8_lossy(&chunk)),
+                Err(error) => {
+                    eprintln!("[stderr] capture stopped: {error}");
+                    break;
+                }
             }
         }
     });
     buf
+}
+
+async fn read_stderr_chunk<R>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buf.clear();
+    loop {
+        if buf.len() >= STDERR_CHUNK_CAP {
+            return Ok(buf.len());
+        }
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len());
+        }
+        let room = STDERR_CHUNK_CAP - buf.len();
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(available.len())
+            .min(room);
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if buf.last() == Some(&b'\n') || buf.len() >= STDERR_CHUNK_CAP {
+            return Ok(buf.len());
+        }
+    }
 }
 // ==================== stderr redaction ====================
 
@@ -331,11 +366,14 @@ pub(crate) fn expire_parked_plans(core: &TurnCore, state: &mut TurnState, key: &
         .collect();
     if let Ok(expired) = plan_review::expire_reviews(db, &parked) {
         for (plan_id, revision, _previous) in expired {
-            core.dispatch_event(state, EngineEvent::PlanReviewSettled {
-                plan_id,
-                revision,
-                status: plan_review::PlanStatus::Expired.as_str().to_string(),
-            });
+            core.dispatch_event(
+                state,
+                EngineEvent::PlanReviewSettled {
+                    plan_id,
+                    revision,
+                    status: plan_review::PlanStatus::Expired.as_str().to_string(),
+                },
+            );
         }
     }
 }
@@ -420,8 +458,7 @@ impl TurnCore {
                 // explicit start marker keep running: claude streams tool
                 // arguments inside the same response and closes it at
                 // message_stop.
-                let response_end = role == "assistant"
-                    || (role == "tool" && result.is_none());
+                let response_end = role == "assistant" || (role == "tool" && result.is_none());
                 if response_end && !state.gen_explicit {
                     state.gen_end();
                 }
@@ -629,27 +666,33 @@ impl TurnCore {
                 // {revision, route, frames, ...} 顶层平铺——context 是适配器
                 // 产出的对象,revision 由后端注入,适配器不得占用该键。
                 if record.review_kind == plan_review::PlanReviewKind::NativeRequest {
-                if let Some(entry) = self.registry.get(&self.run_id) {
-                    if let Ok(mut plans) = entry.plans.lock() {
-                        let mut parked = context;
-                        if let Some(map) = parked.as_object_mut() {
-                            map.insert(
-                                "revision".to_string(),
-                                serde_json::Value::from(record.revision),
-                            );
-                        } else {
-                            parked = serde_json::json!({
-                                "revision": record.revision,
-                                "opaque": parked,
-                            });
+                    if let Some(entry) = self.registry.get(&self.run_id) {
+                        if let Ok(mut plans) = entry.plans.lock() {
+                            let mut parked = context;
+                            if let Some(map) = parked.as_object_mut() {
+                                map.insert(
+                                    "revision".to_string(),
+                                    serde_json::Value::from(record.revision),
+                                );
+                            } else {
+                                parked = serde_json::json!({
+                                    "revision": record.revision,
+                                    "opaque": parked,
+                                });
+                            }
+                            plans.insert(record.plan_id.clone(), parked);
                         }
-                        plans.insert(record.plan_id.clone(), parked);
                     }
-                }
                 }
                 let payload = serde_json::to_value(&record)
                     .unwrap_or_else(|_| serde_json::json!({ "planId": record.plan_id }));
-                state.push(&self.sink, &self.run_id, &self.engine_id, "plan_review", payload);
+                state.push(
+                    &self.sink,
+                    &self.run_id,
+                    &self.engine_id,
+                    "plan_review",
+                    payload,
+                );
             }
             EngineEvent::PlanReviewSettled {
                 plan_id,
@@ -709,8 +752,6 @@ impl TurnCore {
                 // the pre-control-protocol headless run (ask -> denial, the
                 // model works around it). Best effort: if the pipe is gone
                 // the CLI is already dead and its own deadline settles.
-                let registry = Arc::clone(&self.registry);
-                let run_id = self.run_id.clone();
                 let line = serde_json::json!({
                     "type": "control_response",
                     "response": {
@@ -725,9 +766,7 @@ impl TurnCore {
                     },
                 })
                 .to_string();
-                tokio::spawn(async move {
-                    let _ = registry.write_line(&run_id, line).await;
-                });
+                let _ = self.registry.write_line(&self.run_id, line);
             }
             EngineEvent::Model(model) => {
                 state.push(
@@ -788,7 +827,11 @@ impl TurnCore {
                 // exits instead of waiting for a next message forever.
                 self.registry.close_stdin(&self.run_id);
                 let mut data = serde_json::json!({ "usage": usage });
-                if self.registry.get(&self.run_id).is_some_and(|entry| entry.killed.load(std::sync::atomic::Ordering::SeqCst)) {
+                if self
+                    .registry
+                    .get(&self.run_id)
+                    .is_some_and(|entry| entry.killed.load(std::sync::atomic::Ordering::SeqCst))
+                {
                     data["cancelled"] = true.into();
                 }
                 state.push_with_gen_ms(
@@ -880,6 +923,112 @@ impl Drop for VirtualRunGuard {
     fn drop(&mut self) {
         self.registry
             .remove_run_if_pid(&self.run_id, self.virtual_pid);
+    }
+}
+
+/// Abort backstop for a virtual host-stream turn. The registry's kill path
+/// aborts the turn task after the settle grace; an aborted future never
+/// reaches the driver's terminal dispatch, so the guard emits the one
+/// terminal event on drop and still frees the registry keys. `disarm_settled`
+/// after a normal dispatch, with no await between them, so a healthy turn
+/// does not emit twice.
+pub(crate) struct HostTurnGuard {
+    sink: Arc<event_sink::EventSink>,
+    // Dropped with the guard: frees the run's registry keys on abort.
+    _registry_guard: VirtualRunGuard,
+    engine_id: String,
+    run_id: String,
+    killed: Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+}
+
+impl HostTurnGuard {
+    pub(crate) fn arm(
+        core: &TurnCore,
+        killed: Arc<std::sync::atomic::AtomicBool>,
+        virtual_pid: u32,
+    ) -> Self {
+        Self {
+            sink: Arc::clone(&core.sink),
+            _registry_guard: VirtualRunGuard::new(
+                Arc::clone(&core.registry),
+                core.run_id.clone(),
+                virtual_pid,
+            ),
+            engine_id: core.engine_id.clone(),
+            run_id: core.run_id.clone(),
+            killed,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm_settled(&mut self, killed: bool, failed: bool) {
+        let reason = if killed {
+            "interrupt"
+        } else if failed {
+            "error"
+        } else {
+            "completed"
+        };
+        eprintln!(
+            "[{}] settle run={} reason={reason}",
+            self.channel(),
+            self.run_id
+        );
+        self.armed = false;
+    }
+
+    fn channel(&self) -> &'static str {
+        if self.engine_id == "codex" {
+            "codex"
+        } else {
+            "acp"
+        }
+    }
+
+    fn emit_terminal(&self, kind: &str, data: Value) {
+        self.sink.push(serde_json::json!({
+            "runId": self.run_id,
+            "sessionId": Value::Null,
+            "engine": self.engine_id,
+            "seq": 1,
+            "kind": kind,
+            "data": data,
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        }));
+        self.sink.flush();
+    }
+}
+
+impl Drop for HostTurnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.killed.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!(
+                "[{}] settle run={} reason=interrupt-abort",
+                self.channel(),
+                self.run_id
+            );
+            self.emit_terminal(
+                "done",
+                serde_json::json!({ "usage": Value::Null, "cancelled": true }),
+            );
+        } else {
+            eprintln!(
+                "[{}] settle run={} reason=aborted",
+                self.channel(),
+                self.run_id
+            );
+            self.emit_terminal(
+                "error",
+                Value::String("turn aborted before it could settle".to_string()),
+            );
+        }
     }
 }
 
@@ -1646,8 +1795,14 @@ mod terminal_event_tests {
             .filter_map(|event| event.get("genMs").and_then(Value::as_u64))
             .collect();
         assert_eq!(usages.len(), 2, "both usage reports carry genMs");
-        assert!(usages[0] >= 200, "explicit window ignored the tool row: {usages:?}");
-        assert!(usages[1] < 200, "implicit window closed at the tool row: {usages:?}");
+        assert!(
+            usages[0] >= 200,
+            "explicit window ignored the tool row: {usages:?}"
+        );
+        assert!(
+            usages[1] < 200,
+            "implicit window closed at the tool row: {usages:?}"
+        );
     }
 
     #[tokio::test]
@@ -1830,10 +1985,7 @@ mod plan_dispatch_tests {
         }
     }
 
-    fn ready_core(
-        tag: &str,
-        drop_table: bool,
-    ) -> (TurnCore, Arc<Collector>, Arc<crate::db::Db>) {
+    fn ready_core(tag: &str, drop_table: bool) -> (TurnCore, Arc<Collector>, Arc<crate::db::Db>) {
         let dir = std::env::temp_dir().join(format!(
             "ccgui-plan-dispatch-{tag}-{}-{}",
             std::process::id(),
@@ -1842,9 +1994,7 @@ mod plan_dispatch_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(crate::db::Db::open_at(&dir.join("app.db")).unwrap());
         if drop_table {
-            db.0.lock()
-                .execute("DROP TABLE plan_reviews", [])
-                .unwrap();
+            db.0.lock().execute("DROP TABLE plan_reviews", []).unwrap();
         }
         let collector = Arc::new(Collector::default());
         let core = TurnCore {
@@ -1973,6 +2123,148 @@ mod plan_dispatch_tests {
                 .unwrap()
                 .contains("could not be persisted"),
             "{error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    /// Invalid UTF-8 must not stop the drain: a later megabyte of stderr, and
+    /// the tail written after it, still land in the ring. The child has to
+    /// exit; a capture that stops on the first bad byte fills the pipe and
+    /// blocks the writer.
+    #[tokio::test]
+    async fn stderr_lossy_utf8_keeps_draining_until_eof() {
+        let peer = r#"
+const fs = require('fs');
+fs.writeSync(2, Buffer.from([0xff, 0xfe, 0x0a]));
+const chunk = Buffer.alloc(64 * 1024, 0x61);
+let sent = 0;
+while (sent < 1024 * 1024) {
+  fs.writeSync(2, chunk);
+  sent += chunk.length;
+}
+fs.writeSync(2, 'TAIL-MARK\n');
+"#;
+        let mut child = Command::new("node")
+            .args(["-e", peer])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("node");
+        let stderr = child.stderr.take().expect("stderr");
+        let buf = spawn_stderr_capture(stderr);
+        let finished = timeout(Duration::from_secs(5), child.wait()).await;
+        if finished.is_err() {
+            let _ = child.start_kill();
+            panic!("stderr peer blocked; capture stopped before EOF");
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let text = buf.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if text.contains('\u{FFFD}') && text.contains("TAIL-MARK") {
+                return;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("ring missing lossy text or tail, len={}", text.len());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The registry aborts the turn task when a killed child never settles.
+    /// Dropping that future must still emit one terminal event and free the
+    /// registry keys. A second event would mean the guard and the driver both
+    /// settled.
+    #[tokio::test]
+    async fn aborted_host_turn_emits_one_terminal_event_and_clears_the_registry() {
+        use crate::engine::ChildEntry;
+        use crate::event_sink::{Emit, EventSink};
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicBool;
+
+        struct Collecting(Mutex<Vec<String>>);
+        impl Emit for Collecting {
+            fn emit_json(&self, _name: &str, raw_json: &str) {
+                self.0.lock().unwrap().push(raw_json.to_string());
+            }
+        }
+
+        let emitter = Arc::new(Collecting(Mutex::new(Vec::new())));
+        let registry = Arc::new(ProcessRegistry::default());
+        let killed = Arc::new(AtomicBool::new(true));
+        let run_id = "abort-settle".to_string();
+        let virtual_pid = 4_000_000_202u32;
+        registry.insert(
+            run_id.clone(),
+            ChildEntry {
+                child: None,
+                pid: virtual_pid,
+                run_id: run_id.clone(),
+                killed: Arc::clone(&killed),
+                reader_abort: Arc::new(std::sync::OnceLock::new()),
+                stdin: None,
+                questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let core = TurnCore {
+            sink: EventSink::new(emitter.clone()),
+            registry: Arc::clone(&registry),
+            engine_id: "kimi".to_string(),
+            run_id: run_id.clone(),
+            db: None,
+        };
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _guard = HostTurnGuard::arm(&core, killed, virtual_pid);
+            let _ = armed_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        // Abort before the first poll drops the future without running `arm`.
+        // The registry backstop aborts a turn that is already inside the read
+        // loop, so the guard exists and its Drop must settle the run.
+        tokio::time::timeout(std::time::Duration::from_secs(2), armed_rx)
+            .await
+            .expect("guard should arm before the abort")
+            .expect("armed channel open");
+        task.abort();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("abort must finish dropping the turn")
+                .is_err(),
+            "abort must cancel the turn future"
+        );
+        let raw = emitter.0.lock().unwrap();
+        let mut terminal = Vec::new();
+        for batch in raw.iter() {
+            let parsed: Value = serde_json::from_str(batch).unwrap();
+            let items = parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]);
+            for event in items {
+                if matches!(event["kind"].as_str(), Some("done") | Some("error")) {
+                    terminal.push(event);
+                }
+            }
+        }
+        assert_eq!(
+            terminal.len(),
+            1,
+            "exactly one terminal event: {terminal:?}"
+        );
+        assert_eq!(terminal[0]["kind"], "done");
+        assert_eq!(terminal[0]["data"]["cancelled"], true);
+        assert_eq!(
+            registry.active_run_count(),
+            0,
+            "abort must clear the registry"
         );
     }
 }

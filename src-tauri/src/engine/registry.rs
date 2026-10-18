@@ -2,10 +2,10 @@
 //! interrupt routing, and teardown sweeps.
 
 use super::reader::READER_SETTLE_GRACE;
+use super::stdio_duplex::StdioWriter;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -40,8 +40,9 @@ pub struct ChildEntry {
     pub reader_abort: Arc<std::sync::OnceLock<tokio::task::AbortHandle>>,
     /// Interactive stdin kept open past the payload (`keep_stdin_open`):
     /// control responses (question answers) are written on it. Shared by the
-    /// run-id and session-id entries; `None` for one-shot runs.
-    pub stdin: Option<Arc<TokioMutex<Option<tokio::process::ChildStdin>>>>,
+    /// run-id and session-id entries; `None` for one-shot runs. The handle
+    /// only enqueues; it never waits on the pipe.
+    pub(crate) stdin: Option<StdioWriter>,
     /// Pending question requests (request_id -> full tool input) awaiting the
     /// user's answer; shared by both registry keys of the run.
     pub questions: Arc<Mutex<HashMap<String, Value>>>,
@@ -110,34 +111,30 @@ impl ProcessRegistry {
     /// Err when the run is unknown, its stdin is already closed, or the
     /// pipe refuses the write — a swallowed failure would leave the CLI
     /// parked while the caller believes the answer landed.
-    pub(crate) async fn write_line(&self, key: &str, line: String) -> Result<(), String> {
+    pub(crate) fn write_line(&self, key: &str, line: String) -> Result<(), String> {
         let stdin = self
             .get(key)
             .and_then(|entry| entry.stdin)
             .ok_or_else(|| "the session is no longer accepting input".to_string())?;
-        let mut guard = stdin.lock().await;
-        let handle = guard
-            .as_mut()
-            .ok_or_else(|| "the session's stdin is already closed".to_string())?;
-        handle
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| format!("write to the session's stdin: {e}"))?;
-        handle
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("write to the session's stdin: {e}"))
+        if stdin.is_closed() {
+            return Err("the session's stdin is already closed".to_string());
+        }
+        // Enqueue only. A parked answer must not take a lock a stuck pipe
+        // write still holds, or Stop and the next prompt stay frozen.
+        stdin.enqueue_text(line)?;
+        if let Some(error) = stdin.fatal() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Close a run's interactive stdin: the CLI treats EOF as the end of the
-    /// session and exits once the current turn is done.
+    /// session and exits once the current turn is done. Close is ordered
+    /// after every frame already queued.
     pub(crate) fn close_stdin(&self, key: &str) {
-        let Some(stdin) = self.get(key).and_then(|entry| entry.stdin) else {
-            return;
-        };
-        tokio::spawn(async move {
-            *stdin.lock().await = None;
-        });
+        if let Some(stdin) = self.get(key).and_then(|entry| entry.stdin) {
+            stdin.close();
+        }
     }
     /// Hand a host-stream driver's interactive stdin to the registry. Those
     /// drivers spawn their own child (the entry has `child: None`), but an
@@ -145,17 +142,13 @@ impl ProcessRegistry {
     /// `write_line` has to find it. One run is keyed twice (run id + session
     /// alias) and the alias was cloned before the child existed: both copies
     /// get the same handle or answering by session id would miss.
-    pub(crate) fn set_stdin(
-        &self,
-        key: &str,
-        stdin: Arc<TokioMutex<Option<tokio::process::ChildStdin>>>,
-    ) {
+    pub(crate) fn set_stdin(&self, key: &str, stdin: StdioWriter) {
         if let Ok(mut map) = self.0.lock() {
             let Some(run_id) = map.get(key).map(|entry| entry.run_id.clone()) else {
                 return;
             };
             for entry in map.values_mut().filter(|entry| entry.run_id == run_id) {
-                entry.stdin = Some(Arc::clone(&stdin));
+                entry.stdin = Some(stdin.clone());
             }
         }
     }
@@ -185,10 +178,7 @@ impl ProcessRegistry {
         plans
             .drain()
             .map(|(plan_id, context)| {
-                let revision = context
-                    .get("revision")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
+                let revision = context.get("revision").and_then(Value::as_i64).unwrap_or(0);
                 (plan_id, revision, context)
             })
             .collect()
@@ -865,10 +855,11 @@ mod registry_tests {
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].run_id, "run-2");
 
-        registry.get("run-2").unwrap().killed.store(
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        registry
+            .get("run-2")
+            .unwrap()
+            .killed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(registry.active_runs().is_empty());
     }
 
@@ -878,7 +869,13 @@ mod registry_tests {
         registry.insert("run-1".to_string(), stub_entry("run-1", 101));
         registry.note_run("run-1", "codex", None, "D:\\ws");
         // A fixed, old origin makes a reset-to-now regression deterministic.
-        registry.1.lock().unwrap().get_mut("run-1").unwrap().started_at = 1_700_000_000_000;
+        registry
+            .1
+            .lock()
+            .unwrap()
+            .get_mut("run-1")
+            .unwrap()
+            .started_at = 1_700_000_000_000;
         registry.note_run("run-1", "codex", Some("session-1"), "D:\\ws");
         registry.note_session("run-1", "session-1");
         registry.insert_alias("session-1".to_string(), stub_entry("run-1", 101));
@@ -886,7 +883,10 @@ mod registry_tests {
         let runs = registry.active_runs();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].started_at, 1_700_000_000_000);
-        assert_eq!(serde_json::to_value(&runs[0]).unwrap()["startedAt"], 1_700_000_000_000u64);
+        assert_eq!(
+            serde_json::to_value(&runs[0]).unwrap()["startedAt"],
+            1_700_000_000_000u64
+        );
         assert_eq!(registry.run_started_at("run-1"), Some(runs[0].started_at));
         registry.remove_if_pid("session-1", 101);
         assert!(registry.run_started_at("run-1").is_none());

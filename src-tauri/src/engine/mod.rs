@@ -42,14 +42,15 @@ mod qoder_session;
 mod reader;
 mod registry;
 pub mod resolve;
+mod stdio_duplex;
 pub mod wsl_transport;
 
 pub(crate) use resolve::command_for_binary;
 
 // Event types and tool-call/todo payload helpers (events.rs).
 pub(crate) use events::{
-    assistant_message, parse_todo_args, parse_todo_result, parse_tool_args_value, push_session_id, safe_prompt_arg,
-    tool_call_message, tool_call_message_with_id, tool_call_patch_with_id,
+    assistant_message, parse_todo_args, parse_todo_result, parse_tool_args_value, push_session_id,
+    safe_prompt_arg, tool_call_message, tool_call_message_with_id, tool_call_patch_with_id,
     tool_path_arg, tool_result_patch, tool_result_patch_with_id,
 };
 pub use events::{EngineEvent, TodoItem, TodosPayload};
@@ -61,7 +62,7 @@ pub use registry::{ActiveRun, ChildEntry, ProcessRegistry};
 pub use reader::sweep_staging_dirs;
 pub(crate) use reader::{
     cleanup_staged_files, read_line_capped, run_reader, spawn_stderr_capture, spawn_stdin_writer,
-    LineRead, RunContext, TurnCore, TurnState, VirtualRunGuard, MAX_LINE_BYTES,
+    HostTurnGuard, LineRead, RunContext, TurnCore, TurnState, VirtualRunGuard, MAX_LINE_BYTES,
 };
 
 use crate::event_sink;
@@ -539,7 +540,11 @@ fn prepare_launch(
     // 记忆工具注入的是本机 exe + 本机数据库,远端(WSL)CLI 拉不起来。
     // 发送时提示词快照已经冻结(里面写着「用 memory 工具」),所以这里显式
     // 拒绝,而不是挂一个起不来的服务器让模型自己发现工具不存在。
-    if wsl && memory_bot.as_deref().is_some_and(|id| !id.trim().is_empty()) {
+    if wsl
+        && memory_bot
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+    {
         return Err("记忆工具不支持远程工作区(WSL):注入的是本机程序".into());
     }
     // 工具白名单是硬约束：引擎不能兑现就直接拒绝启动（不降级为无约束）。
@@ -900,7 +905,9 @@ async fn send_message_inner_with_sink(
     allowed_tools: Option<Vec<String>>,
     origin: Option<String>,
 ) -> Result<SendResult, String> {
-    if origin.as_deref().is_some_and(|value| value != "hub") { return Err("send origin must be hub".into()); }
+    if origin.as_deref().is_some_and(|value| value != "hub") {
+        return Err("send origin must be hub".into());
+    }
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if run_id.is_empty()
         || run_id.len() > 128
@@ -948,20 +955,31 @@ async fn send_message_inner_with_sink(
     // The page that sent this turn may reload before the child exits.
     // Identity lives beside the process entry so that reload can paint the
     // session as still running. A failed launch drops it with the reservation.
-    state.processes.note_run(
-        &run_id,
-        &engine,
-        session_id.as_deref(),
-        &workspace_path,
-    );
+    state
+        .processes
+        .note_run(&run_id, &engine, session_id.as_deref(), &workspace_path);
     if sink.journals_chat() {
         let started_at = state.processes.run_started_at(&run_id).unwrap_or(0);
-        let source = if origin.as_deref() == Some("hub") { Ok("hub".to_string()) }
-            else { session_id.as_deref().map(|session| crate::history::journal::session_origin(&state.db, &engine, session))
-                .unwrap_or_else(|| Ok("local".to_string())) };
-        let recorded = source.and_then(|source| crate::history::journal::begin_with_origin(
-            &state.db, &run_id, &engine, session_id.as_deref(), &workspace_path, started_at, None, &source,
-        ));
+        let source = if origin.as_deref() == Some("hub") {
+            Ok("hub".to_string())
+        } else {
+            session_id
+                .as_deref()
+                .map(|session| crate::history::journal::session_origin(&state.db, &engine, session))
+                .unwrap_or_else(|| Ok("local".to_string()))
+        };
+        let recorded = source.and_then(|source| {
+            crate::history::journal::begin_with_origin(
+                &state.db,
+                &run_id,
+                &engine,
+                session_id.as_deref(),
+                &workspace_path,
+                started_at,
+                None,
+                &source,
+            )
+        });
         if let Err(error) = recorded {
             state.processes.remove_reservation(&run_id);
             return Err(format!("could not save chat turn: {error}"));
@@ -971,13 +989,27 @@ async fn send_message_inner_with_sink(
         let anchor_session = session_id.clone();
         let anchor = tauri::async_runtime::spawn_blocking(move || {
             anchor_session.as_deref().and_then(|session| {
-                crate::history::reader::journal_anchor(&db, &anchor_engine, session).ok().flatten()
+                crate::history::reader::journal_anchor(&db, &anchor_engine, session)
+                    .ok()
+                    .flatten()
             })
-        }).await.map_err(|e| e.to_string());
+        })
+        .await
+        .map_err(|e| e.to_string());
         let recorded = anchor.and_then(|anchor| {
-            let native_before = anchor.map(|m| serde_json::json!({"seq":m.seq,"role":m.role,"text":m.text,"ts":m.ts}).to_string());
-            state.db.0.lock().execute("UPDATE chat_runs SET native_before=?2 WHERE run_id=?1",
-                rusqlite::params![run_id,native_before]).map(|_| ()).map_err(|e| e.to_string())
+            let native_before = anchor.map(|m| {
+                serde_json::json!({"seq":m.seq,"role":m.role,"text":m.text,"ts":m.ts}).to_string()
+            });
+            state
+                .db
+                .0
+                .lock()
+                .execute(
+                    "UPDATE chat_runs SET native_before=?2 WHERE run_id=?1",
+                    rusqlite::params![run_id, native_before],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         });
         if let Err(error) = recorded {
             crate::history::journal::launch_result(&state.db, &run_id, None, Some(&error))?;
@@ -1021,17 +1053,30 @@ async fn send_message_inner_with_sink(
         if chat_sink.journals_chat() {
             chat_sink.flush();
             crate::history::journal::launch_result(&state.db, &reserved, None, Some(error))?;
-            let seq: i64 = state.db.0.lock().query_row(
-                "SELECT COALESCE(MAX(seq),0)+1 FROM chat_events WHERE run_id=?1", [&reserved], |r| r.get(0),
-            ).unwrap_or(1);
-            chat_sink.push(serde_json::json!({"runId": reserved, "engine": event_engine,
-                "sessionId": event_session, "seq": seq, "kind": "error", "data": error}));
+            let seq: i64 = state
+                .db
+                .0
+                .lock()
+                .query_row(
+                    "SELECT COALESCE(MAX(seq),0)+1 FROM chat_events WHERE run_id=?1",
+                    [&reserved],
+                    |r| r.get(0),
+                )
+                .unwrap_or(1);
+            chat_sink.push(
+                serde_json::json!({"runId": reserved, "engine": event_engine,
+                "sessionId": event_session, "seq": seq, "kind": "error", "data": error}),
+            );
             chat_sink.flush();
         }
         state.processes.remove_reservation(&reserved);
     } else if chat_sink.journals_chat() {
-        crate::history::journal::launch_result(&state.db, &reserved,
-            result.as_ref().ok().and_then(|r| r.session_id.as_deref()), None)?;
+        crate::history::journal::launch_result(
+            &state.db,
+            &reserved,
+            result.as_ref().ok().and_then(|r| r.session_id.as_deref()),
+            None,
+        )?;
     }
     result
 }
@@ -1198,6 +1243,7 @@ async fn send_reserved(
         &mut child,
         launch.built.stdin_payload,
         launch.built.keep_stdin_open,
+        &run_id,
     );
     let questions: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
     let plans: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1458,10 +1504,7 @@ pub async fn answer_question(
         .ok_or_else(|| "question is no longer pending".to_string())?;
     if let Some(context) = input.get("kimiAcp") {
         let frame = kimi_acp::answer_frame(context, answers.as_ref())?;
-        state
-            .processes
-            .write_line(&session_id, frame.to_string())
-            .await?;
+        state.processes.write_line(&session_id, frame.to_string())?;
         if let Ok(mut questions) = entry.questions.lock() {
             questions.remove(&request_id);
         }
@@ -1471,10 +1514,7 @@ pub async fn answer_question(
     // the answer is the JSON-RPC response line on the CLI's stdin.
     if let Some(acp) = input.get("grokAcp") {
         let frame = grok_acp::answer_frame(acp, answers.as_ref())?;
-        state
-            .processes
-            .write_line(&session_id, frame.to_string())
-            .await?;
+        state.processes.write_line(&session_id, frame.to_string())?;
         if let Ok(mut questions) = entry.questions.lock() {
             questions.remove(&request_id);
         }
@@ -1485,10 +1525,7 @@ pub async fn answer_question(
     // ask's advertised options.
     if let Some(acp) = input.get("minimaxAcp") {
         let frame = minimax_acp::answer_frame(acp, answers.as_ref())?;
-        state
-            .processes
-            .write_line(&session_id, frame.to_string())
-            .await?;
+        state.processes.write_line(&session_id, frame.to_string())?;
         if let Ok(mut questions) = entry.questions.lock() {
             questions.remove(&request_id);
         }
@@ -1499,10 +1536,7 @@ pub async fn answer_question(
     // issued — the card answers by question text.
     if let Some(app) = input.get("codexApp") {
         let frame = codex_app::answer_frame(app, answers.as_ref())?;
-        state
-            .processes
-            .write_line(&session_id, frame.to_string())
-            .await?;
+        state.processes.write_line(&session_id, frame.to_string())?;
         if let Ok(mut questions) = entry.questions.lock() {
             questions.remove(&request_id);
         }
@@ -1515,10 +1549,7 @@ pub async fn answer_question(
         let frame = pi_family::extension_ui_answer_frame(method, &request_id, answers.as_ref());
         // A failed write must surface: the frontend keeps the card pending on
         // Err instead of falsely marking the question answered.
-        state
-            .processes
-            .write_line(&session_id, frame.to_string())
-            .await?;
+        state.processes.write_line(&session_id, frame.to_string())?;
         if let Ok(mut questions) = entry.questions.lock() {
             questions.remove(&request_id);
         }
@@ -1631,7 +1662,7 @@ pub async fn answer_question(
     .to_string();
     // A failed write must surface: the frontend keeps the card pending on
     // Err instead of falsely marking the question answered.
-    state.processes.write_line(&session_id, line).await?;
+    state.processes.write_line(&session_id, line)?;
     // Delivered: drop the parked copy so the EOF drain skips it.
     if let Ok(mut questions) = entry.questions.lock() {
         questions.remove(&request_id);
@@ -1728,7 +1759,10 @@ pub async fn respond_plan_review(
     }
 
     // native_request:取出停住的上下文,校验它属于同一版本、正文未变。
-    let session_key = review.run_id.clone().unwrap_or_else(|| review.session_id.clone());
+    let session_key = review
+        .run_id
+        .clone()
+        .unwrap_or_else(|| review.session_id.clone());
     let entry = state
         .processes
         .get(&session_key)
@@ -1755,8 +1789,9 @@ pub async fn respond_plan_review(
             // 正文在审批期间变化:不能让已抢占版本带着旧正文继续执行——
             // 先失效,要求重新审阅(PR §4.2 末条)。
             let _ = plan_review::expire_reviews(&state.db, &[(plan_id.clone(), expected_revision)]);
-            return Err("plan content changed while awaiting review; the revision was expired"
-                .to_string());
+            return Err(
+                "plan content changed while awaiting review; the revision was expired".to_string(),
+            );
         }
     }
 
@@ -1779,14 +1814,18 @@ pub async fn respond_plan_review(
     let frame = substitute_plan_feedback(frame, feedback.as_deref());
 
     let written = match parked.get("route").and_then(Value::as_str) {
-        Some("stdin") => state.processes.write_line(&session_key, frame_to_line(&frame)).await,
+        Some("stdin") => state
+            .processes
+            .write_line(&session_key, frame_to_line(&frame)),
         Some("http") => {
             let origin = parked.get("origin").and_then(Value::as_str).unwrap_or("");
             let path = parked.get("path").and_then(Value::as_str).unwrap_or("");
             if origin.is_empty() || path.is_empty() {
                 Err("the parked native context is missing its http origin/path".to_string())
             } else {
-                crate::dsh_host::host_call(origin, path, frame).await.map(|_| ())
+                crate::dsh_host::host_call(origin, path, frame)
+                    .await
+                    .map(|_| ())
             }
         }
         _ => Err("the parked native context does not declare a reply route".to_string()),
@@ -2175,10 +2214,14 @@ mod permission_tests {
         assert!(args_value.contains("--memory-mcp"), "{args_value}");
         assert!(args_value.contains("\"bot-1\""), "{args_value}");
         // 默认不挂。
-        let off = codex::CodexEngine.host_command(&req(None), "fake-bin").unwrap();
-        assert!(!off.command.as_std().get_args().any(|a| a
-            .to_string_lossy()
-            .contains("ccgui-memory")));
+        let off = codex::CodexEngine
+            .host_command(&req(None), "fake-bin")
+            .unwrap();
+        assert!(!off
+            .command
+            .as_std()
+            .get_args()
+            .any(|a| a.to_string_lossy().contains("ccgui-memory")));
     }
 
     #[test]
@@ -2529,7 +2572,10 @@ mod permission_tests {
             let Err(message) = refusal else {
                 panic!("{id} plan request must be refused before spawn");
             };
-            assert!(message.contains("cannot run a human-approved plan"), "{message}");
+            assert!(
+                message.contains("cannot run a human-approved plan"),
+                "{message}"
+            );
             assert!(ensure_plan_approval(&id, engine.as_ref(), Some("auto")).is_ok());
         }
 
@@ -2547,7 +2593,10 @@ mod permission_tests {
         let mut auto_req = req(Some("auto"));
         auto_req.model = Some("openai-codex/gpt-5.4".into());
         let auto = argv(&pi_family::omp(), &auto_req);
-        let pin = auto.iter().position(|a| a == "--model").expect("model flag");
+        let pin = auto
+            .iter()
+            .position(|a| a == "--model")
+            .expect("model flag");
         assert_eq!(auto[pin + 1], "openai-codex/gpt-5.4");
         assert!(!auto.contains(&"--auto-approve".to_string()));
         let bypass = argv(&pi_family::omp(), &req(Some("bypass")));
@@ -3005,7 +3054,7 @@ mod plan_respond_tests {
         app: &tauri::App<tauri::test::MockRuntime>,
         key: &str,
         plan_id: &str,
-        stdin: Option<Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>>,
+        stdin: Option<stdio_duplex::StdioWriter>,
         extra: serde_json::Value,
     ) {
         let state = app.state::<crate::AppState>();
@@ -3044,13 +3093,11 @@ mod plan_respond_tests {
         tag: &str,
     ) -> (
         tokio::process::Child,
-        Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
+        stdio_duplex::StdioWriter,
         std::path::PathBuf,
     ) {
-        let out_path = std::env::temp_dir().join(format!(
-            "ccgui-plan-frames-{tag}-{}",
-            std::process::id()
-        ));
+        let out_path =
+            std::env::temp_dir().join(format!("ccgui-plan-frames-{tag}-{}", std::process::id()));
         let out_file = std::fs::File::create(&out_path).unwrap();
         #[cfg(windows)]
         let mut command = {
@@ -3065,7 +3112,7 @@ mod plan_respond_tests {
             .stdout(std::process::Stdio::from(out_file))
             .spawn()
             .unwrap();
-        let stdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take()));
+        let stdin = stdio_duplex::StdioWriter::spawn(child.stdin.take().expect("stdin"), tag);
         (child, stdin, out_path)
     }
 
@@ -3077,7 +3124,7 @@ mod plan_respond_tests {
     ) -> String {
         let entry = app.state::<crate::AppState>().processes.get(key).unwrap();
         if let Some(stdin) = entry.stdin {
-            *stdin.lock().await = None;
+            stdin.close();
         }
         child.wait().await.unwrap();
         let frames = std::fs::read_to_string(out_path).unwrap();
@@ -3111,7 +3158,11 @@ mod plan_respond_tests {
         assert!(written.contains("\"outcome\":\"approved\""), "{written}");
 
         // 停住的上下文已移除;重复提交同一 revision 返回冲突而非重复执行。
-        let entry = app.state::<crate::AppState>().processes.get("sess-a").unwrap();
+        let entry = app
+            .state::<crate::AppState>()
+            .processes
+            .get("sess-a")
+            .unwrap();
         assert!(entry.plans.lock().unwrap().is_empty());
         let again = respond_plan_review(
             app.state::<crate::AppState>(),
@@ -3163,7 +3214,7 @@ mod plan_respond_tests {
             &app,
             "sess-c",
             "plan-c",
-            Some(Arc::new(tokio::sync::Mutex::new(None))),
+            Some(stdio_duplex::StdioWriter::already_closed()),
             json!({}),
         );
 
@@ -3186,7 +3237,11 @@ mod plan_respond_tests {
         assert!(reverted.decision_intent_at.is_some());
         assert!(reverted.applied_at.is_none());
         // 停住的上下文保留,用户可重试。
-        let entry = app.state::<crate::AppState>().processes.get("sess-c").unwrap();
+        let entry = app
+            .state::<crate::AppState>()
+            .processes
+            .get("sess-c")
+            .unwrap();
         assert!(entry.plans.lock().unwrap().contains_key("plan-c"));
     }
 

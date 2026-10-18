@@ -52,8 +52,8 @@ use crate::engine::qoder_session::{
     QoderSessionUpdate, PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT, SESSION_NEW_TIMEOUT,
 };
 use crate::engine::{
-    cleanup_staged_files, BuiltCommand, EngineEvent, SendRequest, TurnCore, TurnState,
-    VirtualRunGuard,
+    cleanup_staged_files, BuiltCommand, EngineEvent, HostTurnGuard, SendRequest, TurnCore,
+    TurnState,
 };
 
 /// elicitation select 的批准选项标签；OMP 严格相等判定
@@ -101,9 +101,8 @@ pub(crate) async fn run_acp_turn(
     } = built;
     let mut state = TurnState::new(None);
     let mut view = TurnView::default();
-    // Abort-safe backstop（同 grok）：任务被 abort/panic 时不让注册键泄漏。
-    let _registry_guard =
-        VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
+    // Abort-safe backstop（同 grok）：任务被 abort 时仍发出一条终态并清注册键。
+    let mut host_guard = HostTurnGuard::arm(&core, Arc::clone(&killed), virtual_pid);
     let result = if req.session_id.is_some() {
         // 双保险：build_command 已在 spawn 前拒绝；防御层被绕过同样不许
         // 在一个没有人工等待点的恢复会话里跑计划。
@@ -124,13 +123,15 @@ pub(crate) async fn run_acp_turn(
         }
         crate::engine::reader::expire_parked_plans(&core, &mut state, &key);
     }
+    let was_killed = killed.load(Ordering::SeqCst);
+    let failed = result.is_err();
     if let Err(error) = result {
-        if !killed.load(Ordering::SeqCst) {
+        if !was_killed {
             core.dispatch_event(&mut state, EngineEvent::Error(error));
         }
     }
     if !state.saw_done && !state.saw_error {
-        let usage = if killed.load(Ordering::SeqCst) {
+        let usage = if was_killed {
             None
         } else {
             view.last_usage.clone()
@@ -138,6 +139,7 @@ pub(crate) async fn run_acp_turn(
         let session_id = state.native_session_id.clone();
         core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
     }
+    host_guard.disarm_settled(was_killed, failed && !was_killed);
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     if let Some(session_id) = state.native_session_id.clone() {
         core.registry.remove_if_pid(&session_id, virtual_pid);
@@ -160,8 +162,9 @@ async fn turn_inner(
     let mut spawned = spawn_piped_acp(command, &core.engine_id, &req.workspace)?;
     // 审批帧经注册表里的这根 stdin 回写（respond_plan_review 的
     // route:"stdin" 路径），必须在握手前挂上。
+    spawned.acp.bind_run(&core.run_id);
     core.registry
-        .set_stdin(&core.run_id, Arc::clone(&spawned.acp.stdin));
+        .set_stdin(&core.run_id, spawned.acp.stdin.clone());
     let result = handshake_and_prompt(&mut spawned.acp, core, state, view, req, killed).await;
     // ACP 是驻留会话协议：prompt 应答后 CLI 仍在，每条退出路径都拆树。
     teardown(&mut spawned.child).await;
@@ -650,7 +653,10 @@ fn plan_candidate_names(local_root: &Path, slug: Option<&str>) -> Vec<String> {
                 .filter_map(|entry| {
                     let name = entry.file_name().to_string_lossy().into_owned();
                     let is_plan = name.to_ascii_lowercase().ends_with("plan.md");
-                    let is_file = entry.file_type().map(|kind| kind.is_file()).unwrap_or(false);
+                    let is_file = entry
+                        .file_type()
+                        .map(|kind| kind.is_file())
+                        .unwrap_or(false);
                     if is_plan && is_file {
                         let mtime = entry
                             .metadata()
@@ -724,8 +730,9 @@ fn load_verified_plan(local_roots: &[PathBuf], params: &Value) -> Result<(String
         .get("message")
         .and_then(Value::as_str)
         .ok_or_else(|| "OMP 计划 elicitation 缺少 message，无法核验正文".to_string())?;
-    let (title, preview) = parse_approval_message(message)
-        .ok_or_else(|| "OMP 计划 elicitation 的 message 不是计划审批格式，拒绝凭摘要批准".to_string())?;
+    let (title, preview) = parse_approval_message(message).ok_or_else(|| {
+        "OMP 计划 elicitation 的 message 不是计划审批格式，拒绝凭摘要批准".to_string()
+    })?;
     if local_roots.is_empty() {
         return Err(
             "在本机 OMP 会话目录中找不到该会话的 artifacts 目录（自定义 session-dir/profile 布局未覆盖），按失败关闭拒绝批准"
@@ -890,7 +897,10 @@ fn handle_session_update(
             input,
         } => {
             view.tool_names.insert(tool_id, tool_name.clone());
-            core.dispatch_event(state, crate::engine::tool_call_message(tool_name, input.as_ref()));
+            core.dispatch_event(
+                state,
+                crate::engine::tool_call_message(tool_name, input.as_ref()),
+            );
         }
         QoderSessionUpdate::ToolCompleted {
             tool_id,
@@ -1041,10 +1051,8 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ccgui-omp-acp-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ccgui-omp-acp-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1120,9 +1128,10 @@ mod tests {
 
     #[test]
     fn parses_the_approval_message_and_binds_the_preview() {
-        let (title, preview) =
-            parse_approval_message("Approve plan \"auth-refactor\" and start implementation?\n\n# 认证重构\n步骤一\n")
-                .expect("approval message");
+        let (title, preview) = parse_approval_message(
+            "Approve plan \"auth-refactor\" and start implementation?\n\n# 认证重构\n步骤一\n",
+        )
+        .expect("approval message");
         assert_eq!(title, "auth-refactor");
         assert_eq!(preview, "# 认证重构\n步骤一\n");
         // 非审批格式一律 None（ask 的消息、截断的消息）。
@@ -1136,7 +1145,10 @@ mod tests {
         assert!(!preview_matches(short, "a\nb\nc\n…"));
         let long: String = (1..=20).map(|n| format!("l{n}\n")).collect();
         let long = long.trim_end_matches('\n');
-        let head12 = (1..=12).map(|n| format!("l{n}")).collect::<Vec<_>>().join("\n");
+        let head12 = (1..=12)
+            .map(|n| format!("l{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(preview_matches(long, &format!("{head12}\n…")));
         assert!(!preview_matches(long, &head12));
         // 提案后正文被改动 → 拒绝。
@@ -1145,12 +1157,18 @@ mod tests {
 
     #[test]
     fn slug_and_heading_follow_the_cli_rules() {
-        assert_eq!(slug_from_title("auth-refactor"), Some("auth-refactor".into()));
+        assert_eq!(
+            slug_from_title("auth-refactor"),
+            Some("auth-refactor".into())
+        );
         // 尾部 -plan 剥掉（大小写不敏感），空 slug 回退净化标题。
         assert_eq!(slug_from_title("auth-plan"), Some("auth".into()));
         assert_eq!(slug_from_title("auth-PLAN"), Some("auth".into()));
         assert_eq!(slug_from_title("plan"), Some("plan".into()));
-        assert_eq!(slug_from_title("My feature plan.md"), Some("My-feature".into()));
+        assert_eq!(
+            slug_from_title("My feature plan.md"),
+            Some("My-feature".into())
+        );
         assert_eq!(slug_from_title("!!!"), None);
         // 第一个一级标题；## 与无空格 # 不算。
         assert_eq!(first_heading("# 认证重构\n正文"), Some("认证重构".into()));
@@ -1165,21 +1183,33 @@ mod tests {
         let tmp = Path::new("/private/var/folders/xx");
         // home 相对（含 home 本身）→ 前缀 `-`。
         assert_eq!(
-            encode_session_dir_name(Path::new("/Users/alice/proj"), Some(home), tmp, Path::new("/Users/alice/proj")),
+            encode_session_dir_name(
+                Path::new("/Users/alice/proj"),
+                Some(home),
+                tmp,
+                Path::new("/Users/alice/proj")
+            ),
             "-proj"
         );
-        assert_eq!(
-            encode_session_dir_name(home, Some(home), tmp, home),
-            "-"
-        );
+        assert_eq!(encode_session_dir_name(home, Some(home), tmp, home), "-");
         // tmp 相对 → `-tmp-…`。
         assert_eq!(
-            encode_session_dir_name(Path::new("/private/var/folders/xx/ws"), Some(home), tmp, Path::new("/private/var/folders/xx/ws")),
+            encode_session_dir_name(
+                Path::new("/private/var/folders/xx/ws"),
+                Some(home),
+                tmp,
+                Path::new("/private/var/folders/xx/ws")
+            ),
             "-tmp-ws"
         );
         // 其他绝对路径 → legacy `--…--`，分隔符与冒号转 `-`。
         assert_eq!(
-            encode_session_dir_name(Path::new("/Volumes/data/proj"), Some(home), tmp, Path::new("/Volumes/data/proj")),
+            encode_session_dir_name(
+                Path::new("/Volumes/data/proj"),
+                Some(home),
+                tmp,
+                Path::new("/Volumes/data/proj")
+            ),
             "--Volumes-data-proj--"
         );
     }
@@ -1235,9 +1265,8 @@ mod tests {
         assert!(loaded.contains("第一步"));
 
         // 预览对不上 → 拒绝（提案后改动）。
-        let stale = elicitation_params(
-            "Approve plan \"auth\" and start implementation?\n\n# 别的计划\n",
-        );
+        let stale =
+            elicitation_params("Approve plan \"auth\" and start implementation?\n\n# 别的计划\n");
         let error = load_verified_plan(&[local.clone()], &stale).unwrap_err();
         assert!(error.contains("不一致"), "{error}");
         // 没有 artifacts 根 → 拒绝。

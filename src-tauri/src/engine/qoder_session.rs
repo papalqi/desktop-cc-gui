@@ -24,9 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::io::BufReader;
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::{timeout, Instant};
 
 /// 提取并规范化上下文窗口字段
@@ -55,7 +54,7 @@ fn attach_context_window(mut usage: Value) -> Value {
     usage
 }
 
-use super::{EngineEvent, SendRequest, TurnCore, TurnState, VirtualRunGuard};
+use super::{EngineEvent, HostTurnGuard, SendRequest, TurnCore, TurnState};
 
 const ACP_PROTOCOL_VERSION: u32 = 1;
 pub(crate) const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -666,9 +665,10 @@ fn assemble_prompt_blocks(
 // ==================== ACP process ====================
 
 pub(crate) struct AcpProcess {
-    /// Shared with the registry: a parked question is answered by writing
-    /// this child's stdin from `answer_question`, not from the read loop.
-    pub(crate) stdin: Arc<TokioMutex<Option<ChildStdin>>>,
+    /// Shared with the registry: a parked question is answered by enqueueing
+    /// on this same writer. The read loop never waits on the pipe.
+    pub(crate) stdin: super::stdio_duplex::StdioWriter,
+    run_id: String,
     reader: BufReader<ChildStdout>,
     /// Partial-line bytes survive a cancelled read (KILL_POLL ticks land
     /// mid-line); read_line_capped only ever appends to it.
@@ -678,14 +678,37 @@ pub(crate) struct AcpProcess {
     limits: PumpLimits,
 }
 
+fn acp_timeout_message(
+    run_id: &str,
+    method: &str,
+    cancel_sent: bool,
+    hard_deadline: Option<Instant>,
+) -> String {
+    let reason = if cancel_sent {
+        "interrupt"
+    } else if hard_deadline.is_some_and(|hard| Instant::now() >= hard) {
+        "hard-cap"
+    } else {
+        "idle-timeout"
+    };
+    eprintln!("[acp] deadline run={run_id} method={method} reason={reason}");
+    if cancel_sent {
+        CANCELLED.to_string()
+    } else {
+        format!("{method} timed out")
+    }
+}
+
 impl AcpProcess {
     pub(crate) fn new(
-        stdin: Arc<TokioMutex<Option<ChildStdin>>>,
+        stdin: super::stdio_duplex::StdioWriter,
         stdout: ChildStdout,
         workspace_root: PathBuf,
+        run_id: &str,
     ) -> Self {
         Self {
             stdin,
+            run_id: run_id.to_string(),
             reader: BufReader::new(stdout),
             line_buf: Vec::new(),
             next_id: 1,
@@ -694,20 +717,22 @@ impl AcpProcess {
         }
     }
 
-    pub(crate) async fn write_line(&mut self, value: &Value) -> Result<(), String> {
+    /// Point logs and the shared writer at the registry run id. Spawn only
+    /// knows the binary label.
+    pub(crate) fn bind_run(&mut self, run_id: &str) {
+        self.run_id = run_id.to_string();
+        self.stdin.set_run_id(run_id);
+    }
+
+    pub(crate) fn write_line(&mut self, value: &Value) -> Result<(), String> {
+        if self.stdin.is_closed() {
+            return Err("the ACP session's stdin is already closed".to_string());
+        }
         let bytes = encode_ndjson(value)?;
-        let mut stdin = self.stdin.lock().await;
-        let handle = stdin
-            .as_mut()
-            .ok_or_else(|| "the ACP session's stdin is already closed".to_string())?;
-        handle
-            .write_all(&bytes)
-            .await
-            .map_err(|error| format!("failed to write ACP request: {error}"))?;
-        handle
-            .flush()
-            .await
-            .map_err(|error| format!("failed to flush ACP request: {error}"))?;
+        self.stdin.enqueue_frame(bytes)?;
+        if let Some(error) = self.stdin.fatal() {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -768,8 +793,7 @@ impl AcpProcess {
         let id = self.next_id;
         self.next_id += 1;
         let expected_key = id.to_string();
-        self.write_line(&jsonrpc_request(id, method, params))
-            .await?;
+        self.write_line(&jsonrpc_request(id, method, params))?;
         let limits = self.limits;
         let is_prompt = method == "session/prompt";
         let started_at = Instant::now();
@@ -786,19 +810,38 @@ impl AcpProcess {
             if killed.load(Ordering::SeqCst) {
                 match (cancel_sent_at, cancel_session_id) {
                     (None, Some(session_id)) => {
-                        let _ = self
-                            .notify("session/cancel", json!({ "sessionId": session_id }))
-                            .await;
+                        eprintln!(
+                            "[acp] settle run={} reason=interrupt method={method}",
+                            self.run_id
+                        );
+                        let _ = self.notify("session/cancel", json!({ "sessionId": session_id }));
                         let sent_at = Instant::now();
                         cancel_sent_at = Some(sent_at);
                         deadline = deadline.min(sent_at + limits.cancel_settle);
                     }
-                    (None, None) => return Err(CANCELLED.to_string()),
+                    (None, None) => {
+                        eprintln!(
+                            "[acp] deadline run={} method={method} reason=interrupt",
+                            self.run_id
+                        );
+                        return Err(CANCELLED.to_string());
+                    }
                     (Some(sent), _) if sent.elapsed() > limits.cancel_settle => {
+                        eprintln!(
+                            "[acp] deadline run={} method={method} reason=interrupt",
+                            self.run_id
+                        );
                         return Err(CANCELLED.to_string());
                     }
                     (Some(_), _) => {}
                 }
+            }
+            if let Some(error) = self.stdin.fatal() {
+                eprintln!(
+                    "[acp] stdio fatal run={} method={method} reason={error}",
+                    self.run_id
+                );
+                return Err(error);
             }
             let wait = if settled.is_some() {
                 let cap_remaining = drain_deadline
@@ -811,11 +854,12 @@ impl AcpProcess {
             } else {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(if cancel_sent_at.is_some() {
-                        CANCELLED.to_string()
-                    } else {
-                        format!("{method} timed out")
-                    });
+                    return Err(acp_timeout_message(
+                        &self.run_id,
+                        method,
+                        cancel_sent_at.is_some(),
+                        prompt_hard_deadline,
+                    ));
                 }
                 remaining.min(limits.kill_poll)
             };
@@ -828,6 +872,7 @@ impl AcpProcess {
             let bytes = match read {
                 Ok(Ok(super::LineRead::Line(bytes))) => bytes,
                 Ok(Ok(super::LineRead::Eof)) => {
+                    eprintln!("[acp] stdout eof run={} method={method}", self.run_id);
                     return match settled.take() {
                         Some(result) => Ok(result),
                         None => Err(format!("{method} ended: ACP stdout closed")),
@@ -840,6 +885,10 @@ impl AcpProcess {
                     ));
                 }
                 Ok(Err(error)) => {
+                    eprintln!(
+                        "[acp] stdout error run={} method={method} reason={error}",
+                        self.run_id
+                    );
                     return match settled.take() {
                         Some(result) => Ok(result),
                         None => Err(format!("{method} stdout error: {error}")),
@@ -852,11 +901,12 @@ impl AcpProcess {
                     // An idle read tick: re-check the deadline and the
                     // killed flag on the next loop pass.
                     if deadline.saturating_duration_since(Instant::now()).is_zero() {
-                        return Err(if cancel_sent_at.is_some() {
-                            CANCELLED.to_string()
-                        } else {
-                            format!("{method} timed out")
-                        });
+                        return Err(acp_timeout_message(
+                            &self.run_id,
+                            method,
+                            cancel_sent_at.is_some(),
+                            prompt_hard_deadline,
+                        ));
                     }
                     continue;
                 }
@@ -902,15 +952,15 @@ impl AcpProcess {
                         }
                     }
                     if let Some(response) = router(&other) {
-                        self.write_line(&response).await?;
+                        self.write_line(&response)?;
                     }
                 }
             }
         }
     }
 
-    async fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
-        self.write_line(&jsonrpc_notification(method, params)).await
+    fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
+        self.write_line(&jsonrpc_notification(method, params))
     }
 }
 
@@ -958,9 +1008,10 @@ pub(crate) fn spawn_piped_acp(
     Ok(SpawnedAcp {
         child,
         acp: AcpProcess::new(
-            Arc::new(TokioMutex::new(Some(stdin))),
+            super::stdio_duplex::StdioWriter::spawn(stdin, label),
             stdout,
             workspace.to_path_buf(),
+            label,
         ),
         stderr_buf: super::spawn_stderr_capture(stderr),
         #[cfg(windows)]
@@ -1010,22 +1061,47 @@ pub(crate) async fn run_acp_turn(
     killed: Arc<AtomicBool>,
     virtual_pid: u32,
 ) {
+    let mut command = super::command_for_binary(&bin);
+    command.arg("--acp");
+    run_prepared_turn(core, req, command, bin, killed, virtual_pid).await
+}
+
+/// Shared settle for a qoder ACP turn. `label` is the binary path in
+/// production (so the IDE-launcher guard still applies) and a test tag when
+/// the caller already built the command.
+async fn run_prepared_turn(
+    core: TurnCore,
+    req: SendRequest,
+    mut command: Command,
+    label: String,
+    killed: Arc<AtomicBool>,
+    virtual_pid: u32,
+) {
     let mut state = TurnState::new(req.session_id.clone());
     let mut view = TurnView::default();
     let preassigned_session_id = req.session_id.clone();
-    // Abort-safe backstop: the by-name removals below only run when the task
-    // finishes normally. An abort or a panic would otherwise leave this run's
-    // keys pinning a concurrency slot until app exit.
-    let _registry_guard =
-        VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
-    let result = turn_inner(&core, &mut state, &mut view, &req, &bin, &killed).await;
+    // Abort-safe backstop: an aborted turn never reaches the dispatch below,
+    // so the guard emits the one terminal event and frees the registry keys.
+    let mut host_guard = HostTurnGuard::arm(&core, Arc::clone(&killed), virtual_pid);
+    let result = turn_inner(
+        &core,
+        &mut state,
+        &mut view,
+        &req,
+        &mut command,
+        &label,
+        &killed,
+    )
+    .await;
+    let was_killed = killed.load(Ordering::SeqCst);
+    let failed = result.is_err();
     if let Err(error) = result {
-        if !killed.load(Ordering::SeqCst) {
+        if !was_killed {
             core.dispatch_event(&mut state, EngineEvent::Error(error));
         }
     }
     if !state.saw_done && !state.saw_error {
-        let usage = if killed.load(Ordering::SeqCst) {
+        let usage = if was_killed {
             None
         } else {
             view.last_usage.clone()
@@ -1033,6 +1109,7 @@ pub(crate) async fn run_acp_turn(
         let session_id = state.native_session_id.clone();
         core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
     }
+    host_guard.disarm_settled(was_killed, failed && !was_killed);
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     // Clean up both the native session id (if the engine reported one) and
     // the preassigned session id (if we resumed an existing conversation).
@@ -1052,15 +1129,17 @@ async fn turn_inner(
     state: &mut TurnState,
     view: &mut TurnView,
     req: &SendRequest,
-    bin: &str,
+    command: &mut Command,
+    label: &str,
     killed: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    if super::qoder::is_qoder_ide_launcher_bin(bin) {
+    if super::qoder::is_qoder_ide_launcher_bin(label) {
         return Err(
             "qoderBin must point to qodercli, not the Qoder IDE launcher (`qoder`)".to_string(),
         );
     }
-    let mut spawned = spawn_acp(bin, &req.workspace).await?;
+    let mut spawned = spawn_piped_acp(command, label, &req.workspace)?;
+    spawned.acp.bind_run(&core.run_id);
     let result = handshake_and_prompt(&mut spawned.acp, core, state, view, req, killed).await;
     teardown(&mut spawned.child).await;
     match result {
@@ -1732,5 +1811,313 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
         teardown(&mut spawned.child).await;
         let result = result.expect("idle prompt must time out before the test guard");
         assert_eq!(result.unwrap_err(), "session/prompt timed out");
+    }
+
+    const DUPLEX_BYTES: usize = 2 * 1024 * 1024;
+
+    fn process_alive(pid: u32) -> bool {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        sys.process(Pid::from_u32(pid)).is_some()
+    }
+
+    fn wait_until_dead(pid: u32) {
+        let started = std::time::Instant::now();
+        while process_alive(pid) {
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("pid {pid} is still alive");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Peer that, on `session/prompt` only, asks for a large file and then
+    /// writes a multi-megabyte stdout burst with `fs.writeSync` before it
+    /// reads stdin again. `session` mode also answers the qoder handshake.
+    fn write_duplex_peer(dir: &std::path::Path, session: bool) -> std::path::PathBuf {
+        let script = dir.join("peer.js");
+        let session_flag = if session { "true" } else { "false" };
+        let source = format!(
+            r#"
+const fs = require('fs');
+const session = {session_flag};
+const file = process.argv[2];
+const marker = process.argv[3];
+const pids = process.argv[4];
+if (pids) {{
+  const kid = require('child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{{}},1e9)'], {{stdio:'ignore'}});
+  fs.writeFileSync(pids, JSON.stringify({{pid: process.pid, child: kid.pid}}));
+}}
+function readUntil(pred) {{
+  let acc = Buffer.alloc(0);
+  const buf = Buffer.alloc(65536);
+  while (true) {{
+    const n = fs.readSync(0, buf, 0, buf.length);
+    if (n <= 0) return null;
+    acc = Buffer.concat([acc, buf.subarray(0, n)]);
+    let nl;
+    while ((nl = acc.indexOf(10)) >= 0) {{
+      const line = acc.subarray(0, nl).toString('utf8');
+      acc = acc.subarray(nl + 1);
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line);
+      if (pred(msg)) return msg;
+    }}
+  }}
+}}
+function reply(id, result) {{
+  fs.writeSync(1, JSON.stringify({{jsonrpc:'2.0', id, result}}) + '\n');
+}}
+readUntil(msg => {{
+  if (!msg.method) return false;
+  if (msg.method !== 'session/prompt') {{
+    if (!session) return false;
+    const result = msg.method === 'session/new' ? {{sessionId: 's-test'}} : {{}};
+    reply(msg.id, result);
+    return false;
+  }}
+  if (marker) fs.writeFileSync(marker, 'burst');
+  fs.writeSync(1, JSON.stringify({{jsonrpc:'2.0', id:'fs-1', method:'fs/read_text_file', params:{{path:file}}}}) + '\n');
+  const chunk = 'z'.repeat(32 * 1024);
+  let sent = 0;
+  while (sent < {bytes}) {{
+    const line = JSON.stringify({{jsonrpc:'2.0', method:'session/update', params:{{sessionId:'s-test', update:{{sessionUpdate:'agent_message_chunk', content:{{type:'text', text:chunk}}}}}}}}) + '\n';
+    fs.writeSync(1, line);
+    sent += Buffer.byteLength(line);
+  }}
+  const answer = readUntil(msg => String(msg.id) === 'fs-1');
+  const ok = !!(answer && answer.result && answer.result.content && answer.result.content.length >= {bytes});
+  reply(msg.id, ok ? {{stopReason:'end_turn'}} : {{stopReason:'error'}});
+  return true;
+}});
+"#,
+            session_flag = session_flag,
+            bytes = DUPLEX_BYTES,
+        );
+        std::fs::write(&script, source).unwrap();
+        script
+    }
+
+    fn temp_workspace(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ccgui-acp-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.txt");
+        std::fs::write(&big, vec![b'a'; DUPLEX_BYTES]).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn acp_full_duplex_burst_does_not_deadlock() {
+        let dir = temp_workspace("duplex");
+        let script = write_duplex_peer(&dir, false);
+        let file = dir.join("big.txt");
+        let mut command = Command::new("node");
+        command.arg(&script).arg(&file);
+        let mut spawned = spawn_piped_acp(&mut command, "acp-duplex", &dir).expect("node");
+        spawned.acp.limits.prompt_hard_cap = Duration::from_secs(30);
+        let mut updates = 0usize;
+        let outcome = timeout(
+            Duration::from_secs(8),
+            spawned.acp.routed(
+                "session/prompt",
+                json!({}),
+                Duration::from_secs(20),
+                &AtomicBool::new(false),
+                Some("s-test"),
+                &mut |line| match line {
+                    AcpLine::Notification { method, .. } if method == "session/update" => {
+                        updates += 1;
+                        None
+                    }
+                    AcpLine::AgentRequest { id, method, params } => {
+                        Some(answer_agent_request(&dir, id, method, params))
+                    }
+                    _ => None,
+                },
+            ),
+        )
+        .await;
+        teardown(&mut spawned.child).await;
+        let result = outcome
+            .expect("full-duplex burst must not deadlock the read loop")
+            .expect("prompt must complete");
+        assert_eq!(result["stopReason"], json!("end_turn"));
+        assert!(updates > 0, "stdout burst must be drained");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn acp_silent_peer_hits_idle_deadline_and_kills_child() {
+        let dir = temp_workspace("silent");
+        let pids = dir.join("pids.json");
+        let peer = r#"
+const fs = require('fs');
+fs.writeFileSync(process.argv[1], JSON.stringify({pid: process.pid}));
+setInterval(() => {}, 1e9);
+"#;
+        let mut command = Command::new("node");
+        command.args(["-e", peer, &pids.to_string_lossy()]);
+        let mut spawned = spawn_piped_acp(&mut command, "acp-silent", &dir).expect("node");
+        spawned.acp.limits = test_limits();
+        spawned.acp.limits.prompt_hard_cap = Duration::from_secs(30);
+        let big = "a".repeat(DUPLEX_BYTES);
+        let outcome = timeout(
+            Duration::from_secs(3),
+            spawned.acp.routed(
+                "session/prompt",
+                json!({ "prompt": big }),
+                Duration::from_millis(200),
+                &AtomicBool::new(false),
+                Some("s-test"),
+                &mut |_| None,
+            ),
+        )
+        .await;
+        let pid = spawned.child.id();
+        teardown(&mut spawned.child).await;
+        let err = outcome
+            .expect("a silent peer must hit the idle deadline, not the test guard")
+            .expect_err("silent peer ends with a typed timeout");
+        assert_eq!(err, "session/prompt timed out");
+        if let Some(pid) = pid {
+            wait_until_dead(pid);
+        }
+        let recorded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pids).unwrap()).unwrap();
+        wait_until_dead(recorded["pid"].as_u64().unwrap() as u32);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn acp_interrupt_during_stdio_deadlock_settles() {
+        use crate::engine::registry::ChildEntry;
+        use crate::engine::ProcessRegistry;
+        use crate::event_sink::{Emit, EventSink};
+        use std::collections::HashMap;
+
+        struct CollectingEmitter(std::sync::Mutex<Vec<String>>);
+        impl Emit for CollectingEmitter {
+            fn emit_json(&self, _name: &str, raw_json: &str) {
+                self.0.lock().unwrap().push(raw_json.to_string());
+            }
+        }
+
+        let dir = temp_workspace("interrupt");
+        let script = write_duplex_peer(&dir, true);
+        let file = dir.join("big.txt");
+        let marker = dir.join("marker");
+        let pids = dir.join("pids.json");
+        let mut command = Command::new("node");
+        command.arg(&script).arg(&file).arg(&marker).arg(&pids);
+
+        let emitter = std::sync::Arc::new(CollectingEmitter(std::sync::Mutex::new(Vec::new())));
+        let registry = std::sync::Arc::new(ProcessRegistry::default());
+        let killed = std::sync::Arc::new(AtomicBool::new(false));
+        let virtual_pid = 4_000_000_201u32;
+        let run_id = "duplex-interrupt".to_string();
+        registry.insert(
+            run_id.clone(),
+            ChildEntry {
+                child: None,
+                pid: virtual_pid,
+                run_id: run_id.clone(),
+                killed: std::sync::Arc::clone(&killed),
+                reader_abort: std::sync::Arc::new(std::sync::OnceLock::new()),
+                stdin: None,
+                questions: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                plans: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            },
+        );
+        let core = TurnCore {
+            sink: EventSink::new(emitter.clone()),
+            registry: std::sync::Arc::clone(&registry),
+            engine_id: "qoder".to_string(),
+            run_id: run_id.clone(),
+            db: None,
+        };
+        let req = SendRequest {
+            session_id: None,
+            workspace: dir.clone(),
+            prompt: "hi".into(),
+            prompt_contributions: Vec::new(),
+            native_compact: false,
+            images: Vec::new(),
+            model: None,
+            effort: None,
+            service_tier: None,
+            permission: None,
+            additional_dirs: Vec::new(),
+            provider_id: None,
+            computer_use: None,
+            memory_bot: None,
+            allowed_tools: None,
+        };
+        let mut task = tokio::spawn(run_prepared_turn(
+            core,
+            req,
+            command,
+            "acp-interrupt".into(),
+            std::sync::Arc::clone(&killed),
+            virtual_pid,
+        ));
+        let marked = timeout(Duration::from_secs(8), async {
+            loop {
+                if marker.exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if marked.is_err() {
+            task.abort();
+            let _ = task.await;
+            panic!("peer never reached the stdout burst");
+        }
+        killed.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        tokio::select! {
+            joined = &mut task => {
+                joined.expect("turn task");
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "interrupt must settle inside the cancel window plus margin, took {:?}",
+                    started.elapsed()
+                );
+            }
+            _ = tokio::time::sleep(Duration::from_secs(6)) => {
+                task.abort();
+                let _ = task.await;
+                panic!("turn did not settle within the cancel window plus margin");
+            }
+        }
+        let events = {
+            let raw = emitter.0.lock().unwrap();
+            let mut out = Vec::new();
+            for batch in raw.iter() {
+                let parsed: serde_json::Value = serde_json::from_str(batch).unwrap();
+                let items = parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]);
+                out.extend(items);
+            }
+            out
+        };
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event["kind"].as_str(), Some("done") | Some("error")))
+            .collect();
+        assert_eq!(terminal.len(), 1, "exactly one terminal event: {events:?}");
+        assert_eq!(terminal[0]["kind"], "done");
+        assert_eq!(terminal[0]["data"]["cancelled"], json!(true));
+        assert_eq!(registry.active_run_count(), 0, "registry must be drained");
+        let recorded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pids).unwrap()).unwrap();
+        wait_until_dead(recorded["pid"].as_u64().unwrap() as u32);
+        wait_until_dead(recorded["child"].as_u64().unwrap() as u32);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

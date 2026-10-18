@@ -42,7 +42,7 @@ use super::qoder_session::{
     QoderSessionUpdate, PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT, SESSION_NEW_TIMEOUT,
     SESSION_RESUME_TIMEOUT,
 };
-use super::{BuiltCommand, EngineEvent, SendRequest, TurnCore, TurnState, VirtualRunGuard};
+use super::{BuiltCommand, EngineEvent, HostTurnGuard, SendRequest, TurnCore, TurnState};
 
 /// The agent-initiated request that asks the user to choose. `session/update`
 /// notifications never carry it; it is the only method this driver parks.
@@ -85,11 +85,8 @@ pub(super) async fn run_acp_turn(
     let mut state = TurnState::new(req.session_id.clone());
     let mut view = TurnView::default();
     let preassigned_session_id = req.session_id.clone();
-    // Abort-safe backstop: the by-name removals below only run when the task
-    // finishes normally. An abort or a panic would otherwise leave this run's
-    // keys pinning a concurrency slot until app exit.
-    let _registry_guard =
-        VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
+    // Abort-safe backstop: an aborted turn never reaches the dispatch below.
+    let mut host_guard = HostTurnGuard::arm(&core, Arc::clone(&killed), virtual_pid);
     let result = turn_inner(&core, &mut state, &mut view, &req, &mut command, &killed).await;
     // Pending questions and parked plan reviews die with the turn: settle the
     // cards and expire the reviews BEFORE any terminal dispatch, or the
@@ -101,13 +98,15 @@ pub(super) async fn run_acp_turn(
         preassigned_session_id.clone(),
     ];
     settle_parked(&core, &mut state, parked_keys);
+    let was_killed = killed.load(Ordering::SeqCst);
+    let failed = result.is_err();
     if let Err(error) = result {
-        if !killed.load(Ordering::SeqCst) {
+        if !was_killed {
             core.dispatch_event(&mut state, EngineEvent::Error(error));
         }
     }
     if !state.saw_done && !state.saw_error {
-        let usage = if killed.load(Ordering::SeqCst) {
+        let usage = if was_killed {
             None
         } else {
             view.last_usage.clone()
@@ -115,6 +114,7 @@ pub(super) async fn run_acp_turn(
         let session_id = state.native_session_id.clone();
         core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
     }
+    host_guard.disarm_settled(was_killed, failed && !was_killed);
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     // A resumed conversation was keyed under the incoming session id, and the
     // handshake may have rekeyed it to the CLI's own id: drop both aliases.
@@ -157,8 +157,9 @@ async fn turn_inner(
     // The registry entry exists before this task runs, so a parked question's
     // answer always finds this child's stdin (and the session-id alias clones
     // it later, making `answer_question` work by either key).
+    spawned.acp.bind_run(&core.run_id);
     core.registry
-        .set_stdin(&core.run_id, Arc::clone(&spawned.acp.stdin));
+        .set_stdin(&core.run_id, spawned.acp.stdin.clone());
     let result = handshake_and_prompt(&mut spawned.acp, core, state, view, req, killed).await;
     // ACP is a session protocol: the CLI stays resident after the prompt
     // response, so every exit path tears the tree down.
@@ -542,9 +543,9 @@ fn terminal_message(raw: String, stderr_buf: &Arc<Mutex<String>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::plan_review;
     use crate::engine::registry::ChildEntry;
     use crate::engine::ProcessRegistry;
-    use crate::engine::plan_review;
     use crate::event_sink::{Emit, EventSink};
     use std::sync::Mutex as StdMutex;
 
@@ -800,8 +801,15 @@ mod tests {
             .plans
             .lock()
             .unwrap()
-            .insert("plan-1".to_string(), json!({ "revision": revision, "route": "stdin" }));
-        settle_parked(&core, &mut state, [Some("test-run".to_string()), None, None]);
+            .insert(
+                "plan-1".to_string(),
+                json!({ "revision": revision, "route": "stdin" }),
+            );
+        settle_parked(
+            &core,
+            &mut state,
+            [Some("test-run".to_string()), None, None],
+        );
         assert!(
             registry
                 .get("test-run")
@@ -812,10 +820,9 @@ mod tests {
                 .is_empty(),
             "the parked context leaves the registry with the run"
         );
-        let settled =
-            plan_review::get_review(core.db.as_ref().unwrap(), "plan-1", revision)
-                .unwrap()
-                .unwrap();
+        let settled = plan_review::get_review(core.db.as_ref().unwrap(), "plan-1", revision)
+            .unwrap()
+            .unwrap();
         assert_eq!(settled.status, plan_review::PlanStatus::Expired);
         core.sink.flush();
         let emitted = emitter.0.lock().unwrap().join(" ");
@@ -832,7 +839,11 @@ mod tests {
         core.engine_id = "kimi".into();
         let mut state = TurnState::new(None);
         assert!(park_question(&core, &mut state, &json!(7), &ask_params()).is_none());
-        settle_parked(&core, &mut state, [Some("test-run".to_string()), None, None]);
+        settle_parked(
+            &core,
+            &mut state,
+            [Some("test-run".to_string()), None, None],
+        );
         assert!(
             registry
                 .get("test-run")
@@ -844,9 +855,18 @@ mod tests {
             "the ask is drained by the settle, not left parked"
         );
         core.sink.flush();
-        assert!(emitter.0.lock().unwrap().join(" ").contains("question_settled"));
+        assert!(emitter
+            .0
+            .lock()
+            .unwrap()
+            .join(" ")
+            .contains("question_settled"));
         // Nothing parked, no db: settling again must not emit or fail.
-        settle_parked(&core, &mut state, [Some("test-run".to_string()), None, None]);
+        settle_parked(
+            &core,
+            &mut state,
+            [Some("test-run".to_string()), None, None],
+        );
     }
 
     #[test]

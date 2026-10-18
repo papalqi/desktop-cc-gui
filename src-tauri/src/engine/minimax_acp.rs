@@ -40,7 +40,7 @@ use super::qoder_session::{
     JSONRPC_INVALID_PARAMS, JSONRPC_METHOD_NOT_FOUND, PROMPT_TIMEOUT, RPC_HANDSHAKE_TIMEOUT,
     SESSION_NEW_TIMEOUT, SESSION_RESUME_TIMEOUT,
 };
-use super::{BuiltCommand, Engine, EngineEvent, SendRequest, TurnCore, TurnState, VirtualRunGuard};
+use super::{BuiltCommand, Engine, EngineEvent, HostTurnGuard, SendRequest, TurnCore, TurnState};
 
 /// Model catalog probe budget: a temp-dir session/new skips any workspace
 /// scan, so the handshake lands in seconds; the cap is pure slow-machine
@@ -83,11 +83,8 @@ pub(super) async fn run_acp_turn(
     let mut state = TurnState::new(req.session_id.clone());
     let mut view = TurnView::default();
     let preassigned_session_id = req.session_id.clone();
-    // Abort-safe backstop: the by-name removals below only run when the task
-    // finishes normally. An abort or a panic would otherwise leave this run's
-    // keys pinning a concurrency slot until app exit.
-    let _registry_guard =
-        VirtualRunGuard::new(Arc::clone(&core.registry), core.run_id.clone(), virtual_pid);
+    // Abort-safe backstop: an aborted turn never reaches the dispatch below.
+    let mut host_guard = HostTurnGuard::arm(&core, Arc::clone(&killed), virtual_pid);
     let result = turn_inner(&core, &mut state, &mut view, &req, &mut command, &killed).await;
     // Pending questions die with the turn: settle their cards BEFORE any
     // terminal dispatch, or the monotonic saw_done/saw_error guard in
@@ -105,13 +102,15 @@ pub(super) async fn run_acp_turn(
             core.dispatch_event(&mut state, EngineEvent::QuestionSettled { request_id });
         }
     }
+    let was_killed = killed.load(Ordering::SeqCst);
+    let failed = result.is_err();
     if let Err(error) = result {
-        if !killed.load(Ordering::SeqCst) {
+        if !was_killed {
             core.dispatch_event(&mut state, EngineEvent::Error(error));
         }
     }
     if !state.saw_done && !state.saw_error {
-        let usage = if killed.load(Ordering::SeqCst) {
+        let usage = if was_killed {
             None
         } else {
             view.last_usage.clone()
@@ -119,6 +118,7 @@ pub(super) async fn run_acp_turn(
         let session_id = state.native_session_id.clone();
         core.dispatch_event(&mut state, EngineEvent::Done { session_id, usage });
     }
+    host_guard.disarm_settled(was_killed, failed && !was_killed);
     core.registry.remove_if_pid(&core.run_id, virtual_pid);
     // A resumed conversation was keyed under the incoming session id, and the
     // handshake may have rekeyed it to the CLI's own id: drop both aliases.
@@ -144,8 +144,9 @@ async fn turn_inner(
     // The registry entry exists before this task runs, so a parked question's
     // answer always finds this child's stdin (and the session-id alias clones
     // it later, making `answer_question` work by either key).
+    spawned.acp.bind_run(&core.run_id);
     core.registry
-        .set_stdin(&core.run_id, Arc::clone(&spawned.acp.stdin));
+        .set_stdin(&core.run_id, spawned.acp.stdin.clone());
     let result = handshake_and_prompt(&mut spawned.acp, core, state, view, req, killed).await;
     // ACP is a session protocol: the CLI stays resident after the prompt
     // response, so every exit path tears the tree down.
@@ -195,9 +196,7 @@ async fn handshake_and_prompt(
         // The permission ask is the user's line to answer: return None so the
         // frame is written by `answer_question` (via the registry-held
         // stdin), not by the read loop.
-        AcpLine::AgentRequest { id, method, params }
-            if method == "session/request_permission" =>
-        {
+        AcpLine::AgentRequest { id, method, params } if method == "session/request_permission" => {
             park_permission(core, state, id, params)
         }
         // Forms this client cannot render release the CLI instead of holding
@@ -440,8 +439,7 @@ fn resolve_model_value(
     let options = session_result["configOptions"]
         .as_array()?
         .iter()
-        .find(|option| option["id"] == "model")?
-        ["options"]
+        .find(|option| option["id"] == "model")?["options"]
         .as_array()?;
     let candidates: Vec<(String, String)> = options
         .iter()
@@ -581,13 +579,16 @@ fn mode_id(permission: Option<&str>, session_result: &Value) -> Option<String> {
             .map(|_| id.to_string())
     });
     object_match.or_else(|| {
-        modes.iter().filter_map(|mode| mode.as_str()).find_map(|id| {
-            let lowered = id.to_lowercase();
-            needle
-                .iter()
-                .find(|word| lowered.contains(*word))
-                .map(|_| id.to_string())
-        })
+        modes
+            .iter()
+            .filter_map(|mode| mode.as_str())
+            .find_map(|id| {
+                let lowered = id.to_lowercase();
+                needle
+                    .iter()
+                    .find(|word| lowered.contains(*word))
+                    .map(|_| id.to_string())
+            })
     })
 }
 
@@ -762,7 +763,11 @@ pub(crate) fn models_from_config_options(session_result: &Value) -> Vec<ProbeMod
             name,
         });
     }
-    if let Some(index) = rows.iter().position(|row| row.is_default).filter(|i| *i > 0) {
+    if let Some(index) = rows
+        .iter()
+        .position(|row| row.is_default)
+        .filter(|i| *i > 0)
+    {
         let row = rows.remove(index);
         rows.insert(0, row);
     }
@@ -781,9 +786,8 @@ fn park_permission(
     rpc_id: &Value,
     params: &Value,
 ) -> Option<Value> {
-    let cancel = || {
-        jsonrpc_result_response(rpc_id, json!({ "outcome": { "outcome": "cancelled" } }))
-    };
+    let cancel =
+        || jsonrpc_result_response(rpc_id, json!({ "outcome": { "outcome": "cancelled" } }));
     // A malformed ask (no options array) must release the CLI inline — a
     // `None` here means "parked", and nothing would ever answer it.
     let Some(options) = params["options"].as_array() else {
@@ -851,9 +855,9 @@ pub(super) fn answer_frame(parked: &Value, answers: Option<&Value>) -> Result<Va
             json!({ "outcome": { "outcome": "cancelled" } }),
         ));
     };
-    let map = answers
-        .as_object()
-        .ok_or_else(|| "MiniMax answers must be an object keyed by the question text".to_string())?;
+    let map = answers.as_object().ok_or_else(|| {
+        "MiniMax answers must be an object keyed by the question text".to_string()
+    })?;
     let option_ids = parked
         .get("options")
         .and_then(Value::as_object)
@@ -976,8 +980,12 @@ mod tests {
     fn model_resolution_matches_live_config_values() {
         // Thinking variant preferred for a normal effort request…
         assert_eq!(
-            resolve_model_value(&model_session_result(), "minimax/MiniMax-M3", Some("medium"))
-                .as_deref(),
+            resolve_model_value(
+                &model_session_result(),
+                "minimax/MiniMax-M3",
+                Some("medium")
+            )
+            .as_deref(),
             Some("m:minimax:MiniMax-M3:v:thinking")
         );
         // …plain variant when the effort is off, with a fall-back to the
@@ -1011,7 +1019,10 @@ mod tests {
             resolve_model_value(&model_session_result(), "minimax/Nope-M99", None),
             None
         );
-        assert_eq!(resolve_model_value(&json!({}), "minimax/MiniMax-M3", None), None);
+        assert_eq!(
+            resolve_model_value(&json!({}), "minimax/MiniMax-M3", None),
+            None
+        );
     }
 
     #[test]
@@ -1022,10 +1033,7 @@ mod tests {
         );
         assert_eq!(
             parse_model_option_value("m:minimax:MiniMax-M2.7:v:thinking"),
-            Some((
-                "minimax/MiniMax-M2.7".to_string(),
-                "thinking".to_string()
-            ))
+            Some(("minimax/MiniMax-M2.7".to_string(), "thinking".to_string()))
         );
         assert_eq!(parse_model_option_value("minimax/MiniMax-M3"), None);
         assert_eq!(parse_model_option_value("m:::v:"), None);
@@ -1132,8 +1140,11 @@ mod tests {
         assert_eq!(parked["questions"][0]["options"][0]["label"], "Allow once");
         // The card payload the frontend renders, plus the context the answer
         // command reads (`input.get("minimaxAcp")`).
-        let frame = answer_frame(&parked["minimaxAcp"], Some(&json!({"Run rm -rf?": "Reject"})))
-            .unwrap();
+        let frame = answer_frame(
+            &parked["minimaxAcp"],
+            Some(&json!({"Run rm -rf?": "Reject"})),
+        )
+        .unwrap();
         assert_eq!(
             frame,
             json!({
@@ -1147,14 +1158,13 @@ mod tests {
             answer_frame(&parked["minimaxAcp"], None).unwrap()["result"],
             json!({ "outcome": { "outcome": "cancelled" } })
         );
-        assert!(answer_frame(&parked["minimaxAcp"], Some(&json!({"Run rm -rf?": "nuke"})))
-            .is_err());
+        assert!(
+            answer_frame(&parked["minimaxAcp"], Some(&json!({"Run rm -rf?": "nuke"}))).is_err()
+        );
         core.sink.flush();
         assert!(emitter.0.lock().unwrap().join(" ").contains("minimaxAcp"));
         // An ask with no answerable options releases the CLI inline.
-        assert!(
-            park_permission(&core, &mut state, &json!(8), &json!({ "options": [] })).is_some()
-        );
+        assert!(park_permission(&core, &mut state, &json!(8), &json!({ "options": [] })).is_some());
         // A malformed ask (no options at all) must release inline too — a
         // `None` would leave the CLI parked with nothing parked to answer it.
         let release = park_permission(&core, &mut state, &json!(9), &json!({ "sessionId": "s" }));
@@ -1177,15 +1187,19 @@ mod tests {
 
     #[test]
     fn usage_and_updates_project_onto_frontend_keys() {
-        let usage = prompt_usage(&json!({ "_meta": { "inputTokens": 10, "outputTokens": 5 } }))
-            .unwrap();
+        let usage =
+            prompt_usage(&json!({ "_meta": { "inputTokens": 10, "outputTokens": 5 } })).unwrap();
         assert_eq!(usage["totalTokens"], json!(15));
         assert_eq!(
-            usage_update(&json!({"update": {"sessionUpdate": "usage_update", "used": 100, "size": 200000}}))
-                .unwrap()["model_context_window"],
+            usage_update(
+                &json!({"update": {"sessionUpdate": "usage_update", "used": 100, "size": 200000}})
+            )
+            .unwrap()["model_context_window"],
             json!(200000)
         );
-        assert!(usage_update(&json!({"update": {"sessionUpdate": "agent_message_chunk"}})).is_none());
+        assert!(
+            usage_update(&json!({"update": {"sessionUpdate": "agent_message_chunk"}})).is_none()
+        );
         assert!(prompt_usage(&json!({})).is_none());
     }
 }
