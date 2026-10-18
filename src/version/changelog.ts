@@ -29,6 +29,24 @@ export function changelogEntryFor(version: string): ChangelogEntry | undefined {
 
 export const CHANGELOG_DATA: ChangelogEntry[] = [
   {
+    version: "1.3.2",
+    date: "2026-10-18",
+    content: {
+      zh: `🐛 修复
+- **ACP 与 Codex 回合卡死**：CLI 大量写 stdout、客户端同时回答 stdin 时，双方互等管道导致回合永久挂住。stdio 改为全双工（独立写任务、64 MiB 有界队列），空闲超时、硬上限和停止都能照常结束回合并杀掉子进程；stderr 采集不再因非法 UTF-8 停止排空。
+- **中断后运行一直显示进行中**：虚拟运行（qoder、grok、kimi、minimax、omp、dsh、opencode、Codex app-server）被中止时，现在恰好补发一条终态事件，序号接续本次运行、带上原生会话 id；opencode 中止后不再泄漏并发名额。
+- **ACP 长回合被误判空闲**：会话有活动就续期 prompt 空闲超时；长错误输出保留开头部分。
+- **远程网页**：连接中断的机器会提示等待；未送达的运行在重发前先关闭；只能在桌面完成的操作会说明原因；设置写入会标明目标机器，写入失败时恢复原值。
+- **侧栏与会话**：会话行显示所在项目和引擎标题；置顶行分为标题行与机器行；归档、置顶按钮保留在会话行；窄于 1280px 时面板标签仍可用。`,
+      en: `🐛 Fixes
+- **Frozen ACP and Codex turns**: a turn could hang forever when the CLI wrote a large stdout burst while the client answered on stdin. Stdio is now full duplex (a dedicated writer task with a bounded 64 MiB queue), so idle timeouts, the hard cap and Stop still settle the run and kill the child. Stderr capture no longer stops draining on invalid UTF-8.
+- **Runs stuck as running after an interrupt**: aborting a virtual run (qoder, grok, kimi, minimax, omp, dsh, opencode, Codex app-server) now emits exactly one terminal event, with the run's next sequence number and its native session id. An aborted opencode turn no longer leaks a concurrency slot.
+- **Long ACP turns timed out as idle**: session activity now renews the prompt idle timeout, and long error output keeps its beginning.
+- **Remote web**: an offline machine tells the interface to wait; an unreceived run is closed before a resend is offered; desktop-only actions explain why; settings writes name the target machine and restore the previous value when the write fails.
+- **Sidebar and sessions**: session rows show the local project and the engine title; pinned rows split into a title line and a machine line; archive and pin stay on the row; panel tabs stay available below 1280px.`,
+    },
+  },
+  {
     version: "1.3.1",
     date: "2026-10-16",
     content: {
