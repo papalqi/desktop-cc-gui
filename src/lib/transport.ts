@@ -99,6 +99,22 @@ const HEARTBEAT_DEADLINE_MS = 10_000;
 const RESUME_DEADLINE_MS = 5_000;
 /** Pushed right after hello, before late subscribers exist; the latest replays to them. */
 const STICKY_EVENTS = new Set(["machines://status"]);
+
+/** Hub `machines://status` rows. Null when the payload is not that shape. */
+function statusOnline(payload: unknown): Map<string, boolean> | null {
+  if (!payload || typeof payload !== "object") return null;
+  const machines = (payload as { machines?: unknown }).machines;
+  if (!Array.isArray(machines)) return null;
+  const online = new Map<string, boolean>();
+  for (const row of machines) {
+    if (!row || typeof row !== "object") continue;
+    const name = (row as { name?: unknown }).name;
+    const isOnline = (row as { online?: unknown }).online;
+    if (typeof name !== "string" || !name || typeof isOnline !== "boolean") continue;
+    online.set(name, isOnline);
+  }
+  return online;
+}
 let bridgeGeneration = 0;
 
 /** `reconnecting` follows a connection that had said hello. A half-open
@@ -171,9 +187,6 @@ class WebBridge {
   private listeners = new Map<string, Set<Listener>>();
   private retryMs = 1000;
   private versionValue: string | null = null;
-  /** Hello `version` last seen for an executor. A different value drops that machine's misses. */
-  private executorVersions = new Map<string, string | null>();
-  private unnamedExecutorVersion: string | null | undefined = undefined;
   private versionWaiters: ((v: string | null) => void)[] = [];
   /** Hello on the attempt in progress. A previous connection does not count. */
   private helloSeen = false;
@@ -187,6 +200,10 @@ class WebBridge {
   private pingDeadline: number | null = null;
   private lastFrameAt = 0;
   private sticky = new Map<string, unknown>();
+  /** `online` last seen on this socket. Absent means this snapshot did not list the machine. */
+  private machineOnline = new Map<string, boolean>();
+  /** The first `machines://status` after open records the baseline and does not clear. */
+  private sawMachineStatus = false;
 
   constructor() {
     document.addEventListener("visibilitychange", () => {
@@ -217,6 +234,9 @@ class WebBridge {
     // The shared multi-machine socket is not one executor; reconnect() drops
     // the machine it was aimed at.
     if (!webMultiMachine()) forgetBridgeMachine(webMachine());
+    // A new socket does not inherit the previous connection's presence.
+    this.machineOnline.clear();
+    this.sawMachineStatus = false;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     this.helloSeen = false;
     const machine = webMultiMachine() ? null : webMachine();
@@ -260,6 +280,8 @@ class WebBridge {
       version?: string;
       machine?: string | null;
       global?: boolean;
+      hub?: boolean;
+      online?: boolean;
       id?: unknown;
       ok?: boolean;
       payload?: unknown;
@@ -286,8 +308,10 @@ class WebBridge {
       const named = typeof msg.machine === "string" && msg.machine ? msg.machine : null;
       if (named) setWebMachine(named);
       if (!webMultiMachine() && named) claimUnnamedUnknowns(named);
+      // Hub hello `version` is the hub (`createHub({ version })`), and a direct
+      // executor socket sends hello once, so version is not an upgrade signal.
+      if (msg.hub === true && !this.sawMachineStatus && named && msg.online === false) this.machineOnline.set(named, false);
       const version = typeof msg.version === "string" ? msg.version : null;
-      this.noteExecutorVersion(named ?? (webMultiMachine() ? null : webMachine()), version);
       this.helloSeen = true;
       this.everOpen = true;
       this.versionValue = version;
@@ -329,6 +353,7 @@ class WebBridge {
       return;
     }
     if (msg.type === "event" && typeof msg.name === "string") {
+      if (msg.name === "machines://status") this.noteMachineStatus(msg.payload);
       if (STICKY_EVENTS.has(msg.name)) this.sticky.set(msg.name, msg.payload);
       const subs = this.listeners.get(msg.name);
       if (subs) for (const cb of subs) cb(msg.payload, typeof msg.machine === "string" ? msg.machine : undefined);
@@ -571,15 +596,18 @@ class WebBridge {
     });
   }
 
-  /** Last hello version for this machine. A change means that executor was replaced. */
-  private noteExecutorVersion(machine: string | null, version: string | null): void {
-    if (machine === null) {
-      if (this.unnamedExecutorVersion !== undefined && this.unnamedExecutorVersion !== version) forgetUnknown(null);
-      this.unnamedExecutorVersion = version;
-      return;
+  /** Drop misses when a machine goes from offline or absent to `online: true`. */
+  private noteMachineStatus(payload: unknown): void {
+    const next = statusOnline(payload);
+    if (!next) return;
+    const baseline = !this.sawMachineStatus;
+    this.sawMachineStatus = true;
+    for (const [name, online] of next) {
+      if (!online) continue;
+      const previous = this.machineOnline.get(name);
+      if (baseline ? previous === false : previous !== true) forgetBridgeMachine(name);
     }
-    if (this.executorVersions.has(machine) && this.executorVersions.get(machine) !== version) forgetBridgeMachine(machine);
-    this.executorVersions.set(machine, version);
+    this.machineOnline = next;
   }
 
   /** Drop the socket and open another for this page's machine. */
