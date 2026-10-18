@@ -938,6 +938,17 @@ impl Drop for VirtualRunGuard {
     }
 }
 
+/// Log prefix for [`HostTurnGuard`]. Codex stays `codex` and every other
+/// engine that already logged `acp` stays `acp`. dsh and opencode derive the
+/// label from their engine id.
+fn settle_channel(engine_id: &str) -> &str {
+    match engine_id {
+        "codex" => "codex",
+        "dsh" | "opencode" => engine_id,
+        _ => "acp",
+    }
+}
+
 /// Abort backstop for a virtual host-stream turn. The registry's kill path
 /// aborts the turn task after the settle grace; an aborted future never
 /// reaches the driver's terminal dispatch, so the guard emits the one
@@ -995,12 +1006,11 @@ impl HostTurnGuard {
         self.armed = false;
     }
 
-    fn channel(&self) -> &'static str {
-        if self.engine_id == "codex" {
-            "codex"
-        } else {
-            "acp"
-        }
+    /// Log prefix. Codex stays `codex` and the ACP drivers stay `acp`.
+    /// dsh and opencode use their own engine id so an abort is not logged
+    /// as an ACP settle.
+    fn channel(&self) -> &str {
+        settle_channel(&self.engine_id)
     }
 
     fn emit_terminal(&self, kind: &str, data: Value) {
@@ -2201,6 +2211,16 @@ fs.writeSync(2, 'TAIL-MARK\n');
                 panic!("ring missing lossy text or tail, len={}", text.len());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn settle_channel_labels_dsh_and_opencode_without_changing_the_others() {
+        assert_eq!(super::settle_channel("codex"), "codex");
+        assert_eq!(super::settle_channel("dsh"), "dsh");
+        assert_eq!(super::settle_channel("opencode"), "opencode");
+        for engine in ["kimi", "grok", "minimax", "omp", "qoder", "qoder-cn"] {
+            assert_eq!(super::settle_channel(engine), "acp", "{engine}");
         }
     }
 

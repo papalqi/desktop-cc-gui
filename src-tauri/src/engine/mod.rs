@@ -62,7 +62,7 @@ pub use registry::{ActiveRun, ChildEntry, ProcessRegistry};
 pub use reader::sweep_staging_dirs;
 pub(crate) use reader::{
     cleanup_staged_files, read_line_capped, run_reader, spawn_stderr_capture, spawn_stdin_writer,
-    HostTurnGuard, LineRead, RunContext, TurnCore, TurnState, VirtualRunGuard, MAX_LINE_BYTES,
+    HostTurnGuard, LineRead, RunContext, TurnCore, TurnState, MAX_LINE_BYTES,
 };
 
 use crate::event_sink;
