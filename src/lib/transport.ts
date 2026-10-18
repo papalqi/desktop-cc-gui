@@ -22,12 +22,70 @@ export const webToken: string | null = isWeb
 type Listener = (payload: unknown, machine?: string) => void;
 
 interface PendingReq {
+  cmd: string;
   machine: string | null;
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
   timer: number | null;
   sent: boolean;
   historyTiming?: { startedAt: number; session: number };
+}
+
+/** Misses for one executor. A null machine is the unnamed connection, and in
+ *  multi-machine mode a hub-global command. Another machine must still be asked. */
+const permanentUnknown = new Map<string, Map<string, string>>();
+const unnamedUnknown = new Map<string, string>();
+
+function unknownBucket(machine: string | null): Map<string, string> {
+  if (machine === null) return unnamedUnknown;
+  let bucket = permanentUnknown.get(machine);
+  if (!bucket) {
+    bucket = new Map();
+    permanentUnknown.set(machine, bucket);
+  }
+  return bucket;
+}
+
+function unknownError(machine: string | null, cmd: string): string | undefined {
+  return (machine === null ? unnamedUnknown : permanentUnknown.get(machine))?.get(cmd);
+}
+
+function rememberUnknown(machine: string | null, cmd: string, errorText: string): void {
+  unknownBucket(machine).set(cmd, errorText);
+}
+
+function forgetUnknown(machine: string | null): void {
+  if (machine === null) unnamedUnknown.clear();
+  else permanentUnknown.delete(machine);
+}
+
+/** Drop misses for the executor this socket is about to talk to. */
+function forgetBridgeMachine(machine: string | null): void {
+  forgetUnknown(machine);
+  if (!webMultiMachine() && machine !== null) unnamedUnknown.clear();
+}
+
+/** A reply that arrived before hello still belongs to the machine hello names. */
+function claimUnnamedUnknowns(machine: string): void {
+  if (unnamedUnknown.size === 0) return;
+  const bucket = unknownBucket(machine);
+  for (const [cmd, errorText] of unnamedUnknown) {
+    if (!bucket.has(cmd)) bucket.set(cmd, errorText);
+  }
+  unnamedUnknown.clear();
+}
+
+/** The machine `WebBridge.invoke` sends to. Explicit target, else a global
+ *  command on the shared socket, else this page's machine. */
+function resolvedTarget(cmd: string, target: string | null | undefined): string | null {
+  if (target !== undefined) return target;
+  return webMultiMachine() && GLOBAL_COMMANDS.has(cmd) ? null : webMachine();
+}
+
+/** A single-machine miss recorded before hello uses the machine hello just named. */
+function attributedMachine(machine: string | null): string | null {
+  if (machine !== null || webMultiMachine()) return machine;
+  return webMachine();
 }
 
 const RETRY_MAX_MS = 10_000;
@@ -41,6 +99,22 @@ const HEARTBEAT_DEADLINE_MS = 10_000;
 const RESUME_DEADLINE_MS = 5_000;
 /** Pushed right after hello, before late subscribers exist; the latest replays to them. */
 const STICKY_EVENTS = new Set(["machines://status"]);
+
+/** Hub `machines://status` rows. Null when the payload is not that shape. */
+function statusOnline(payload: unknown): Map<string, boolean> | null {
+  if (!payload || typeof payload !== "object") return null;
+  const machines = (payload as { machines?: unknown }).machines;
+  if (!Array.isArray(machines)) return null;
+  const online = new Map<string, boolean>();
+  for (const row of machines) {
+    if (!row || typeof row !== "object") continue;
+    const name = (row as { name?: unknown }).name;
+    const isOnline = (row as { online?: unknown }).online;
+    if (typeof name !== "string" || !name || typeof isOnline !== "boolean") continue;
+    online.set(name, isOnline);
+  }
+  return online;
+}
 let bridgeGeneration = 0;
 
 /** `reconnecting` follows a connection that had said hello. A half-open
@@ -126,6 +200,10 @@ class WebBridge {
   private pingDeadline: number | null = null;
   private lastFrameAt = 0;
   private sticky = new Map<string, unknown>();
+  /** `online` last seen on this socket. Absent means this snapshot did not list the machine. */
+  private machineOnline = new Map<string, boolean>();
+  /** The first `machines://status` after open records the baseline and does not clear. */
+  private sawMachineStatus = false;
 
   constructor() {
     document.addEventListener("visibilitychange", () => {
@@ -152,6 +230,13 @@ class WebBridge {
     ) {
       return this.openGate!;
     }
+    // A replacement socket is this bridge reconnecting to the page's machine.
+    // The shared multi-machine socket is not one executor; reconnect() drops
+    // the machine it was aimed at.
+    if (!webMultiMachine()) forgetBridgeMachine(webMachine());
+    // A new socket does not inherit the previous connection's presence.
+    this.machineOnline.clear();
+    this.sawMachineStatus = false;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     this.helloSeen = false;
     const machine = webMultiMachine() ? null : webMachine();
@@ -195,6 +280,8 @@ class WebBridge {
       version?: string;
       machine?: string | null;
       global?: boolean;
+      hub?: boolean;
+      online?: boolean;
       id?: unknown;
       ok?: boolean;
       payload?: unknown;
@@ -218,10 +305,16 @@ class WebBridge {
         this.ws?.close();
         return;
       }
-      if (typeof msg.machine === "string" && msg.machine) setWebMachine(msg.machine);
+      const named = typeof msg.machine === "string" && msg.machine ? msg.machine : null;
+      if (named) setWebMachine(named);
+      if (!webMultiMachine() && named) claimUnnamedUnknowns(named);
+      // Hub hello `version` is the hub (`createHub({ version })`), and a direct
+      // executor socket sends hello once, so version is not an upgrade signal.
+      if (msg.hub === true && !this.sawMachineStatus && named && msg.online === false) this.machineOnline.set(named, false);
+      const version = typeof msg.version === "string" ? msg.version : null;
       this.helloSeen = true;
       this.everOpen = true;
-      this.versionValue = typeof msg.version === "string" ? msg.version : null;
+      this.versionValue = version;
       this.features = features;
       if (this.features.has("ping")) this.startHeartbeat();
       setBridgeState("open");
@@ -249,10 +342,18 @@ class WebBridge {
         });
       }
       if (msg.ok) entry.resolve(msg.payload);
-      else entry.reject(new Error(msg.error === "executor_history_offline" ? i18n.t("chat.executorHistoryOffline") : String(msg.error ?? "unknown error")));
+      else {
+        const raw = typeof msg.error === "string" ? msg.error : "";
+        const errorText = raw === "executor_history_offline"
+          ? i18n.t("chat.executorHistoryOffline")
+          : String(msg.error ?? "unknown error");
+        if (raw.startsWith("unknown command")) rememberUnknown(attributedMachine(entry.machine), entry.cmd, errorText);
+        entry.reject(new Error(errorText));
+      }
       return;
     }
     if (msg.type === "event" && typeof msg.name === "string") {
+      if (msg.name === "machines://status") this.noteMachineStatus(msg.payload);
       if (STICKY_EVENTS.has(msg.name)) this.sticky.set(msg.name, msg.payload);
       const subs = this.listeners.get(msg.name);
       if (subs) for (const cb of subs) cb(msg.payload, typeof msg.machine === "string" ? msg.machine : undefined);
@@ -397,12 +498,15 @@ class WebBridge {
 
   invoke<T>(cmd: string, args?: Record<string, unknown>, target?: string | null): Promise<T> {
     if (this.capabilityError) return Promise.reject(this.capabilityError);
-    const machine = target === undefined ? webMultiMachine() && GLOBAL_COMMANDS.has(cmd) ? null : webMachine() : target;
     if (!webMultiMachine() && target && target !== webMachine()) return Promise.reject(new Error("machine does not match this connection"));
+    const machine = resolvedTarget(cmd, target);
+    const rejected = unknownError(machine, cmd);
+    if (rejected) return Promise.reject(new Error(rejected));
     const id = this.nextId++;
     const { promise, resolve, reject } = Promise.withResolvers<T>();
     const timeout = requestTimeout(cmd);
     this.pending.set(id, {
+      cmd,
       machine,
       resolve: resolve as (v: unknown) => void,
       reject,
@@ -492,8 +596,23 @@ class WebBridge {
     });
   }
 
+  /** Drop misses when a machine goes from offline or absent to `online: true`. */
+  private noteMachineStatus(payload: unknown): void {
+    const next = statusOnline(payload);
+    if (!next) return;
+    const baseline = !this.sawMachineStatus;
+    this.sawMachineStatus = true;
+    for (const [name, online] of next) {
+      if (!online) continue;
+      const previous = this.machineOnline.get(name);
+      if (baseline ? previous === false : previous !== true) forgetBridgeMachine(name);
+    }
+    this.machineOnline = next;
+  }
+
   /** Drop the socket and open another for this page's machine. */
   reconnect(): Promise<void> {
+    forgetBridgeMachine(webMachine());
     this.capabilityError = null;
     bridgeGeneration += 1;
     this.stopHeartbeat();

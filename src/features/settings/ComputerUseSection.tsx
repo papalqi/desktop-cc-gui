@@ -10,7 +10,7 @@ import {
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
 import { errorText } from "@/lib/errors";
-import { IS_MAC } from "@/lib/platform";
+import { IS_MAC, isWeb } from "@/lib/platform";
 import { ipc, type ComputerUsePermissionStatus } from "@/lib/ipc";
 import { useChatStore } from "@/features/chat/store";
 import { engineSupportsComputerUse } from "@/features/chat/computer-use";
@@ -52,6 +52,8 @@ export function ComputerUseSection() {
 
   const openPane = useCallback(
     (kind: "accessibility" | "screenRecording") => {
+      // System Settings is a desktop pane. Permission status still loads.
+      if (isWeb) return;
       void ipc
         .computerUseOpenPermissionSettings(kind)
         .then(() => refreshStatus())

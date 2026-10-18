@@ -12,6 +12,7 @@ import {
   SettingsRow,
 } from "@/components/application/settings/settings-rows";
 import { ipc } from "@/lib/ipc";
+import { isWeb } from "@/lib/platform";
 import { listenSettingsChanged } from "@/lib/events";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 
@@ -74,6 +75,8 @@ export function WebAuthCard() {
    *  someone else" moment. The backend rotates it after every pairing and on a
    *  timer anyway; this just brings that forward. */
   const rotateKey = useCallback(() => {
+    // A phone that rotates the pairing key locks every other device out.
+    if (isWeb) return;
     setAuthBusy(true);
     void ipc
       .rotateWebPairKey()
@@ -114,7 +117,7 @@ export function WebAuthCard() {
             type="button"
             aria-label={t("settings.webAuthRotate")}
             title={t("settings.webAuthRotate")}
-            disabled={!canCopyKey || authBusy}
+            disabled={!canCopyKey || authBusy || isWeb}
             onClick={rotateKey}
             className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-lg text-foreground-icon-secondary transition-colors hover:bg-background-secondary-hover hover:text-foreground-icon-primary disabled:cursor-default disabled:text-foreground-icon-quaternary disabled:hover:bg-transparent"
           >

@@ -46,6 +46,22 @@ fn ser<T: serde::Serialize>(r: Result<T, String>) -> Result<Value, String> {
     r.and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
 }
 
+/// First time this process sees an unknown command, log it. Repeats are the
+/// same permanent gap (an old page, or a command this build does not route)
+/// and must not fill the error log on every poll.
+fn note_unknown_command(cmd: &str) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let mut seen = match SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+    {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    seen.insert(cmd.to_string())
+}
+
 /// 记忆写入失败保持结构化：错误以 JSON 字符串过桥，前端 memoryErrorMessage
 /// 按 code/kind 本地化。
 fn memory_ser<T: serde::Serialize>(
@@ -598,6 +614,143 @@ struct TerminalResizeArgs {
     rows: u16,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanReviewArgs {
+    engine: String,
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RespondPlanReviewArgs {
+    plan_id: String,
+    expected_revision: i64,
+    decision: crate::engine::plan_review::PlanDecision,
+    #[serde(default)]
+    feedback: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ActiveArgs {
+    active: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepoPathArgs {
+    repo_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorktreeCreateCall {
+    creation_id: String,
+    args: crate::git_worktree::WorktreeCreateArgs,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreationIdArgs {
+    creation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorktreeRemoveArgs {
+    repo_path: String,
+    worktree_path: String,
+    branch: Option<String>,
+    delete_branch: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitBranchMergedArgs {
+    repo_path: String,
+    branch: String,
+    base: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitResolvePrArgs {
+    repo_path: String,
+    input: String,
+    suggested_branch: String,
+    worktree_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MissionStartArgs {
+    engine: String,
+    prompt: String,
+    workspace_path: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MissionInterruptArgs {
+    run_id: String,
+}
+
+#[derive(Deserialize)]
+struct FontPathArgs {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct DeviceRenameArgs {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiProviderArgs {
+    engine: String,
+    provider_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiKeyArgs {
+    engine: String,
+    provider_id: String,
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct PiModelsWriteArgs {
+    engine: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceMetadataArgs {
+    plugin_id: String,
+    workspace_path: String,
+}
+
+#[derive(Deserialize)]
+struct EngineOnlyArgs {
+    engine: String,
+}
+
 /// Routes a bridge invoke to the same command functions the Tauri handler
 /// uses. Sync commands run inline: the heaviest (git diff, config writes) are
 /// milliseconds-scale, and the per-invoke tokio task keeps the read loop
@@ -623,6 +776,13 @@ pub(super) async fn dispatch(
     let secrets = crate::diagnostics::private_values(&raw);
     let identity = (raw["engine"].as_str().map(str::to_owned), raw["sessionId"].as_str().map(str::to_owned), raw["runId"].as_str().map(str::to_owned));
     let result = dispatch_inner(app, cmd, raw).await;
+    let unknown = result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.starts_with("unknown command:"));
+    if unknown && !note_unknown_command(cmd) {
+        return result;
+    }
     crate::diagnostics::record(crate::diagnostics::Entry {
         category: if result.is_ok() { "performance" } else { "error" }, level: if result.is_ok() { "info" } else { "error" },
         source: "rpc", operation: Some(cmd), message: result.as_ref().err().map(String::as_str),
@@ -1405,6 +1565,159 @@ async fn dispatch_inner(app: &tauri::AppHandle, cmd: &str, raw: Value) -> Result
             ser(crate::plugins::market::plugin_fetch_market_readme(a.id).await)
         }
         "plugin_check_updates" => ser(crate::plugins::market::plugin_check_updates().await),
+        // Plan reviews are session state. The remote card lists them and
+        // submits the same decision the desktop card does.
+        "list_plan_reviews" => {
+            let a: PlanReviewArgs = parse_args(&raw)?;
+            ser(crate::engine::list_plan_reviews(app.state(), a.engine, a.session_id).await)
+        }
+        "respond_plan_review" => {
+            let a: RespondPlanReviewArgs = parse_args(&raw)?;
+            ser(crate::engine::respond_plan_review(
+                app.state(),
+                a.plan_id,
+                a.expected_revision,
+                a.decision,
+                a.feedback,
+            )
+            .await)
+        }
+        // A remote-started computer-use run still executes on this desktop.
+        // Arming Esc is the person-at-the-machine stop, not a browser window.
+        "computer_use_set_active" => {
+            let a: ActiveArgs = parse_args(&raw)?;
+            ser(crate::computer_use::computer_use_set_active(app.clone(), a.active))
+        }
+        "computer_use_permission_status" => {
+            ser(Ok(crate::computer_use::computer_use_permission_status()))
+        }
+        // Worktree dialogs operate on the executor's repos.
+        "git_worktree_list" => {
+            let a: RepoPathArgs = parse_args(&raw)?;
+            ser(crate::git_worktree::git_worktree_list(a.repo_path).await)
+        }
+        "git_worktree_create" => {
+            let a: GitWorktreeCreateCall = parse_args(&raw)?;
+            ser(crate::git_worktree::git_worktree_create(
+                app.clone(),
+                app.state(),
+                a.creation_id,
+                a.args,
+            )
+            .await)
+        }
+        "git_worktree_create_cancel" => {
+            let a: CreationIdArgs = parse_args(&raw)?;
+            ser(Ok(crate::git_worktree::git_worktree_create_cancel(
+                app.state(),
+                a.creation_id,
+            )))
+        }
+        "git_worktree_remove" => {
+            let a: GitWorktreeRemoveArgs = parse_args(&raw)?;
+            ser(crate::git_worktree::git_worktree_remove(
+                a.repo_path,
+                a.worktree_path,
+                a.branch,
+                a.delete_branch,
+            )
+            .await)
+        }
+        "git_branch_merged" => {
+            let a: GitBranchMergedArgs = parse_args(&raw)?;
+            ser(crate::git_worktree::git_branch_merged(a.repo_path, a.branch, a.base).await)
+        }
+        "git_resolve_pr" => {
+            let a: GitResolvePrArgs = parse_args(&raw)?;
+            ser(crate::git_worktree::git_resolve_pr(
+                a.repo_path,
+                a.input,
+                a.suggested_branch,
+                a.worktree_path,
+            )
+            .await)
+        }
+        // Mission nodes use the same engine pipeline as send_message.
+        "mission_agent_start" => {
+            let a: MissionStartArgs = parse_args(&raw)?;
+            ser(crate::mission::mission_agent_start(
+                app.clone(),
+                a.engine,
+                a.prompt,
+                a.workspace_path,
+                a.model,
+                a.effort,
+                a.provider_id,
+                a.session_id,
+                a.allowed_tools,
+                a.run_id,
+            )
+            .await)
+        }
+        "mission_agent_interrupt" => {
+            let a: MissionInterruptArgs = parse_args(&raw)?;
+            ser(crate::mission::mission_agent_interrupt(app.clone(), a.run_id).await)
+        }
+        // Font bytes cross the JSON bridge. Callers pass a font-picker path.
+        "read_font_file" => {
+            let a: FontPathArgs = parse_args(&raw)?;
+            ser(crate::fonts::read_font_file(a.path))
+        }
+        "web_device_rename" => {
+            let a: DeviceRenameArgs = parse_args(&raw)?;
+            ser(super::web_device_rename(app.clone(), a.id, a.name))
+        }
+        // The DSH host process lives on the executor. Settings drives it.
+        "dsh_host_status" => ser(crate::dsh_host::dsh_host_status(app.state()).await),
+        "dsh_host_start" => ser(crate::dsh_host::dsh_host_start(app.state()).await),
+        "dsh_host_stop" => ser(crate::dsh_host::dsh_host_stop(app.state()).await),
+        // Same trust class as upsert_provider. Keys stay in the redacted args.
+        "pi_family_auth_list" => {
+            let a: EngineOnlyArgs = parse_args(&raw)?;
+            ser(crate::engine::pi_family_auth::pi_family_auth_list(a.engine))
+        }
+        "pi_family_auth_set_api_key" => {
+            let a: PiKeyArgs = parse_args(&raw)?;
+            ser(crate::engine::pi_family_auth::pi_family_auth_set_api_key(
+                a.engine,
+                a.provider_id,
+                a.key,
+            ))
+        }
+        "pi_family_auth_delete_credential" => {
+            let a: PiProviderArgs = parse_args(&raw)?;
+            ser(crate::engine::pi_family_auth::pi_family_auth_delete_credential(
+                a.engine,
+                a.provider_id,
+            ))
+        }
+        "pi_family_models_config_read" => {
+            let a: EngineOnlyArgs = parse_args(&raw)?;
+            ser(crate::engine::pi_family_auth::pi_family_models_config_read(a.engine))
+        }
+        "pi_family_models_config_write" => {
+            let a: PiModelsWriteArgs = parse_args(&raw)?;
+            ser(crate::engine::pi_family_auth::pi_family_models_config_write(
+                a.engine,
+                a.text,
+            ))
+        }
+        // Read of a registered workspace's facts for a plugin that already
+        // holds workspace.metadata.read. Not a filesystem grant.
+        "workspace_metadata" => {
+            let a: WorkspaceMetadataArgs = parse_args(&raw)?;
+            ser(crate::db::workspace_metadata(
+                app.state(),
+                a.plugin_id,
+                a.workspace_path,
+            ))
+        }
+        // The built-in creator skill is installed into the executor's engines.
+        "creator_skill_install" => ser(Ok(crate::creator_skill::creator_skill_install(app.clone()))),
         _ => Err(format!("unknown command: {cmd}")),
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_parity_test.rs"]
+mod dispatch_parity_test;

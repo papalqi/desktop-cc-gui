@@ -2,7 +2,9 @@ use super::{parse_session_file, Message, ParsedSession, SessionMeta};
 use base64::Engine as _;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -654,6 +656,17 @@ pub(super) fn canonical_session(db: &crate::db::Db, engine: &str, session: &str,
 pub(super) fn log_source_signature(db: &crate::db::Db, engine: &str, session: &str, processes: &crate::engine::ProcessRegistry, source: Option<&Path>) -> Result<String, String> {
     let path = match source { Some(path) => Some(path.to_path_buf()), None => find_session_file_path(db, engine, session)? };
     let stat = path.as_ref().and_then(|p| source_stamp(p));
+    signature_for(db, engine, session, processes, path, stat)
+}
+
+fn signature_for(
+    db: &crate::db::Db,
+    engine: &str,
+    session: &str,
+    processes: &crate::engine::ProcessRegistry,
+    path: Option<PathBuf>,
+    stat: Option<SourceStamp>,
+) -> Result<String, String> {
     let (_, accepted) = db.accepted_internal_frames(engine, session)?;
     let head: i64 = db.0.lock().query_row("SELECT COALESCE(MAX(e.cursor),0) FROM chat_events e JOIN chat_runs r ON r.run_id=e.run_id WHERE r.engine=?1 AND r.session_id=?2", rusqlite::params![engine,session], |r| r.get(0)).map_err(|e| e.to_string())?;
     let mut live: Vec<_> = processes.active_runs().into_iter().filter(|r| r.engine == engine && r.session_id.as_deref() == Some(session)).map(|r| {
@@ -663,7 +676,170 @@ pub(super) fn log_source_signature(db: &crate::db::Db, engine: &str, session: &s
         (r.run_id, questions)
     }).collect();
     live.sort();
-    serde_json::to_string(&(path,stat,accepted,head,live,super::journal::session_origin(db,engine,session)?)).map_err(|e| e.to_string())
+    serde_json::to_string(&(path, stat, accepted, head, live, super::journal::session_origin(db, engine, session)?)).map_err(|e| e.to_string())
+}
+
+/// One consistent append-only transcript prefix, plus the journal snapshot
+/// taken with it.
+pub(super) struct PrefixReady {
+    pub signature: String,
+    pub page: SessionPage,
+    pub ids: Vec<String>,
+    pub prefix_len: u64,
+    pub prefix_hash: String,
+    pub path: PathBuf,
+    pub grew_during_read: bool,
+    pub attempts: u32,
+}
+
+pub(super) enum PrefixRead {
+    /// Opencode, DSH, agy, or a session with no transcript file. Those sources
+    /// are not append-only; the caller keeps the full-parse race check.
+    Unsupported,
+    /// The file shrank, disappeared, or bytes inside the captured prefix changed.
+    Rewritten,
+    Ready(Box<PrefixReady>),
+}
+
+fn mtime_nanos(meta: &std::fs::Metadata) -> Option<u128> {
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+fn plain_transcript(engine: &str, path: &Path) -> bool {
+    if matches!(engine, "opencode" | "dsh" | "agy") {
+        return false;
+    }
+    super::split_opencode_db_path(path).is_none()
+}
+
+/// Invariant: a plain session transcript (codex, grok, claude, kimi, qoder, pi,
+/// omp jsonl) is append-only until compaction, rename, or truncation. Bytes
+/// `[0, prefix)` are immutable when a second read of those bytes matches and
+/// the file has not shrunk. The page is that prefix plus one journal snapshot.
+/// A torn trailing line is excluded only when the file grew past the captured
+/// length, so the next read returns the finished line once. A stable EOF with
+/// no newline is a complete last record.
+pub(super) fn read_append_only_prefix(
+    db: &crate::db::Db,
+    engine: &str,
+    session: &str,
+    processes: &crate::engine::ProcessRegistry,
+    source: Option<&Path>,
+) -> Result<PrefixRead, String> {
+    let path = match source {
+        Some(path) => path.to_path_buf(),
+        None => match find_session_file_path(db, engine, session)? {
+            Some(path) => path,
+            None => return Ok(PrefixRead::Unsupported),
+        },
+    };
+    if !plain_transcript(engine, &path) {
+        return Ok(PrefixRead::Unsupported);
+    }
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PrefixRead::Rewritten);
+        }
+        Err(error) => return Err(format!("stat transcript: {error}")),
+    };
+    let Some(captured_mtime) = mtime_nanos(&meta) else {
+        return Ok(PrefixRead::Unsupported);
+    };
+    let captured_len = meta.len();
+    if captured_len > usize::MAX as u64 {
+        return Err("transcript prefix is too large".into());
+    }
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PrefixRead::Rewritten);
+        }
+        Err(error) => return Err(format!("open transcript: {error}")),
+    };
+    let mut buf = vec![0u8; captured_len as usize];
+    if file.read_exact(&mut buf).is_err() {
+        return Ok(PrefixRead::Rewritten);
+    }
+    drop(file);
+    let now_len = match std::fs::metadata(&path) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PrefixRead::Rewritten);
+        }
+        Err(error) => return Err(format!("stat transcript: {error}")),
+    };
+    if now_len < captured_len {
+        return Ok(PrefixRead::Rewritten);
+    }
+    let grew = now_len > captured_len;
+    if grew {
+        match buf.iter().rposition(|byte| *byte == b'\n') {
+            Some(index) => buf.truncate(index + 1),
+            None => buf.clear(),
+        }
+    }
+    let mut check_file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PrefixRead::Rewritten);
+        }
+        Err(error) => return Err(format!("open transcript: {error}")),
+    };
+    let mut check = vec![0u8; buf.len()];
+    if check_file.read_exact(&mut check).is_err() || check != buf {
+        return Ok(PrefixRead::Rewritten);
+    }
+    let prefix_len = buf.len() as u64;
+    if check_file.metadata().map(|meta| meta.len()).unwrap_or(0) < prefix_len {
+        return Ok(PrefixRead::Rewritten);
+    }
+    let prefix_hash = format!("{:x}", Sha256::digest(&buf));
+    let (accepted, _) = db.accepted_internal_frames(engine, session)?;
+    let parsed = super::extract::parse_session_bytes(engine, &buf, &accepted)?;
+    let stamp = Some(((prefix_len, captured_mtime), None));
+    let mut attempts = 0u32;
+    let mut chosen = None;
+    for _ in 0..3 {
+        attempts += 1;
+        let before = signature_for(
+            db,
+            engine,
+            session,
+            processes,
+            Some(path.clone()),
+            stamp,
+        )?;
+        let (page, ids) = canonical_page(db, engine, session, &parsed, processes)?;
+        let after = signature_for(
+            db,
+            engine,
+            session,
+            processes,
+            Some(path.clone()),
+            stamp,
+        )?;
+        let consistent = before == after;
+        chosen = Some((before, page, ids));
+        if consistent {
+            break;
+        }
+    }
+    let (signature, page, ids) = chosen.ok_or("append prefix produced no page")?;
+    Ok(PrefixRead::Ready(Box::new(PrefixReady {
+        signature,
+        page,
+        ids,
+        prefix_len,
+        prefix_hash,
+        path,
+        grew_during_read: grew,
+        attempts,
+    })))
 }
 
 /// Sync body of `load_remote_session_page`, once the remote transcript is

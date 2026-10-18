@@ -1,6 +1,8 @@
 //! Revision metadata is durable; canonical message bodies remain in bounded memory.
 use super::{
-    reader::{canonical_session, log_source_signature, SessionPage},
+    reader::{
+        canonical_session, log_source_signature, read_append_only_prefix, PrefixRead, SessionPage,
+    },
     Message,
 };
 use crate::{db::Db, engine::ProcessRegistry};
@@ -9,7 +11,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    path::Path,
+    io::Read,
+    path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
 
@@ -72,6 +75,11 @@ struct Snapshot {
     page: SessionPage,
     bytes: usize,
     subagent_triggers: Vec<Option<i64>>,
+    /// Bytes of the append-only prefix this snapshot parsed. Empty hash means
+    /// the snapshot is not a prefix (journal-only or a non-plain source).
+    prefix_len: u64,
+    prefix_hash: String,
+    source_path: PathBuf,
 }
 #[derive(Default)]
 struct Cache {
@@ -262,6 +270,9 @@ fn record(
         page,
         bytes,
         subagent_triggers,
+        prefix_len: 0,
+        prefix_hash: String::new(),
+        source_path: PathBuf::new(),
     })
 }
 
@@ -272,14 +283,27 @@ fn slice(
     until: Option<i64>,
     limit: usize,
 ) -> LogPage {
+    // An in-flight copy pins the head it started from. Later appends belong
+    // to the next call. A requested head past this snapshot, or an epoch
+    // change, is still a rewrite.
+    let pinned = until.filter(|head| *head <= snapshot.head);
     let reset = after > snapshot.head
-        || epoch.is_some_and(|e| e != snapshot.epoch)
-        || until.is_some_and(|head| head != snapshot.head);
+        || epoch.is_some_and(|value| value != snapshot.epoch)
+        || until.is_some_and(|head| head > snapshot.head);
+    let ceiling = if reset {
+        snapshot.head
+    } else {
+        pinned.unwrap_or(snapshot.head)
+    };
     let mut rows = Vec::new();
     let mut bytes = 0;
     let mut has_more = false;
     if !reset {
-        for row in snapshot.rows.iter().filter(|row| row.rev > after) {
+        for row in snapshot
+            .rows
+            .iter()
+            .filter(|row| row.rev > after && row.rev <= ceiling)
+        {
             let size = row.payload_bytes + row.message_id.len() * 6 + 256;
             if rows.len() >= limit || !rows.is_empty() && bytes + size > PAGE_BYTES {
                 has_more = true;
@@ -294,11 +318,11 @@ fn slice(
     } else if has_more {
         rows.last().map_or(after, |row| row.rev)
     } else {
-        snapshot.head
+        ceiling
     };
     LogPage {
         rows,
-        head_rev: snapshot.head,
+        head_rev: if reset { snapshot.head } else { ceiling },
         epoch: snapshot.epoch,
         next_rev,
         has_more,
@@ -329,6 +353,94 @@ fn read(
     )
 }
 
+fn stored_head(db: &Db, engine: &str, session: &str) -> Result<Option<(i64, i64)>, String> {
+    db.0.lock()
+        .query_row(
+            "SELECT head_rev,epoch FROM session_log_heads WHERE engine=?1 AND session_id=?2",
+            params![engine, session],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+}
+
+/// The cached prefix is still the bytes we parsed. A shorter file or a
+/// different hash is a rewrite and must not be served from this snapshot.
+fn prefix_intact(snapshot: &Snapshot) -> bool {
+    if snapshot.prefix_hash.is_empty() {
+        return false;
+    }
+    let mut file = match std::fs::File::open(&snapshot.source_path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if meta.len() < snapshot.prefix_len {
+        return false;
+    }
+    let mut buf = vec![0u8; snapshot.prefix_len as usize];
+    if file.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    hash(&buf) == snapshot.prefix_hash
+}
+
+fn note_source_movement(
+    engine: &str,
+    session: &str,
+    attempts: u32,
+    started: std::time::Instant,
+    grew: bool,
+    prefix_bytes: u64,
+    message: &'static str,
+) {
+    crate::diagnostics::record(
+        crate::diagnostics::Entry {
+            category: "performance",
+            level: "info",
+            source: "sync",
+            operation: Some("session_log_since"),
+            message: Some(message),
+            engine: Some(engine),
+            session_id: Some(session),
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            metrics: Some(serde_json::json!({
+                "attempts": attempts,
+                "fileGrew": grew,
+                "prefixBytes": prefix_bytes,
+            })),
+            ..crate::diagnostics::Entry::default()
+        },
+        &[],
+    );
+}
+
+fn publish(
+    cache: &mut Cache,
+    key: (String, String, String),
+    snapshot: Snapshot,
+    after: i64,
+    epoch: Option<i64>,
+    until: Option<i64>,
+    limit: usize,
+) -> Result<LogPage, String> {
+    let result = slice(&snapshot, after, epoch, until, limit);
+    if let Some(old) = cache.entries.remove(&key) {
+        cache.bytes = cache.bytes.saturating_sub(old.bytes);
+    }
+    if snapshot.bytes <= CACHE_BYTES {
+        if cache.entries.len() >= CACHE_SESSIONS || cache.bytes + snapshot.bytes > CACHE_BYTES {
+            cache.entries.clear();
+            cache.bytes = 0;
+        }
+        cache.bytes += snapshot.bytes;
+        cache.entries.insert(key, snapshot);
+    }
+    Ok(result)
+}
+
 fn read_source(
     db: &Db,
     processes: &ProcessRegistry,
@@ -353,46 +465,74 @@ fn read_source(
             .map_err(|e| e.to_string())?;
     let key = (database, engine.to_string(), session.to_string());
     let limit = limit.unwrap_or(500).clamp(1, 500);
+    let started = std::time::Instant::now();
     let mut cache = CACHE.lock().map_err(|e| e.to_string())?;
-    for _ in 0..3 {
-        let signature = log_source_signature(db, engine, session, processes, source)?;
-        let head: Option<(i64, i64)> = db
-            .0
-            .lock()
-            .query_row(
-                "SELECT head_rev,epoch FROM session_log_heads WHERE engine=?1 AND session_id=?2",
-                params![engine, session],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        if let Some(hit) = cache
-            .entries
-            .get(&key)
-            .filter(|hit| hit.signature == signature && head == Some((hit.head, hit.epoch)))
-        {
-            return Ok(slice(hit, after, epoch, until, limit));
-        }
-        let (page, ids) = canonical_session(db, engine, session, processes, source)?;
-        if log_source_signature(db, engine, session, processes, source)? != signature {
-            continue;
-        }
-        let snapshot = record(db, engine, session, signature, page, ids)?;
-        let result = slice(&snapshot, after, epoch, until, limit);
-        if let Some(old) = cache.entries.remove(&key) {
-            cache.bytes = cache.bytes.saturating_sub(old.bytes);
-        }
-        if snapshot.bytes <= CACHE_BYTES {
-            if cache.entries.len() >= CACHE_SESSIONS || cache.bytes + snapshot.bytes > CACHE_BYTES {
-                cache.entries.clear();
-                cache.bytes = 0;
-            }
-            cache.bytes += snapshot.bytes;
-            cache.entries.insert(key, snapshot);
-        }
-        return Ok(result);
+    let signature = log_source_signature(db, engine, session, processes, source)?;
+    let stored = stored_head(db, engine, session)?;
+    if let Some(hit) = cache
+        .entries
+        .get(&key)
+        .filter(|hit| hit.signature == signature && stored == Some((hit.head, hit.epoch)))
+    {
+        return Ok(slice(hit, after, epoch, until, limit));
     }
-    Err("session changed while reading revision log".into())
+    if let Some(pinned) = until {
+        if let Some(hit) = cache.entries.get(&key) {
+            let epoch_ok = epoch.map(|value| value == hit.epoch).unwrap_or(true);
+            if epoch_ok && pinned <= hit.head && prefix_intact(hit) {
+                return Ok(slice(hit, after, epoch, Some(pinned), limit));
+            }
+        }
+    }
+    match read_append_only_prefix(db, engine, session, processes, source)? {
+        PrefixRead::Ready(ready) => {
+            let ready = *ready;
+            if ready.grew_during_read || ready.attempts > 1 {
+                note_source_movement(
+                    engine,
+                    session,
+                    ready.attempts,
+                    started,
+                    ready.grew_during_read,
+                    ready.prefix_len,
+                    "append-only prefix",
+                );
+            }
+            let mut snapshot = record(db, engine, session, ready.signature, ready.page, ready.ids)?;
+            snapshot.prefix_len = ready.prefix_len;
+            snapshot.prefix_hash = ready.prefix_hash;
+            snapshot.source_path = ready.path;
+            publish(&mut cache, key, snapshot, after, epoch, until, limit)
+        }
+        // Not append-only, or the prefix itself was rewritten. Keep the
+        // three full parses: a stable rewrite bumps epoch, a source that
+        // keeps changing is still an error.
+        PrefixRead::Unsupported | PrefixRead::Rewritten => {
+            let mut saw_change = false;
+            for attempt in 1..=3u32 {
+                let signature = log_source_signature(db, engine, session, processes, source)?;
+                let (page, ids) = canonical_session(db, engine, session, processes, source)?;
+                if log_source_signature(db, engine, session, processes, source)? != signature {
+                    saw_change = true;
+                    continue;
+                }
+                if saw_change {
+                    note_source_movement(
+                        engine,
+                        session,
+                        attempt,
+                        started,
+                        false,
+                        0,
+                        "source signature stabilized",
+                    );
+                }
+                let snapshot = record(db, engine, session, signature, page, ids)?;
+                return publish(&mut cache, key, snapshot, after, epoch, until, limit);
+            }
+            Err("session changed while reading revision log".into())
+        }
+    }
 }
 
 #[tauri::command]
@@ -584,10 +724,16 @@ mod tests {
             delta.rows[0].payload.as_ref().unwrap().result,
             patched.result
         );
+        // A tool-result patch grows the head without bumping the epoch. The
+        // page that already started stays on the revision it pinned; the
+        // patched row is the next call, not a reset.
+        let unfinished = slice(&changed, first.next_rev, Some(1), Some(first.head_rev), 500);
         assert!(
-            slice(&changed, first.next_rev, Some(1), Some(first.head_rev), 500).reset,
-            "a changed head invalidates unfinished pages"
+            !unfinished.reset,
+            "an in-flight copy stays on the revision it started"
         );
+        assert_eq!(unfinished.head_rev, first.head_rev);
+        assert!(unfinished.rows.iter().all(|row| row.rev <= first.head_rev));
         drop(db);
         let db = Db::open_at(&path).unwrap();
         let reopened = save(
@@ -947,5 +1093,295 @@ mod tests {
         assert!(reset.epoch > first.epoch);
         let updated = read(&db, &processes, "codex", "s", 0, None, None, None).unwrap();
         assert_eq!(updated.rows[0].payload.as_ref().unwrap().text, "edited");
+    }
+
+    fn codex_line(role: &str, text: &str) -> String {
+        let kind = if role == "user" {
+            "input_text"
+        } else {
+            "output_text"
+        };
+        json!({"type":"response_item","payload":{"type":"message","role":role,"content":[{"type":kind,"text":text}]}}).to_string()
+    }
+
+    fn insert_codex(db: &Db, path: &std::path::Path, session: &str) {
+        db.0.lock().execute(
+            "INSERT INTO sessions(engine,session_id,workspace_path,file_path,file_size,file_mtime_ms) VALUES('codex',?1,'/ws',?2,0,0)",
+            rusqlite::params![session, path.to_string_lossy().as_ref()],
+        ).unwrap();
+    }
+
+    /// The 3b757e562 reader: signature, full `canonical_session`, signature
+    /// again, three tries. A live append changes the stamp on every try.
+    fn read_source_3b757e562(
+        db: &Db,
+        processes: &ProcessRegistry,
+        session: &str,
+    ) -> Result<(), String> {
+        for _ in 0..3 {
+            let signature = log_source_signature(db, "codex", session, processes, None)?;
+            let _ = canonical_session(db, "codex", session, processes, None)?;
+            if log_source_signature(db, "codex", session, processes, None)? != signature {
+                continue;
+            }
+            return Ok(());
+        }
+        Err("session changed while reading revision log".into())
+    }
+
+    #[test]
+    fn append_keeps_the_pinned_revision_and_returns_the_tail_once() {
+        let scratch = Scratch::new();
+        let db = Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let path = scratch.0.join("grow.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                codex_line("user", "one"),
+                codex_line("assistant", "two")
+            ),
+        )
+        .unwrap();
+        insert_codex(&db, &path, "grow");
+        let processes = ProcessRegistry::default();
+        let first = read(&db, &processes, "codex", "grow", 0, None, None, Some(500)).unwrap();
+        assert_eq!(first.rows.len(), 2);
+        assert!(!first.reset);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        writeln!(file, "{}", codex_line("assistant", "three")).unwrap();
+        file.flush().unwrap();
+        drop(file);
+        let pinned = read(
+            &db,
+            &processes,
+            "codex",
+            "grow",
+            0,
+            Some(first.epoch),
+            Some(first.head_rev),
+            Some(500),
+        )
+        .unwrap();
+        assert!(!pinned.reset);
+        assert_eq!(pinned.head_rev, first.head_rev);
+        assert_eq!(pinned.epoch, first.epoch);
+        let texts: Vec<_> = pinned
+            .rows
+            .iter()
+            .map(|row| row.payload.as_ref().unwrap().text.clone())
+            .collect();
+        assert_eq!(texts, vec!["one".to_string(), "two".to_string()]);
+        let tail = read(
+            &db,
+            &processes,
+            "codex",
+            "grow",
+            first.head_rev,
+            Some(first.epoch),
+            None,
+            Some(500),
+        )
+        .unwrap();
+        assert!(!tail.reset);
+        assert_eq!(tail.rows.len(), 1);
+        assert_eq!(tail.rows[0].payload.as_ref().unwrap().text, "three");
+        assert!(tail.rows[0].rev > first.head_rev);
+    }
+
+    #[test]
+    fn pinned_until_does_not_hide_a_rewritten_or_truncated_prefix() {
+        let scratch = Scratch::new();
+        let db = Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let path = scratch.0.join("rewrite.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                codex_line("user", "before-a"),
+                codex_line("assistant", "before-b")
+            ),
+        )
+        .unwrap();
+        insert_codex(&db, &path, "rw");
+        let processes = ProcessRegistry::default();
+        let first = read(&db, &processes, "codex", "rw", 0, None, None, None).unwrap();
+        std::fs::write(&path, format!("{}\n", codex_line("user", "after"))).unwrap();
+        let reset = read(
+            &db,
+            &processes,
+            "codex",
+            "rw",
+            0,
+            Some(first.epoch),
+            Some(first.head_rev),
+            None,
+        )
+        .unwrap();
+        assert!(reset.reset);
+        assert!(reset.epoch > first.epoch);
+        let updated = read(&db, &processes, "codex", "rw", 0, None, None, None).unwrap();
+        assert_eq!(updated.rows.iter().filter(|row| !row.deleted).count(), 1);
+        assert_eq!(
+            updated
+                .rows
+                .iter()
+                .find(|row| !row.deleted)
+                .unwrap()
+                .payload
+                .as_ref()
+                .unwrap()
+                .text,
+            "after"
+        );
+    }
+
+    #[test]
+    fn active_append_converges_and_the_old_three_try_loop_does_not() {
+        let scratch = Scratch::new();
+        let db = Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let path = scratch.0.join("live.jsonl");
+        let padding = "中文🙂".repeat(1638);
+        let base = 80usize;
+        let mut lines = Vec::with_capacity(base);
+        let mut expected = Vec::with_capacity(base);
+        for index in 0..base {
+            let role = if index % 2 == 0 { "user" } else { "assistant" };
+            let text = format!("base-{index}:{padding}");
+            expected.push(text.clone());
+            lines.push(codex_line(role, &text));
+        }
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        insert_codex(&db, &path, "live");
+        let processes = ProcessRegistry::default();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let extras = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_path = path.clone();
+        let writer_stop = std::sync::Arc::clone(&stop);
+        let writer_extras = std::sync::Arc::clone(&extras);
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(writer_path)
+                .unwrap();
+            use std::io::Write;
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let n = writer_extras.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                writeln!(file, "{}", codex_line("assistant", &format!("extra-{n}"))).unwrap();
+                file.flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        let started = std::time::Instant::now();
+        let _ = canonical_session(&db, "codex", "live", &processes, None);
+        let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut legacy_error = None;
+        for _ in 0..5 {
+            match read_source_3b757e562(&db, &processes, "live") {
+                Err(error) => {
+                    legacy_error = Some(error);
+                    break;
+                }
+                Ok(()) => continue,
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        let extra_count = extras.load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "append race measurement: canonical_session_ms={parse_ms:.2}, legacy={legacy_error:?}, extra_lines={extra_count}, bytes={}",
+            std::fs::metadata(&path).unwrap().len()
+        );
+        let legacy_error = legacy_error.unwrap_or_else(|| {
+            panic!(
+                "3b757e562 three-try loop did not observe the append race; canonical_session_ms={parse_ms:.2}, extra_lines={extra_count}"
+            );
+        });
+        assert!(
+            legacy_error.contains("session changed while reading revision log"),
+            "{legacy_error}"
+        );
+        for n in 0..extra_count {
+            expected.push(format!("extra-{n}"));
+        }
+        let tail_count = 40usize;
+        let tail_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tail_flag = std::sync::Arc::clone(&tail_stop);
+        let tail_path = path.clone();
+        let tail_writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(tail_path)
+                .unwrap();
+            use std::io::Write;
+            for n in 0..tail_count {
+                if tail_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                writeln!(file, "{}", codex_line("assistant", &format!("tail-{n}"))).unwrap();
+                file.flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        for n in 0..tail_count {
+            expected.push(format!("tail-{n}"));
+        }
+        let mut got = Vec::new();
+        let mut after = 0i64;
+        let mut epoch = None;
+        let mut until = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "reader did not converge; have {} of {}",
+                    got.len(),
+                    expected.len()
+                );
+            }
+            let page = read_source(
+                &db,
+                &processes,
+                "codex",
+                "live",
+                after,
+                epoch,
+                until,
+                Some(500),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("active read failed: {error}"));
+            if page.reset && !got.is_empty() {
+                panic!("reset after {} rows: epoch {}", got.len(), page.epoch);
+            }
+            for row in &page.rows {
+                assert!(!row.deleted);
+                if let Some((prev, _)) = got.last() {
+                    assert!(row.rev > *prev, "revision went backwards");
+                }
+                got.push((row.rev, row.payload.as_ref().unwrap().text.clone()));
+            }
+            if page.has_more {
+                after = page.next_rev;
+                epoch = Some(page.epoch);
+                until = Some(page.head_rev);
+                continue;
+            }
+            if got.len() >= expected.len() {
+                break;
+            }
+            after = page.head_rev;
+            epoch = Some(page.epoch);
+            until = None;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        tail_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        tail_writer.join().unwrap();
+        let texts: Vec<_> = got.into_iter().map(|(_, text)| text).collect();
+        assert_eq!(texts, expected);
     }
 }

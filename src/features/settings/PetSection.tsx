@@ -11,7 +11,7 @@ import {
 } from "@/components/application/settings/settings-rows";
 import { ConfirmDialog } from "@/components/dialogs";
 import { ipc, type AppSettings, type PetSummary } from "@/lib/ipc";
-import { pickDirectory } from "@/lib/platform";
+import { isWeb, pickDirectory } from "@/lib/platform";
 import { petErrorMessage } from "@/features/pet/pet-errors";
 import { PET_SCALE_OPTIONS, normalizePetScale } from "@/features/pet/pet-scale";
 
@@ -39,12 +39,14 @@ function usePetState() {
       .catch((e) => {
         if (!cancelled) setError(String(e));
       });
-    void ipc
-      .listPets()
-      .then((list) => {
-        if (!cancelled) setPets(list);
-      })
-      .catch((e) => console.warn("[settings] pet list failed", e));
+    if (!isWeb) {
+      void ipc
+        .listPets()
+        .then((list) => {
+          if (!cancelled) setPets(list);
+        })
+        .catch((e) => console.warn("[settings] pet list failed", e));
+    }
     return () => {
       cancelled = true;
     };
@@ -68,7 +70,7 @@ function usePetState() {
   }, []);
 
   const onPetEnabledChange = (enabled: boolean) => {
-    if (!settings) return;
+    if (isWeb || !settings) return;
     if (enabled && !pets.some((pet) => pet.id === settings.petId)) {
       setError(t("settings.petImportRequired"));
       return;
@@ -79,7 +81,7 @@ function usePetState() {
     });
   };
   const onPetScaleChange = async (key: Key | null) => {
-    if (!settings || key == null) return;
+    if (isWeb || !settings || key == null) return;
     const next = normalizePetScale(Number(key));
     const previous = normalizePetScale(settings.petScale);
     if (next === previous) return;
@@ -94,7 +96,7 @@ function usePetState() {
     }
   };
   const onPetChange = async (key: Key | null) => {
-    if (!settings || key == null) return;
+    if (isWeb || !settings || key == null) return;
     const petId = String(key);
     setSettings({ ...settings, petId });
     const saved = await save({ petId });
@@ -108,6 +110,7 @@ function usePetState() {
     }
   };
   const importPet = async () => {
+    if (isWeb) return;
     const path = await pickDirectory(t("settings.petImportHint"));
     if (!path) return;
     setPetBusy(true);
@@ -127,6 +130,7 @@ function usePetState() {
     }
   };
   const removePet = async (pet: PetSummary) => {
+    if (isWeb) return;
     try {
       await ipc.removePet(pet.id);
       setPets((current) => current.filter((item) => item.id !== pet.id));

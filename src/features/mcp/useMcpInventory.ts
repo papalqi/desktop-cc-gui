@@ -7,6 +7,7 @@
  * never be overwritten by a late response.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { isWeb } from "@/lib/platform";
 import { mcpApi, McpHubError } from "./api";
 import type { McpConfigEntry, McpInventory } from "./types";
 
@@ -57,6 +58,13 @@ export function useMcpInventory(workspacePath: string | null): McpInventoryStore
   }, [workspacePath]);
 
   useEffect(() => {
+    // McpSection renders a desktop-only notice on the web, but this hook is
+    // mounted first. Skip the host inventory read so the page does not send
+    // mcp_inventory.
+    if (isWeb) {
+      setLoading(false);
+      return;
+    }
     void reload();
   }, [reload]);
 

@@ -226,6 +226,24 @@ fn collect_session(
     fold_rows(rows)
 }
 
+/// Parse a captured plain-text prefix. A consistent append snapshot must not
+/// call `parse_session_file`: that opens the live path and can read bytes
+/// past the prefix the caller froze.
+pub(super) fn parse_session_bytes(
+    engine: &str,
+    bytes: &[u8],
+    accepted_internal_frames: &HashSet<String>,
+) -> Result<ParsedSession, String> {
+    if matches!(engine, "agy" | "opencode" | "dsh") {
+        return Err("not a plain append-only transcript".into());
+    }
+    Ok(collect_session(
+        std::io::Cursor::new(bytes),
+        &extractor_for(engine, ImageMode::Collect),
+        accepted_internal_frames,
+    ))
+}
+
 /// Shared fold over extracted rows (usage markers, tool-result pairing,
 /// durations, seq numbering) — opencode feeds it from its storage-tree walk
 /// instead of an NDJSON line reader.
