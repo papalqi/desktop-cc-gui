@@ -6,9 +6,7 @@ import { CommandPalette } from "@/features/commands/CommandPalette";
 import PluginPageHost from "@/features/plugins/manager/PluginPageHost";
 import { PluginOverlayHost } from "@/features/plugins/runtime/overlay-host";
 import { bindSystemThemeSync, bindThemeChangePersistence } from "@/features/settings/theme";
-import { UpdateToast } from "@/features/update/UpdateToast";
 import { RelayUpdateNotice } from "@/features/update/RelayUpdateNotice";
-import { useUpdateStore } from "@/features/update/store";
 import { announceReleaseAfterUpgrade } from "@/features/update/upgrade-announcement";
 import { GrantAccessDialogHost } from "@/components/dialogs";
 import { startPluginSystem } from "@/features/plugins";
@@ -70,13 +68,6 @@ function MainApp() {
   useEffect(() => {
     void announceReleaseAfterUpgrade();
   }, []);
-  // Background update check after startup settles; dev builds skip it so
-  // `tauri dev` doesn't nag about the published release being newer.
-  useEffect(() => {
-    if (import.meta.env.DEV) return;
-    const id = setTimeout(() => void useUpdateStore.getState().checkForUpdates(), 3000);
-    return () => clearTimeout(id);
-  }, []);
   // LAN web access autostart: starts the LAN bridge on launch when enabled in
   // settings. The persisted app setting is the source of truth (the backend
   // setup hook reads the same flag); the localStorage key is only a fallback
@@ -133,7 +124,6 @@ function MainApp() {
         {/* Non-modal plugin viewport mounts, independent of the route. */}
         <PluginOverlayHost />
       </HashRouter>
-      <UpdateToast />
       <RelayUpdateNotice />
       <GrantAccessDialogHost />
       <CloseConfirmDialogHost />

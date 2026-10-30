@@ -3,11 +3,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
-vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn() }));
-vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: vi.fn() }));
+vi.mock("@/lib/ipc", () => ({ ipc: { relayUpdateProbe: vi.fn() } }));
 vi.mock("@/lib/transport", () => ({ isWeb: false }));
 vi.mock("@/lib/platform", () => ({
-  getAppVersion: async () => "1.0.5",
+  getAppVersion: async () => "1.3.1",
   openExternal: vi.fn(),
   isWeb: false,
 }));
@@ -23,7 +22,6 @@ declare global {
 }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
-const startUpdateSpy = vi.fn();
 const checkForUpdatesSpy = vi.fn();
 
 describe("UpdateSection update row", () => {
@@ -31,19 +29,13 @@ describe("UpdateSection update row", () => {
   let root: Root | null;
 
   beforeEach(() => {
-    startUpdateSpy.mockReset();
     checkForUpdatesSpy.mockReset();
     // The update store is module-level session state: drive it directly and
-    // swap the two actions for spies so button clicks are observable.
+    // swap the action for a spy so button clicks are observable.
     useUpdateStore.setState({
       stage: "idle",
       version: undefined,
-      latestVersion: undefined,
-      latestPubDate: undefined,
-      downloadedBytes: 0,
-      totalBytes: undefined,
       error: undefined,
-      startUpdate: startUpdateSpy,
       checkForUpdates: checkForUpdatesSpy,
     });
     container = document.createElement("div");
@@ -73,47 +65,38 @@ describe("UpdateSection update row", () => {
     );
   }
 
-  it("available: the row carries the version line and its own update CTA", async () => {
-    useUpdateStore.setState({ stage: "available", version: "1.0.6" });
+  it("latest: names the Hub's release, not a GitHub one", async () => {
+    useUpdateStore.setState({ stage: "latest", version: "1.3.1" });
     await render();
-
-    // Previously the row went blank here and the only affordance was the
-    // toast (which the settings shell used to cover).
-    expect(container.textContent).toContain("发现新版本 v1.0.6");
-
-    const cta = rowButton("立即更新");
-    expect(cta).not.toBeUndefined();
-    expect(cta!.disabled).toBe(false);
-
-    await act(async () => cta!.click());
-    expect(startUpdateSpy).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("当前已是最新版本 · Hub 最新为 v1.3.1");
   });
 
-  it("available: the check button stays available for a re-check", async () => {
-    useUpdateStore.setState({ stage: "available", version: "1.0.6" });
+  it("available: says the update installs in the background and offers no install button", async () => {
+    useUpdateStore.setState({ stage: "available", version: "1.3.2" });
     await render();
-
-    const check = rowButton("检查更新");
-    expect(check).not.toBeUndefined();
-    await act(async () => check!.click());
-    expect(checkForUpdatesSpy).toHaveBeenCalledWith({ interactive: true });
+    expect(container.textContent).toContain("发现新版本 v1.3.2，正在后台下载，空闲时自动安装");
+    expect(container.querySelectorAll("button")).toHaveLength(1);
   });
 
-  it("downloading: progress replaces the actions instead of offering a race", async () => {
-    useUpdateStore.setState({ stage: "downloading", downloadedBytes: 512, totalBytes: 1024 });
+  it("unconfigured: explains that no Hub is connected", async () => {
+    useUpdateStore.setState({ stage: "unconfigured" });
     await render();
-
-    expect(container.textContent).toContain("正在下载更新… 50%");
-    expect(rowButton("立即更新")!.disabled).toBe(true);
-    expect(rowButton("检查更新")).toBeUndefined();
+    expect(container.textContent).toContain("未连接远程 Hub，无法检查更新");
   });
 
-  it("error: the row surfaces the failure and offers a retry", async () => {
+  it("the check button runs a check and is disabled while one is running", async () => {
+    await render();
+    await act(async () => rowButton("检查更新")!.click());
+    expect(checkForUpdatesSpy).toHaveBeenCalledTimes(1);
+
+    await act(async () => useUpdateStore.setState({ stage: "checking" }));
+    expect(rowButton("检查更新")!.disabled).toBe(true);
+  });
+
+  it("error: the row surfaces the failure and keeps the check as the retry", async () => {
     useUpdateStore.setState({ stage: "error", error: "network down" });
     await render();
-
-    expect(container.textContent).toContain("更新失败：network down");
-    expect(rowButton("立即更新")).toBeUndefined();
+    expect(container.textContent).toContain("检查更新失败：network down");
     expect(rowButton("检查更新")!.disabled).toBe(false);
   });
 });

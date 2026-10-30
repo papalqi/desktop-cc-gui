@@ -1,88 +1,35 @@
 import { useTranslation } from "react-i18next";
-import { downloadPercent, type UpdateStage } from "./store";
+import type { UpdateStage } from "./store";
 
-interface StageMessageInput {
+interface UpdateDescriptionInput {
   stage: UpdateStage;
-  /** Version of the pending update, shown on the "available" stage. */
+  /** Hub release version from the last check. */
   version?: string;
-  downloadedBytes: number;
-  totalBytes?: number;
   error?: string;
 }
 
 /**
- * One-line copy for the update stages that more than one surface renders —
- * the floating toast (UpdateToast), the settings update row (UpdateSection)
- * and the release-notes pane (ReleaseNotesPane) — so they can never drift
- * apart while two of them are on screen during a download.
- *
- * The caller owns the stages with surface-specific copy: the toast hides
- * idle/checking/latest and the other two render those from
- * `useUpdateDescription` below.
+ * One-line result of the last "check for updates", shared by the settings
+ * update row and the release-notes pane so both report the same thing.
  */
-export function useUpdateStageMessage({
-  stage,
-  version,
-  downloadedBytes,
-  totalBytes,
-  error,
-}: StageMessageInput): string | null {
+export function useUpdateDescription({ stage, version, error }: UpdateDescriptionInput): string | undefined {
   const { t } = useTranslation();
   switch (stage) {
+    case "checking":
+      return t("settings.updateChecking");
+    case "latest":
+      return version ? t("settings.updateLatestDetail", { version }) : t("settings.updateLatest");
     case "available":
       return t("settings.updateAvailable", { version });
-    case "downloading": {
-      const percent = downloadPercent(downloadedBytes, totalBytes);
-      return t("settings.updateDownloading") + (percent !== null ? ` ${percent}%` : "");
-    }
-    case "installing":
-      return t("settings.updateInstalling");
-    case "restarting":
-      return t("settings.updateRestarting");
+    case "manual":
+      return t("settings.updateAvailableManual", { version });
+    case "failed":
+      return t("settings.relayUpdateFailed", { version });
+    case "unconfigured":
+      return t("settings.updateUnconfigured");
     case "error":
       return t("settings.updateError", { message: error });
     default:
-      return null;
+      return undefined;
   }
-}
-
-interface UpdateDescriptionInput extends StageMessageInput {
-  /** Latest release on the server, known after an interactive check that
-   *  ended in the "up to date" result. */
-  latestVersion?: string;
-  /** ISO publish date of that release, when the manifest has one. */
-  latestPubDate?: string;
-}
-
-/**
- * Full description of the current update state — the stage line plus the
- * two results the toast never renders: "checking…" and the "up to date"
- * line with the newest release's version and publish date. Shared by the
- * settings update row and the release-notes pane so both report the same
- * thing after the user clicks 检查更新.
- */
-export function useUpdateDescription({
-  stage,
-  version,
-  downloadedBytes,
-  totalBytes,
-  error,
-  latestVersion,
-  latestPubDate,
-}: UpdateDescriptionInput): string | undefined {
-  const { t, i18n } = useTranslation();
-  const message = useUpdateStageMessage({ stage, version, downloadedBytes, totalBytes, error });
-  if (stage === "checking") return t("settings.updateChecking");
-  if (stage === "latest") {
-    // The "up to date" line keeps its own richer copy (version + date); an
-    // unparseable/missing date falls back to the version-only sentence.
-    const parsed = latestPubDate ? new Date(latestPubDate) : null;
-    const date =
-      parsed && !Number.isNaN(parsed.getTime()) ? parsed.toLocaleDateString(i18n.language) : null;
-    if (!latestVersion) return t("settings.updateLatest");
-    return date
-      ? t("settings.updateLatestDetail", { version: latestVersion, date })
-      : t("settings.updateLatestDetailNoDate", { version: latestVersion });
-  }
-  return message ?? undefined;
 }

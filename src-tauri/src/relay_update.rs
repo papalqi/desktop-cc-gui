@@ -305,6 +305,66 @@ async fn download(client: &reqwest::Client, file: &ReleaseFile, directory: &Path
     output.sync_all().map_err(|e| e.to_string())
 }
 
+fn wake() -> &'static tokio::sync::Notify {
+    static WAKE: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    WAKE.get_or_init(tokio::sync::Notify::new)
+}
+
+fn update_endpoint(base_url: &str) -> String { format!("{}/update", base_url.trim_end_matches('/')) }
+
+/// The Hub's signed release, or `None` when it has nothing published.
+async fn fetch_release(client: &reqwest::Client, endpoint: &str, key: &str, base: &reqwest::Url) -> Result<Option<Release>, String> {
+    use futures_util::StreamExt;
+    let response = client.get(endpoint).bearer_auth(key).send().await.map_err(|_| "update manifest request failed")?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT || response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None) }
+    let mut body = response.error_for_status().map_err(|_| "Hub refused update manifest")?.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| "update manifest interrupted")?;
+        if bytes.len() + chunk.len() > 65536 { return Err("update manifest is too large".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    let release: Release = serde_json::from_slice(&bytes).map_err(|_| "invalid update manifest")?;
+    verify_release(&release, include_str!("../resources/relay-update-public-key.txt"), base)?;
+    Ok(Some(release))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProbe {
+    /// A Hub connection is configured and enabled; without one nothing can be checked.
+    configured: bool,
+    current: String,
+    latest: Option<String>,
+    newer: bool,
+    /// `latest` already failed to install here and will not be retried automatically.
+    failed: bool,
+    /// This platform downloads and installs Hub releases by itself.
+    auto_install: bool,
+}
+
+/// On-demand version of the background poll's manifest check, for the
+/// settings "check for updates" row. A newer release wakes the poller so the
+/// download starts now instead of on the next tick.
+#[tauri::command]
+pub async fn relay_update_probe(app: tauri::AppHandle) -> Result<UpdateProbe, String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let mut probe = UpdateProbe { configured: false, current: current.into(), latest: None, newer: false, failed: false, auto_install: cfg!(windows) };
+    let settings = crate::settings::read_settings()?;
+    let Some((base_url, key)) = crate::relay::autostart_target(&settings) else { return Ok(probe) };
+    probe.configured = true;
+    let base = reqwest::Url::parse(&base_url).map_err(|_| "invalid configured Hub URL")?;
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10)).timeout(std::time::Duration::from_secs(15))
+        .build().map_err(|e| e.to_string())?;
+    let Some(release) = fetch_release(&client, &update_endpoint(&base_url), &key, &base).await? else { return Ok(probe) };
+    probe.newer = version(&release.version)? > version(current)?;
+    probe.failed = app.state::<crate::AppState>().relay.update.0.lock().info.failed_versions.contains(&release.version);
+    probe.latest = Some(release.version);
+    if probe.newer && !probe.failed && probe.auto_install { wake().notify_one(); }
+    Ok(probe)
+}
+
 #[cfg(windows)]
 async fn poll(app: &tauri::AppHandle, staged: &mut Option<(Release, PathBuf)>, reported: &mut Option<String>) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
@@ -328,7 +388,7 @@ async fn poll(app: &tauri::AppHandle, staged: &mut Option<(Release, PathBuf)>, r
     let Some((base_url, key)) = crate::relay::autostart_target(&settings) else { return Ok(()) };
     let base = reqwest::Url::parse(&base_url).map_err(|_| "invalid configured Hub URL")?;
     let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
-    let endpoint = format!("{}/update", base_url.trim_end_matches('/'));
+    let endpoint = update_endpoint(&base_url);
     let outcome = {
         let gate = state.relay.update.0.lock();
         match gate.info.phase.as_str() {
@@ -340,18 +400,7 @@ async fn poll(app: &tauri::AppHandle, staged: &mut Option<(Release, PathBuf)>, r
         let receipt = outcome.to_string();
         if reported.as_ref() != Some(&receipt) && client.post(format!("{endpoint}/result")).bearer_auth(&key).json(&outcome).send().await.is_ok_and(|r| r.status().is_success()) { *reported = Some(receipt); }
     }
-    let response = client.get(&endpoint).bearer_auth(&key).send().await.map_err(|_| "update manifest request failed")?;
-    if response.status() == reqwest::StatusCode::NO_CONTENT || response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(()) }
-    use futures_util::StreamExt;
-    let mut body = response.error_for_status().map_err(|_| "Hub refused update manifest")?.bytes_stream();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|_| "update manifest interrupted")?;
-        if bytes.len() + chunk.len() > 65536 { return Err("update manifest is too large".into()); }
-        bytes.extend_from_slice(&chunk);
-    }
-    let release: Release = serde_json::from_slice(&bytes).map_err(|_| "invalid update manifest")?;
-    verify_release(&release, include_str!("../resources/relay-update-public-key.txt"), &base)?;
+    let Some(release) = fetch_release(&client, &endpoint, &key, &base).await? else { return Ok(()) };
     {
         let gate = state.relay.update.0.lock();
         if version(&release.version)? <= version(env!("CARGO_PKG_VERSION"))? || gate.info.failed_versions.contains(&release.version) || gate.installing { return Ok(()) }
@@ -404,7 +453,7 @@ pub fn start(app: tauri::AppHandle) {
         let mut reported = None;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
-            interval.tick().await;
+            tokio::select! { _ = interval.tick() => {}, _ = wake().notified() => {} }
             if let Err(error) = poll(&app, &mut staged, &mut reported).await { publish(&app, |info| info.error = Some(error)); }
         }
     });

@@ -155,7 +155,7 @@ const DESKTOP_ONLY: &[(&str, &str)] = &[
     ("load_baidu_tongji_script", "Linux native analytics script"),
     ("send_baidu_tongji_beacon", "Linux native analytics beacon"),
     (
-        "fetch_latest_release_info",
+        "relay_update_probe",
         "desktop update check; the web shell has nothing to update",
     ),
 ];

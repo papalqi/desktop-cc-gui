@@ -4,7 +4,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import CircleAlert from "lucide-react/dist/esm/icons/circle-alert";
 import Info from "lucide-react/dist/esm/icons/info";
-import Loader2 from "lucide-react/dist/esm/icons/loader-2";
 import RefreshCcw from "lucide-react/dist/esm/icons/refresh-ccw";
 import { ActionFeedbackIcon, useActionFeedback, type ActionFeedback } from "@/components/base/action-feedback";
 import { Button } from "@/components/base/buttons/button";
@@ -29,8 +28,7 @@ function resolveChangelogContent(
   return (language ?? "").toLowerCase().startsWith("zh") ? parts : parts.reverse();
 }
 
-/** One release-notes markdown body (either a local bilingual entry or the
- *  update manifest's `notes`) in the app's prose mapping. */
+/** One local release-notes markdown body in the app's prose mapping. */
 function ChangelogMarkdown({ text }: { text: string }) {
   return (
     <ReactMarkdown
@@ -69,28 +67,23 @@ function localEntryFor(version?: string): ChangelogEntry | undefined {
 }
 
 /**
- * 版本更新页签（中心面，单实例）：新版本的更新说明 + 就地更新入口。
- *
- * 内容优先级：本次检测到的更新清单 `notes`（新版本自己带的说明，单语
- * markdown）→ 本地 `CHANGELOG_DATA` 同版本条目（双语按当前语言排序）
- * → 「该版本未附带说明」。页签在发现新版本时自动打开，但本身不依赖更新
- * 状态：更新被「稍后」关掉后仍可继续读说明（`notesRelease` 不随 dismiss 清空）。
+ * 版本更新页签（中心面，单实例）：本地 `CHANGELOG_DATA` 的版本说明（双语按
+ * 当前语言排序），没有对应条目时显示「该版本未附带说明」。
  *
  * 升级后首启（`upgrade-announcement.ts`）会宣布一次本地记录的版本说明，并在
- * 未读期间给页签圆点与页头的「新版本」标记——那个场景没有待更新版本，版本号
- * 来自页签 store 的 `unreadVersion`。
+ * 未读期间给页签圆点与页头的「新版本」标记，版本号来自页签 store 的
+ * `unreadVersion`。
  *
- * 页头就是更新入口：发现新版本给「立即更新」，任何时候都能就地「检查更新」
- * （结果行复用设置页同一份文案，见 `useUpdateDescription`）。
+ * 页头可就地「检查更新」（结果行复用设置页同一份文案，见
+ * `useUpdateDescription`）；下载与安装由 Hub 自更新在后台完成。
  */
-/** Pane header: title, announced version/date and the update/check actions. */
+/** Pane header: title, announced version/date and the check action. */
 function ReleaseHeader({
   displayVersion,
   displayDate,
   unread,
   stage,
   checkFeedback,
-  onUpdate,
   onCheck,
 }: {
   displayVersion: string | undefined;
@@ -99,12 +92,9 @@ function ReleaseHeader({
   unread: boolean;
   stage: UpdateStage;
   checkFeedback: ActionFeedback;
-  onUpdate: () => void;
   onCheck: () => void;
 }) {
   const { t } = useTranslation();
-  const inFlight =
-    stage === "downloading" || stage === "installing" || stage === "restarting";
   return (
     <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-separator-border px-4">
       <div className="flex min-w-0 items-center gap-3">
@@ -125,21 +115,10 @@ function ReleaseHeader({
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
-        {stage === "available" && (
-          <Button size="small" variant="primary" onClick={onUpdate}>
-            {t("settings.updateNow")}
-          </Button>
-        )}
-        {inFlight && (
-          <Loader2
-            className="size-4 shrink-0 animate-spin text-foreground-icon-secondary"
-            aria-hidden
-          />
-        )}
         <Button
           size="small"
           variant="secondary"
-          disabled={stage === "checking" || inFlight}
+          disabled={stage === "checking"}
           onClick={onCheck}
         >
           <span className="flex items-center gap-1.5">
@@ -184,22 +163,13 @@ function ReleaseDescription({
   );
 }
 
-/** Release-notes body: manifest notes, bilingual local entry, or the empty
- *  copy. */
-function ReleaseBody({
-  body,
-  parts,
-}: {
-  body: string | undefined;
-  parts: { lang: "zh" | "en"; text: string }[];
-}) {
+/** Release-notes body: bilingual local entry, or the empty copy. */
+function ReleaseBody({ parts }: { parts: { lang: "zh" | "en"; text: string }[] }) {
   const { t } = useTranslation();
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
       <div className="mx-auto flex w-full max-w-[52rem] flex-col gap-4">
-        {body ? (
-          <ChangelogMarkdown text={body} />
-        ) : parts.length > 0 ? (
+        {parts.length > 0 ? (
           parts.map((part, idx) => (
             <div
               key={part.lang}
@@ -222,36 +192,19 @@ export function ReleaseNotesPane() {
   const { i18n } = useTranslation();
   const stage = useUpdateStore((s) => s.stage);
   const version = useUpdateStore((s) => s.version);
-  const notesRelease = useUpdateStore((s) => s.notesRelease);
   const unreadVersion = useReleaseNotesTabStore((s) => s.unreadVersion);
-  const downloadedBytes = useUpdateStore((s) => s.downloadedBytes);
-  const totalBytes = useUpdateStore((s) => s.totalBytes);
   const error = useUpdateStore((s) => s.error);
-  const latestVersion = useUpdateStore((s) => s.latestVersion);
-  const latestPubDate = useUpdateStore((s) => s.latestPubDate);
-  const startUpdate = useUpdateStore((s) => s.startUpdate);
   const checkForUpdates = useUpdateStore((s) => s.checkForUpdates);
   // 检查更新是刷新型动作：转圈 → 对号（§4.1）。检查失败（stage error）不出
   // 对号，失败信息由结果行用 role="alert" 说明。
   const checkAction = useActionFeedback({ spin: true });
 
-  // 页签标题上的版本：优先本次检测结果，其次是最近一次发现的快照，再次是升级
-  // 后首启宣布的未读版本，最后才是本地最新条目（手动打开、还没有任何更新检查时）。
-  const announced = version ?? notesRelease?.version ?? unreadVersion;
-  const local = useMemo(() => localEntryFor(announced), [announced]);
-  const displayVersion = announced ?? local?.version;
-  const displayDate = notesRelease?.date ?? local?.date;
-  const body = notesRelease?.body?.trim();
+  // 页签标题上的版本：升级后首启宣布的未读版本，否则是本地最新条目。
+  const local = useMemo(() => localEntryFor(unreadVersion), [unreadVersion]);
+  const displayVersion = unreadVersion ?? local?.version;
+  const displayDate = local?.date;
   const parts = local ? resolveChangelogContent(local, i18n.language) : [];
-  const description = useUpdateDescription({
-    stage,
-    version,
-    downloadedBytes,
-    totalBytes,
-    error,
-    latestVersion,
-    latestPubDate,
-  });
+  const description = useUpdateDescription({ stage, version, error });
   const failed = stage === "error";
 
   return (
@@ -262,17 +215,16 @@ export function ReleaseNotesPane() {
         unread={unreadVersion !== undefined}
         stage={stage}
         checkFeedback={checkAction.feedback}
-        onUpdate={() => void startUpdate()}
         onCheck={() =>
           void checkAction.start(
-            () => checkForUpdates({ interactive: true }),
+            () => checkForUpdates(),
             // 非抛错型动作把失败写进 store（store.ts 的 error 分支）。
             () => useUpdateStore.getState().stage === "error",
           )
         }
       />
       <ReleaseDescription description={description} failed={failed} />
-      <ReleaseBody body={body} parts={parts} />
+      <ReleaseBody parts={parts} />
     </div>
   );
 }

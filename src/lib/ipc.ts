@@ -35,6 +35,16 @@ export interface RelayUpdateInfo {
   blackoutEnd: number | null;
 }
 
+/** Mirrors `UpdateProbe` in src-tauri/src/relay_update.rs. */
+export interface RelayUpdateProbe {
+  configured: boolean;
+  current: string;
+  latest: string | null;
+  newer: boolean;
+  failed: boolean;
+  autoInstall: boolean;
+}
+
 export interface SessionMeta {
   machine?: string;
   machineOffline?: boolean;
@@ -1575,6 +1585,7 @@ return {
   interruptSession: (sessionId: string) =>
     invoke<boolean>("interrupt_session", { sessionId }),
   relayUpdateStatus: () => invoke<RelayUpdateInfo>("relay_update_status"),
+  relayUpdateProbe: () => invoke<RelayUpdateProbe>("relay_update_probe"),
   relayUpdateDefer: () => invoke<RelayUpdateInfo>("relay_update_defer"),
   relayUpdateBlackout: (start: number | null, end: number | null) => invoke<RelayUpdateInfo>("relay_update_blackout", { start, end }),
   // 电脑操控 (computer use)

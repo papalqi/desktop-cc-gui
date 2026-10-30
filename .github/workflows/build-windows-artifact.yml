@@ -41,14 +41,6 @@ jobs:
       - name: Rust test compilation
         run: cargo test --manifest-path src-tauri/Cargo.toml --tests --no-run
 
-      - name: Disable updater signing for artifact build
-        shell: pwsh
-        run: |
-          $path = "src-tauri/tauri.conf.json"
-          $config = Get-Content $path -Raw | ConvertFrom-Json
-          $config.bundle.createUpdaterArtifacts = $false
-          $config | ConvertTo-Json -Depth 20 | Set-Content $path
-
       - name: Build unsigned Windows installer
         env:
           NODE_OPTIONS: --max-old-space-size=8192
