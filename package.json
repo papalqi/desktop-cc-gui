@@ -12,6 +12,8 @@
     "deploy:win": "node scripts/deploy-windows.mjs",
     "release:win": "node scripts/release-windows.mjs",
     "test:deploy": "node --test scripts/deploy-windows.test.mjs",
+    "hub:patrol": "node scripts/hub-patrol.mjs",
+    "test:hub-patrol": "node --test scripts/hub-patrol.test.mjs",
     "build:mac": "./scripts/build-signed-macos.sh",
     "build:mac:skip-notarize": "SKIP_NOTARIZE=1 ./scripts/build-signed-macos.sh",
     "preview": "vite preview",
