@@ -156,6 +156,66 @@ pub(crate) fn split_opencode_db_path(path: &Path) -> Option<(PathBuf, String)> {
     Some((PathBuf::from(db), session_id.to_string()))
 }
 
+/// Codex ≥0.162 compresses idle rollouts in place: `rollout-….jsonl` is
+/// encoded to `rollout-….jsonl.zst`, verified, and the source removed; a
+/// resume materializes it back to `.jsonl`. Both names are one transcript, so
+/// an indexed path can name either form by the time it is read.
+const CODEX_COMPRESSED_SUFFIX: &str = ".jsonl.zst";
+
+fn is_codex_rollout_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && (name.ends_with(".jsonl") || name.ends_with(CODEX_COMPRESSED_SUFFIX)))
+}
+
+/// `(plain, compressed)` names of one codex rollout, None for other files.
+pub(crate) fn codex_rollout_forms(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    if !is_codex_rollout_name(path) {
+        return None;
+    }
+    let text = path.to_str()?;
+    let plain = text.strip_suffix(".zst").unwrap_or(text);
+    Some((PathBuf::from(plain), PathBuf::from(format!("{plain}.zst"))))
+}
+
+/// The on-disk form of an indexed transcript. The plain form wins when both
+/// exist: it is the one a resumed thread appends to. A path with no existing
+/// form is returned unchanged so the caller reports the indexed path.
+pub(crate) fn resolve_transcript_path(engine: &str, path: &Path) -> PathBuf {
+    if engine == "codex" {
+        if let Some((plain, compressed)) = codex_rollout_forms(path) {
+            if plain.exists() {
+                return plain;
+            }
+            if compressed.exists() {
+                return compressed;
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Name-level test for a compressed transcript (codex `.jsonl.zst`, dsh
+/// `.jsonl.zstd`). Byte offsets in such a file are not transcript offsets.
+pub(crate) fn is_compressed_transcript_name(path: &Path) -> bool {
+    path.to_str().is_some_and(|text| text.ends_with(".zst") || text.ends_with(".zstd"))
+}
+
+/// Open a transcript for line reading, decompressing a zstd frame by its
+/// magic bytes rather than its name or engine: a remote dsh transcript is
+/// cached under a `.jsonl` name, a codex rollout may be either form.
+pub(crate) fn open_transcript(path: &Path) -> std::io::Result<Box<dyn std::io::BufRead>> {
+    use std::io::BufRead;
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    if reader.fill_buf()?.starts_with(&ZSTD_MAGIC) {
+        let decoder = zstd::stream::read::Decoder::with_buffer(reader)?;
+        Ok(Box::new(std::io::BufReader::new(decoder)))
+    } else {
+        Ok(Box::new(reader))
+    }
+}
+
 /// &str entry point: skips the `Value::String` wrapper allocation the
 /// timestamp hot path used to pay per call.
 pub fn parse_ts_ms_str(text: &str) -> Option<i64> {

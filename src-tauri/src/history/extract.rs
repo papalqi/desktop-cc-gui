@@ -26,7 +26,7 @@ pub fn parse_session_file(
     if engine == "opencode" {
         return Ok(parse_opencode_session(path, accepted_internal_frames));
     }
-    let reader = open_line_reader(engine, path)?;
+    let reader = open_line_reader(path)?;
     Ok(collect_session(
         reader,
         &extractor_for(engine, ImageMode::Collect),
@@ -60,7 +60,7 @@ pub fn scan_summary_file(
     if engine == "opencode" {
         return Ok(scan_opencode_summary(path, accepted_internal_frames));
     }
-    let reader = open_line_reader(engine, path)?;
+    let reader = open_line_reader(path)?;
     let mut acc = ScanAcc::default();
     walk_lines(
         reader,
@@ -73,16 +73,10 @@ pub fn scan_summary_file(
     Ok(acc.finish())
 }
 
-/// dsh session files are zstd-compressed NDJSON; everything else is plain.
-fn open_line_reader(engine: &str, path: &Path) -> Result<Box<dyn BufRead>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    if engine == "dsh" {
-        let decoder = zstd::stream::read::Decoder::new(std::io::BufReader::new(file))
-            .map_err(|e| format!("zstd {}: {e}", path.display()))?;
-        Ok(Box::new(std::io::BufReader::new(decoder)))
-    } else {
-        Ok(Box::new(std::io::BufReader::new(file)))
-    }
+/// dsh session files and compressed codex rollouts are zstd NDJSON; the
+/// frame is detected by content, so either form of a rollout reads alike.
+fn open_line_reader(path: &Path) -> Result<Box<dyn BufRead>, String> {
+    super::open_transcript(path).map_err(|e| format!("open {}: {e}", path.display()))
 }
 
 /// Image payloads: the reader renders them, the scanner must not build them.

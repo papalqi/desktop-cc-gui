@@ -1193,6 +1193,38 @@ mod tests {
         assert!(tail.rows[0].rev > first.head_rev);
     }
 
+    /// Codex ≥0.162 compresses an idle rollout to `.jsonl.zst` and removes the
+    /// plain file the index still names. The revision log must keep serving
+    /// the same rows (no reset, no "open … os error 2"), and a resume that
+    /// materializes the plain form must append after them.
+    #[test]
+    fn compressed_rollout_keeps_its_revisions_and_resume_appends_after_them() {
+        let scratch = Scratch::new();
+        let db = Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let plain = scratch.0.join("rollout-2026-10-16T12-15-15-zst.jsonl");
+        let compressed = scratch.0.join("rollout-2026-10-16T12-15-15-zst.jsonl.zst");
+        let body = format!("{}\n{}\n", codex_line("user", "one"), codex_line("assistant", "two"));
+        std::fs::write(&plain, &body).unwrap();
+        insert_codex(&db, &plain, "zst");
+        let processes = ProcessRegistry::default();
+        let first = read(&db, &processes, "codex", "zst", 0, None, None, Some(500)).unwrap();
+        assert_eq!(first.rows.len(), 2);
+
+        std::fs::write(&compressed, zstd::encode_all(body.as_bytes(), 0).unwrap()).unwrap();
+        std::fs::remove_file(&plain).unwrap();
+        let after = read(&db, &processes, "codex", "zst", 0, Some(first.epoch), None, Some(500)).unwrap();
+        assert!(!after.reset);
+        assert_eq!((after.epoch, after.head_rev), (first.epoch, first.head_rev));
+        let texts: Vec<_> = after.rows.iter().map(|row| row.payload.as_ref().unwrap().text.clone()).collect();
+        assert_eq!(texts, vec!["one".to_string(), "two".to_string()]);
+
+        std::fs::write(&plain, format!("{body}{}\n", codex_line("assistant", "three"))).unwrap();
+        let tail = read(&db, &processes, "codex", "zst", first.head_rev, Some(first.epoch), None, Some(500)).unwrap();
+        assert!(!tail.reset);
+        assert_eq!(tail.rows.len(), 1);
+        assert_eq!(tail.rows[0].payload.as_ref().unwrap().text, "three");
+    }
+
     #[test]
     fn pinned_until_does_not_hide_a_rewritten_or_truncated_prefix() {
         let scratch = Scratch::new();

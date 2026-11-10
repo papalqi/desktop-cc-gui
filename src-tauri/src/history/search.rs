@@ -231,7 +231,8 @@ fn index_one(db: &crate::db::Db, row: &PendingSession) -> Result<bool, String> {
     let (accepted_frames, accepted_signature) =
         db.accepted_internal_frames(&row.engine, &row.session_id)?;
     let parsed = if row.message_count > 0 {
-        match parse_session_file(&row.engine, Path::new(&row.file_path), &accepted_frames) {
+        let path = super::resolve_transcript_path(&row.engine, Path::new(&row.file_path));
+        match parse_session_file(&row.engine, &path, &accepted_frames) {
             Ok(parsed) => parsed,
             Err(error) => {
                 eprintln!(

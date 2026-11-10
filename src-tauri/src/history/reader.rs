@@ -281,7 +281,9 @@ fn find_session_file_path(
         |r| r.get::<_, String>(0),
     )
     .optional()
-    .map(|path| path.map(PathBuf::from))
+    // The row records the form seen at scan time; codex may have compressed
+    // or materialized the rollout since.
+    .map(|path| path.map(|path| super::resolve_transcript_path(engine, Path::new(&path))))
     .map_err(|e| format!("lookup session {engine}/{session_id}: {e}"))
 }
 
@@ -710,7 +712,7 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> Option<u128> {
 }
 
 fn plain_transcript(engine: &str, path: &Path) -> bool {
-    if matches!(engine, "opencode" | "dsh" | "agy") {
+    if matches!(engine, "opencode" | "dsh" | "agy") || super::is_compressed_transcript_name(path) {
         return false;
     }
     super::split_opencode_db_path(path).is_none()
@@ -893,8 +895,11 @@ pub async fn load_session_page(
 /// 用「绝对 .jsonl + 落在该引擎已知会话目录形态」收口,挡住借 IPC 读
 /// 发行版内任意 .jsonl 文件。
 fn is_plausible_remote_session_path(engine: &str, path: &str) -> bool {
-    // dsh 转录本是 zstd 压缩的 session*.jsonl.zstd;其余引擎均为 .jsonl。
-    let suffix_ok = path.ends_with(".jsonl") || (engine == "dsh" && path.ends_with(".jsonl.zstd"));
+    // dsh 转录本是 zstd 压缩的 session*.jsonl.zstd;codex 闲置 rollout 会被
+    // 压缩成 .jsonl.zst;其余引擎均为 .jsonl。
+    let suffix_ok = path.ends_with(".jsonl")
+        || (engine == "dsh" && path.ends_with(".jsonl.zstd"))
+        || (engine == "codex" && path.ends_with(".jsonl.zst"));
     if !suffix_ok || !path.starts_with('/') {
         return false;
     }
@@ -999,11 +1004,20 @@ pub async fn load_remote_session_page(
 fn delete_session_disk(engine: &str, path: &Path) -> Result<(), String> {
     match engine {
         "claude" | "codex" | "pi" | "omp" | "agy" | "qoder" | "qoder-cn" => {
-            match std::fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(format!("remove {}: {e}", path.display())),
+            // A codex rollout can exist in both forms; leaving either one
+            // behind resurrects the session on the next scan.
+            let forms = match (engine, super::codex_rollout_forms(path)) {
+                ("codex", Some((plain, compressed))) => vec![plain, compressed],
+                _ => vec![path.to_path_buf()],
+            };
+            for form in forms {
+                match std::fs::remove_file(&form) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("remove {}: {e}", form.display())),
+                }
             }
+            Ok(())
         }
         // opencode: the db row points at `storage/session/<project>/<id>.json`;
         // the transcript also lives in `storage/message/<id>/` and one
@@ -1264,6 +1278,14 @@ fn remote_session_delete_script(engine: &str, remote_path: &str) -> Result<Strin
     // run_script_output checks the final status, without enabling set -e.
     // Only empty-directory cleanup may mask a failure, never transcript rm.
     let mut script = format!("rm -f -- {quoted} || exit $?");
+    if let ("codex", Some((plain, compressed))) = (engine, super::codex_rollout_forms(Path::new(remote_path))) {
+        // 压缩前后两种形态同属一份 rollout,只删其一会被插件源重新列出。
+        for form in [plain, compressed] {
+            let form = crate::engine::wsl_transport::sh_quote(&form.to_string_lossy());
+            script.push_str(&format!("
+rm -f -- {form} || exit $?"));
+        }
+    }
     if engine == "dsh" {
         // 世代日志同目录共存(session.jsonl.zstd / session.vN.jsonl.zstd),
         // 只删当前代会留下旧代被插件源重新列出;目录删空才移除。
@@ -2610,6 +2632,26 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// A codex rollout can exist as `.jsonl`, `.jsonl.zst`, or both (codex
+    /// compression, resume materialization). Deleting through either indexed
+    /// name must remove both, or the next scan resurrects the session.
+    #[test]
+    fn delete_codex_removes_both_rollout_forms() {
+        let scratch = Scratch::new();
+        let plain = scratch.0.join("rollout-2026-10-16T12-15-15-sid.jsonl");
+        let compressed = scratch.0.join("rollout-2026-10-16T12-15-15-sid.jsonl.zst");
+        let other = scratch.0.join("rollout-2026-10-16T12-15-16-other.jsonl.zst");
+        for (indexed, forms) in [(&plain, vec![&plain, &compressed]), (&compressed, vec![&compressed])] {
+            for form in &forms {
+                std::fs::write(form, "x").unwrap();
+            }
+            std::fs::write(&other, "keep").unwrap();
+            delete_session_disk("codex", indexed).unwrap();
+            assert!(!plain.exists() && !compressed.exists());
+            assert!(other.exists());
+        }
+    }
+
     /// opencode spreads a session over session/message/part; deleting the
     /// metadata file must take the message dir and its part dirs, and leave
     /// other sessions' trees alone.
@@ -2863,6 +2905,25 @@ mod tests {
             "dsh",
             "/home/dev/notes/session.jsonl.zstd"
         ));
+    }
+    /// codex 闲置 rollout 会被压缩成 .jsonl.zst,远程路径白名单同样放行。
+    #[test]
+    fn remote_codex_compressed_rollout_path_shape() {
+        assert!(is_plausible_remote_session_path(
+            "codex",
+            "/home/dev/.codex/sessions/2026/10/16/rollout-2026-10-16T12-15-15-sid.jsonl.zst"
+        ));
+        assert!(!is_plausible_remote_session_path(
+            "claude",
+            "/home/dev/.claude/projects/p/sid.jsonl.zst"
+        ));
+        let script = remote_session_delete_script(
+            "codex",
+            "/home/dev/.codex/sessions/2026/10/16/rollout-2026-10-16T12-15-15-sid.jsonl.zst",
+        )
+        .unwrap();
+        assert!(script.contains("rollout-2026-10-16T12-15-15-sid.jsonl' || exit $?"), "{script}");
+        assert!(script.contains("rollout-2026-10-16T12-15-15-sid.jsonl.zst' || exit $?"), "{script}");
     }
     /// Tool-result-heavy sessions are the steady state (an hourly task's omp
     /// transcript measured 28MB of `result.details` against 18MB of chat

@@ -368,7 +368,7 @@ fn prune_engine_subagent_sessions(
     };
     let dead: Vec<String> = paths
         .into_iter()
-        .filter(|(_, path)| is_subagent(Path::new(path)))
+        .filter(|(_, path)| is_subagent(&super::resolve_transcript_path(engine, Path::new(path))))
         .map(|(id, _)| id)
         .collect();
     if dead.is_empty() {
@@ -1293,6 +1293,71 @@ pub(super) mod tests {
             .map_err(|e| e.to_string())?
         };
         assert_eq!(title, "你好啊");
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    /// Codex ≥0.162 compresses idle rollouts to `.jsonl.zst` and removes the
+    /// plain file; a resume materializes it back. The compressed form must
+    /// index (re-pointing a row recorded as plain), a compressed-only rollout
+    /// must appear, and a rollout present in both forms stays one plain row.
+    #[test]
+    fn scan_indexes_compressed_codex_rollouts() -> Result<(), String> {
+        let home = scratch_dir("scan-codex-zst");
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let day = home.join(".codex").join("sessions").join("2026").join("10").join("16");
+        std::fs::create_dir_all(&day).map_err(|e| e.to_string())?;
+        let cwd_json = workspace.display().to_string().replace('\\', "\\\\");
+        let lines = |id: &str, text: &str| {
+            vec![
+                format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd_json}\"}}}}"),
+                format!("{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{text}\"}}]}}}}"),
+            ]
+        };
+        let old = lines("sid-old", "压缩前的问题");
+        let old_refs: Vec<&str> = old.iter().map(String::as_str).collect();
+        let plain = day.join("rollout-2026-10-16T12-15-15-sid-old.jsonl");
+        let compressed = day.join("rollout-2026-10-16T12-15-15-sid-old.jsonl.zst");
+        std::fs::write(&plain, old.join("\n") + "\n").map_err(|e| e.to_string())?;
+
+        let _guard = HomeGuard::set(&home);
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        db.0.lock()
+            .execute(
+                "INSERT INTO workspaces(id, path, name) VALUES('w1', ?1, 'ws')",
+                [workspace.to_string_lossy().to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        let row = |id: &str| -> Result<(String, String), String> {
+            db.0.lock()
+                .query_row(
+                    "SELECT file_path, title FROM sessions WHERE engine='codex' AND session_id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| e.to_string())
+        };
+        scan_with(&db, || {})?;
+        assert_eq!(row("sid-old")?.0, plain.to_string_lossy());
+
+        write_zstd_jsonl(&compressed, &old_refs);
+        std::fs::remove_file(&plain).map_err(|e| e.to_string())?;
+        let new = lines("sid-new", "只有压缩形态");
+        let new_refs: Vec<&str> = new.iter().map(String::as_str).collect();
+        write_zstd_jsonl(&day.join("rollout-2026-10-16T13-00-00-sid-new.jsonl.zst"), &new_refs);
+        scan_with(&db, || {})?;
+        assert_eq!(row("sid-old")?, (compressed.to_string_lossy().to_string(), "压缩前的问题".to_string()));
+        assert_eq!(row("sid-new")?.1, "只有压缩形态");
+
+        std::fs::write(&plain, old.join("\n") + "\n").map_err(|e| e.to_string())?;
+        scan_with(&db, || {})?;
+        assert_eq!(row("sid-old")?.0, plain.to_string_lossy());
+        let count: i64 = db.0.lock()
+            .query_row("SELECT COUNT(*) FROM sessions WHERE engine='codex'", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        assert_eq!(count, 2);
         drop(db);
         std::fs::remove_dir_all(&home).ok();
         Ok(())

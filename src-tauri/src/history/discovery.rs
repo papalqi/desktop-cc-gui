@@ -15,24 +15,12 @@ use std::path::{Path, PathBuf};
 /// on a cold scan for lines it never uses. Total reads stay bounded by
 /// MAX_HEAD_BYTES. Newer pi-family files prepend a `title` line before the
 /// `session` line, so line 1 alone is not enough either.
-fn peek_head_json_lines(
-    path: &Path,
-    zstd_compressed: bool,
-    max_lines: usize,
-) -> Vec<serde_json::Value> {
-    use std::io::{BufReader, Read};
+fn peek_head_json_lines(path: &Path, max_lines: usize) -> Vec<serde_json::Value> {
+    use std::io::Read;
     const CHUNK_BYTES: usize = 16 * 1024;
     const MAX_HEAD_BYTES: usize = 1024 * 1024;
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(mut reader) = super::open_transcript(path) else {
         return Vec::new();
-    };
-    let mut reader: Box<dyn Read> = if zstd_compressed {
-        match zstd::stream::read::Decoder::new(BufReader::new(file)) {
-            Ok(decoder) => Box::new(decoder),
-            Err(_) => return Vec::new(),
-        }
-    } else {
-        Box::new(file)
     };
     let mut buf = Vec::new();
     // Incremental newline count: re-scanning the whole buffer per chunk is
@@ -833,7 +821,7 @@ fn is_codex_subagent_head(head: &serde_json::Value) -> bool {
 }
 
 pub(super) fn is_codex_subagent_file(path: &Path) -> bool {
-    peek_head_json_lines(path, false, 8)
+    peek_head_json_lines(path, 8)
         .iter()
         .any(is_codex_subagent_head)
 }
@@ -857,7 +845,7 @@ fn is_dsh_subagent_head(head: &serde_json::Value) -> bool {
 }
 
 pub(super) fn is_dsh_subagent_file(path: &Path) -> bool {
-    peek_head_json_lines(path, true, 8)
+    peek_head_json_lines(path, 8)
         .iter()
         .any(is_dsh_subagent_head)
 }
@@ -872,7 +860,7 @@ pub(super) fn identify_head(engine: &str, path: &Path) -> Option<(String, String
     };
     // Scan the first few head lines: newer pi-family files prepend a
     // `title` line before the `session` line.
-    for head in peek_head_json_lines(path, engine == "dsh", 8) {
+    for head in peek_head_json_lines(path, 8) {
         if head.get("type").and_then(|v| v.as_str()) != Some(expected) {
             continue;
         }
@@ -897,7 +885,10 @@ pub(super) fn identify_head(engine: &str, path: &Path) -> Option<(String, String
     None
 }
 
-/// Codex rollout files (readdir only, no content reads).
+/// Codex rollout files (readdir only, no content reads), in either the plain
+/// or the compressed form. A rollout present in both forms (compression has
+/// not removed its source yet, or a resume materialized it) is listed once,
+/// as the plain file.
 pub(super) fn codex_candidates() -> Vec<PathBuf> {
     // Beyond the active home, every v0.9 managed provider home keeps its
     // own sessions tree.
@@ -918,7 +909,7 @@ pub(super) fn codex_candidates() -> Vec<PathBuf> {
                     } else if path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .map(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+                        .map(|n| n.starts_with("rollout-") && (n.ends_with(".jsonl") || n.ends_with(".jsonl.zst")))
                         .unwrap_or(false)
                     {
                         out.push(path);
@@ -927,6 +918,11 @@ pub(super) fn codex_candidates() -> Vec<PathBuf> {
             }
         }
     }
+    let present: std::collections::HashSet<PathBuf> = out.iter().cloned().collect();
+    out.retain(|path| match super::codex_rollout_forms(path) {
+        Some((plain, compressed)) => *path != compressed || !present.contains(&plain),
+        None => true,
+    });
     out
 }
 
@@ -1538,7 +1534,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(peek_head_json_lines(&path, false, 8).is_empty());
+        assert!(peek_head_json_lines(&path, 8).is_empty());
         assert_eq!(identify_head("codex", &path), None);
         std::fs::remove_dir_all(&dir).ok();
     }
