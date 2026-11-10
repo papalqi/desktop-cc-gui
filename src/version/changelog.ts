@@ -29,6 +29,18 @@ export function changelogEntryFor(version: string): ChangelogEntry | undefined {
 
 export const CHANGELOG_DATA: ChangelogEntry[] = [
   {
+    version: "1.3.4",
+    date: "2026-11-10",
+    content: {
+      zh: `🐛 修复
+- **Codex 压缩后的会话打不开**：Codex 0.162 起会把空闲的 \`rollout-*.jsonl\` 压缩成 \`.jsonl.zst\` 并删除原文件，之前本地历史和 Hub 同步都会报“系统找不到指定的文件”。现在扫描、读取、搜索和日志同步都能读取压缩记录；续接会话后 Codex 重新解压出 \`.jsonl\` 时优先读原文件，删除会话时两种文件一起删除。
+- **检查更新显示上游旧版本**：改为读取并校验所连 Hub 上的签名更新清单，与 Windows 空闲自更新同源；去掉“立即更新”按钮和更新提示，安装交给空闲自更新。`,
+      en: `🐛 Fixes
+- **Codex sessions failed to open after compression**: since Codex 0.162, idle \`rollout-*.jsonl\` files are compressed to \`.jsonl.zst\` and the original is removed, so local history and Hub sync failed with "file not found". Scanning, reading, search and log sync now read compressed rollouts. When a resume materializes the \`.jsonl\` again it is preferred, and deleting a session removes both forms.
+- **Update check showed an older upstream version**: it now reads and verifies the signed update manifest on the connected Hub, the same source as the Windows idle self-update. The "update now" action and the update toast are removed; installation is left to the idle self-update.`,
+    },
+  },
+  {
     version: "1.3.3",
     date: "2026-10-18",
     content: {
