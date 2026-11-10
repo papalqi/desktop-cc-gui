@@ -85,6 +85,19 @@ function Assert-Idle {
     if ($null -eq $active) { throw "Cannot verify active turns on the local bridge ($queryFailure); app was not stopped" }
     if ($active -ne 0) { throw "App has $active active turns; app was not stopped" }
 }
+function Clear-RunLimit {
+    # The task runs the app for as long as the machine is up. Task Scheduler's
+    # default 72-hour execution limit terminates it three days after each start
+    # (SCHED_S_TASK_TERMINATED), and the executor silently leaves the Hub.
+    $definition = $task.Definition
+    $previous = $definition.Settings.ExecutionTimeLimit
+    if ($previous -eq 'PT0S') { return $previous }
+    $definition.Settings.ExecutionTimeLimit = 'PT0S'
+    # 4 = TASK_UPDATE; null credentials keep the task's own principal.
+    $script:task = $taskService.GetFolder('\').RegisterTaskDefinition($task.Path, $definition, 4, $null, $null, $definition.Principal.LogonType)
+    if ($task.Definition.Settings.ExecutionTimeLimit -ne 'PT0S') { throw 'Could not remove the scheduled task execution time limit' }
+    return $previous
+}
 function Start-App {
     $null = $task.Run($null)
     $processes = @(Wait-App 1)
@@ -132,13 +145,15 @@ if ($Action -eq 'prepare') {
     foreach ($name in $resourceDirs) {
         if (-not (Test-Path -LiteralPath (Join-Path $payload $name) -PathType Container)) { throw "Missing packaged resource: $name" }
     }
+    # Before anything is stopped: a failure here leaves the running app untouched.
+    $runLimit = Clear-RunLimit
     New-Item -ItemType Directory -Path $before | Out-Null
     Copy-Item -LiteralPath $installed -Destination (Join-Path $before 'ccgui-next.exe')
     foreach ($name in $resourceDirs) {
         $source = Join-Path $appDir $name
         if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination (Join-Path $before $name) -Recurse }
     }
-    $baseline = [ordered]@{ installed=$installed; oldPid=$processes[0].ProcessId; oldHash=(Get-FileHash -LiteralPath (Join-Path $before 'ccgui-next.exe') -Algorithm SHA256).Hash; newHash=$requestData.exeHash; task=$requestData.task }
+    $baseline = [ordered]@{ installed=$installed; oldPid=$processes[0].ProcessId; oldHash=(Get-FileHash -LiteralPath (Join-Path $before 'ccgui-next.exe') -Algorithm SHA256).Hash; newHash=$requestData.exeHash; task=$requestData.task; previousRunLimit=$runLimit }
     $baseline | ConvertTo-Json -Compress | Set-Content -LiteralPath $baselinePath -Encoding UTF8
     $baseline | ConvertTo-Json -Compress
     return

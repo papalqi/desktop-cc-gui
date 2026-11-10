@@ -2,7 +2,8 @@
 function New-TestTask([string]$Name, [string]$Path, [int]$Type = 0, [int]$Count = 1) {
     $actions = [pscustomobject]@{Count=$Count; Action=[pscustomobject]@{Type=$Type;Path=$installed}}
     $actions | Add-Member ScriptMethod Item { param($Index) if ($Index -ne 1 -or $this.Count -ne 1) { throw 'Invalid action index' }; $this.Action }
-    $entry = [pscustomobject]@{Name=$Name;Path=$Path;Definition=[pscustomobject]@{Actions=$actions}}
+    $settings = [pscustomobject]@{ExecutionTimeLimit=$(if ($null -ne $state.runLimit) { $state.runLimit } else { 'PT72H' })}
+    $entry = [pscustomobject]@{Name=$Name;Path=$Path;Definition=[pscustomobject]@{Actions=$actions;Settings=$settings;Principal=[pscustomobject]@{LogonType=3}}}
     $entry | Add-Member ScriptProperty State { if ($state.running) {4} else {3} }
     $entry | Add-Member ScriptMethod Stop { param($Flags) $state.stops++; $state.running=$false }
     $entry | Add-Member ScriptMethod Run {
@@ -22,6 +23,15 @@ function New-Object {
         param($Path)
         $found = @($mockTasks | Where-Object { $_.Path -eq $Path -or $_.Name -eq $Path })
         if ($found.Count -ne 1) { throw 'Task does not exist' }
+        $found[0]
+    }
+    $folder | Add-Member ScriptMethod RegisterTaskDefinition {
+        param($Path, $Definition, $Flags, $User, $Password, $LogonType)
+        if ($Flags -ne 4 -or $null -ne $User -or $null -ne $Password -or $LogonType -ne $Definition.Principal.LogonType) { throw 'Unexpected task registration' }
+        $found = @($mockTasks | Where-Object { $_.Path -eq $Path })
+        if ($found.Count -ne 1) { throw 'Task does not exist' }
+        $state.registrations++
+        $found[0].Definition = $Definition
         $found[0]
     }
     $service = [pscustomobject]@{Folder=$folder}

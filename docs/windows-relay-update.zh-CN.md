@@ -16,7 +16,7 @@ pnpm test:deploy                 # 活动任务、失败恢复、成功更新的
 
 首次使用时，把 `scripts/deploy-windows.config.example.json` 复制为 `scripts/deploy-windows.local.json`，填入当前连接信息。本机配置与 `artifacts/` 已加入忽略规则。当前工作区已配置 PC6。
 
-`host` 使用 SSH 别名或 `user@host`；可选 `port` 与 `identityFile` 覆盖 SSH 配置。SSH 必须已配置密钥登录和已知主机，脚本不会跳过主机身份检查。每台 Windows 目标需已有 `CCGUIRelay` 计划任务，指向正式的 `ccgui-next.exe`；安装目录从任务动作读取，不写死用户名或路径。
+`host` 使用 SSH 别名或 `user@host`；可选 `port` 与 `identityFile` 覆盖 SSH 配置。SSH 必须已配置密钥登录和已知主机，脚本不会跳过主机身份检查。每台 Windows 目标需已有 `CCGUIRelay` 计划任务，指向正式的 `ccgui-next.exe`；安装目录从任务动作读取，不写死用户名或路径。这个任务要一直托管应用，不能有运行时限。Windows 新建任务默认是"运行超过 3 天就停止"（`ExecutionTimeLimit=PT72H`），到时应用会被终止，任务结果为 `0x41306`，执行端随之从 Hub 掉线。`install-windows.ps1` 的准备阶段会在停止应用之前把时限改成不限（`PT0S`），保留任务原有的运行身份，并把原值写进基线的 `previousRunLimit`；改写失败时更新中止，应用照常运行。手工新建任务时，取消勾选"如果任务运行时间超过以下时间，则停止任务"。应用必须由这个任务启动，自更新只认正在运行的根任务，手工双击启动的实例不会被自动更新。
 
 中转主机需要 Bun 和现有多机器中转服务。`relay.directory` 指向中转目录，`relay.bun` 为 Bun 路径，`relay.wsUrl` 为主机自身可访问的 WebSocket 地址。检查复用中转主机 `sessions.json` 中尚未过期的网页登录凭据；凭据不会下载、打印或写入仓库。凭据全部过期时，先网页登录一次。
 

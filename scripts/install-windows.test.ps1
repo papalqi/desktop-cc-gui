@@ -24,7 +24,7 @@ foreach ($scenario in @('success','busy','copy-failure','start-failure','rollbac
     $app = Join-Path $fixture 'app'
     $stage = Join-Path $fixture 'stage'
     $package = Join-Path $fixture 'package'
-    $state = @{ running=$true; pid=10; starts=0; stops=0; failCopy=$false; failStart=$false; busy=$false }
+    $state = @{ running=$true; pid=10; starts=0; stops=0; failCopy=$false; failStart=$false; busy=$false; registrations=0; runLimit=$(if ($scenario -eq 'busy') { 'PT0S' } else { 'PT72H' }) }
     try {
         foreach ($directory in @($app, $stage, $package)) { New-Item -ItemType Directory -Path $directory | Out-Null }
         $installed = Join-Path $app 'ccgui-next.exe'
@@ -43,6 +43,8 @@ foreach ($scenario in @('success','busy','copy-failure','start-failure','rollbac
         . (Join-Path $stage 'install-windows.ps1') -Action prepare -Request $request
         function Assert-Idle { if ($state.busy) { throw 'App has active turns; app was not stopped' } }
         $null = Invoke-Install
+        Assert ($mockTasks[0].Definition.Settings.ExecutionTimeLimit -eq 'PT0S') "$scenario left the task's 72-hour execution limit"
+        Assert ($state.registrations -eq $(if ($state.runLimit -eq 'PT0S') { 0 } else { 1 })) "$scenario re-registered the task an unexpected number of times"
         $Action = 'apply'
         $state.busy = $scenario -eq 'busy'
         $state.failCopy = $scenario -eq 'copy-failure'
