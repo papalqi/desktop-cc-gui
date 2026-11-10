@@ -29,6 +29,16 @@ export function changelogEntryFor(version: string): ChangelogEntry | undefined {
 
 export const CHANGELOG_DATA: ChangelogEntry[] = [
   {
+    version: "1.3.5",
+    date: "2026-11-10",
+    content: {
+      zh: `🐛 修复
+- **执行端运行满 3 天后从 Hub 掉线**：Windows 新建的 \`CCGUIRelay\` 计划任务默认"运行超过 3 天就停止"，到时应用被系统终止（任务结果 \`0x41306\`）。现在部署和空闲自更新在停止应用之前，会先把这个任务改成不限运行时长，保留原有运行身份；改写失败时更新中止，应用照常运行。`,
+      en: `🐛 Fixes
+- **Executor dropped off the Hub after three days**: Windows creates the \`CCGUIRelay\` scheduled task with a default 72-hour run limit, so Task Scheduler terminated the app three days after each start (task result \`0x41306\`). Deploys and the idle self-update now remove this limit before stopping the app, keeping the task's own principal; if that fails the update aborts and the app keeps running.`,
+    },
+  },
+  {
     version: "1.3.4",
     date: "2026-11-10",
     content: {
